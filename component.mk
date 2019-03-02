@@ -1,0 +1,2 @@
+lCOMPONENT_SRCDIRS :=  . include
+COMPONENT_PRIV_INCLUDEDIRS := include
