@@ -13,5 +13,5 @@ A high(ish) performance webserver for the ESP32 with routing, websockets and fil
 
 Clone this component to your [ESP-IDF](https://github.com/espressif/esp-idf) v3.1.2 or later project (as a submodule): 
 ```
-git submodule add https://github.com/funkBuild/esphttps.git components/esphttpd
+git submodule add https://github.com/funkBuild/esphttpd.git components/esphttpd
 ```
