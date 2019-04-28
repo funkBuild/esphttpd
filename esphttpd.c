@@ -254,33 +254,33 @@ void webserver_free_request_headers(http_req *req){
   }
 }
 
-void webserver_send_status(int sock, int status_code, char *status_text){
+void webserver_send_status(http_req *req, int status_code, char *status_text){
   char buf[128];
 
   sprintf(buf, http_resp_main_header, status_code, status_text);
-  send(sock, buf, strlen(buf), 0);
+  send(req->sock, buf, strlen(buf), 0);
 }
 
-void webserver_send_header(int sock, char *key, char *value){
+void webserver_send_header(http_req *req, char *key, char *value){
   char buf[128];
 
   sprintf(buf, http_resp_header, key, value);
-  send(sock, buf, strlen(buf), 0);
+  send(req->sock, buf, strlen(buf), 0);
 }
 
-void webserver_send_body(int sock, char *body, unsigned int body_len){
-  send(sock, "\r\n", 2, 0);
-  send(sock, body, body_len, 0);
+void webserver_send_body(http_req *req, char *body, unsigned int body_len){
+  send(req->sock, "\r\n", 2, 0);
+  send(req->sock, body, body_len, 0);
 }
 
-void webserver_send_response(int sock, http_res *res)
+void webserver_send_response(http_req *req, http_res *res)
 {
-  webserver_send_status(sock, res->status_code, res->status_text);
-  webserver_send_header(sock, "Content-Type", res->content_type);
-  webserver_send_body(sock, res->body, res->body_len);
+  webserver_send_status(req, res->status_code, res->status_text);
+  webserver_send_header(req, "Content-Type", res->content_type);
+  webserver_send_body(req, res->body, res->body_len);
 }
 
-void webserver_send_file_response(int sock, char *file_path, char *content_type)
+void webserver_send_file_response(http_req *req, char *file_path, char *content_type)
 {
   char buf[128];
   size_t n;
@@ -289,7 +289,7 @@ void webserver_send_file_response(int sock, char *file_path, char *content_type)
 
   if (f == NULL) {
     ESP_LOGE(TAG, "File not found %s", file_path);
-    webserver_send_not_found(sock);
+    webserver_send_not_found(req->sock);
     return;
   }
 
@@ -297,10 +297,10 @@ void webserver_send_file_response(int sock, char *file_path, char *content_type)
   size_t file_size = ftell(f);
   rewind(f);
 
-  webserver_send_status(sock, 200, "OK");
-  webserver_send_header(sock, "Content-Type", content_type);
+  webserver_send_status(req->sock, 200, "OK");
+  webserver_send_header(req->sock, "Content-Type", content_type);
   sprintf(buf, "%u", file_size);
-  webserver_send_header(sock, "Content-Length", buf);
+  webserver_send_header(req->sock, "Content-Length", buf);
 
   send(sock, "\r\n", 2, 0);
   
@@ -635,7 +635,6 @@ static void webserver_serve(int clientfd)
     webserver_handle_ws(&req);
   } else {
     webserver_handle_http(&req);
-    close(req.sock);
   };
 
   unsigned long end_time = (esp_timer_get_time() - start_time) / 1000;
