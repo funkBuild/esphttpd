@@ -21,6 +21,9 @@
 #define MAX_WS_CONNECTIONS (16)
 #define WS_MASK_LEN (4)
 
+#define SEND_BUFFER_SIZE 1024
+#define RCV_BUFFER_SIZE 1024
+
 http_route *http_routes = NULL;
 http_route *ws_routes = NULL;
 
@@ -32,6 +35,33 @@ static const char* TAG = "ESPHTTPD";
 SemaphoreHandle_t ws_connection_semaphore;
 ws_ctx *ws_connections[16] = { NULL };
 
+void webserver_send_status(http_req *req, int status_code, char *status_text){
+  char buf[128];
+
+  sprintf(buf, http_resp_main_header, status_code, status_text);
+  send(req->sock, buf, strlen(buf), 0);
+}
+
+void webserver_send_header(http_req *req, char *key, char *value){
+  char buf[128];
+
+  sprintf(buf, http_resp_header, key, value);
+  send(req->sock, buf, strlen(buf), 0);
+}
+
+void webserver_send_body(http_req *req, char *body, unsigned int body_len){
+  send(req->sock, "\r\n", 2, 0);
+  send(req->sock, body, body_len, 0);
+}
+
+void webserver_send_response(http_req *req, http_res *res)
+{
+  webserver_send_status(req, res->status_code, res->status_text);
+  webserver_send_header(req, "Access-Control-Allow-Origin", "*");
+  webserver_send_header(req, "Content-Type", res->content_type);
+  webserver_send_body(req, res->body, res->body_len);
+}
+
 void upload_writer_thread(http_upload_params *upload_params){
   size_t item_size;
 
@@ -39,7 +69,7 @@ void upload_writer_thread(http_upload_params *upload_params){
     char *item = (char *)xRingbufferReceive(upload_params->buf_handle, &item_size, 100/portTICK_PERIOD_MS);
 
     if(item != NULL){
-      fwrite(item, item_size, 1, upload_params->file_handle);
+      //fwrite(item, item_size, 1, upload_params->file_handle);
       vRingbufferReturnItem(upload_params->buf_handle, (void *) item);
     }
   }
@@ -51,19 +81,33 @@ void upload_writer_thread(http_upload_params *upload_params){
 }
 
 err_t webserver_pipe_body_to_file(http_req *req, char *file_path){
+  webserver_send_status(req, 100, "Continue");
+
+  printf("req->remaining_content_length=%u\n", req->remaining_content_length);
+
   unsigned long start_time = esp_timer_get_time();
-  char *buf = malloc(8192);
+  char *buf = malloc(RCV_BUFFER_SIZE);
   int total_bytes = 0, r = 0;
 
   http_upload_params *upload_params = malloc(sizeof(http_upload_params));
   upload_params->running = true;
-  upload_params->file_handle = fopen(file_path, "w+");
+  upload_params->file_handle = fopen(file_path, "w");
 
   if (upload_params->file_handle == NULL){
+    printf("Upload failed\n");
     return ESP_FAIL;
   }
 
-  upload_params->buf_handle = xRingbufferCreate(65536, RINGBUF_TYPE_NOSPLIT);
+  while( (r = webserver_recv_body(req, buf, RCV_BUFFER_SIZE)) != 0 ){
+    fwrite(buf, r, 1, upload_params->file_handle);
+    total_bytes += r;
+  }
+
+  fclose(upload_params->file_handle);
+  free(buf);
+
+/*
+  upload_params->buf_handle = xRingbufferCreate(4*RCV_BUFFER_SIZE, RINGBUF_TYPE_NOSPLIT);
 
   if (upload_params->buf_handle == NULL) {
     return ESP_ERR_NO_MEM;
@@ -76,14 +120,14 @@ err_t webserver_pipe_body_to_file(http_req *req, char *file_path){
     "upload_writer_thread",
     2048,
     (void *) upload_params,
-    9,
+    10,
     &thread_handle
   );
 
   UBaseType_t rbuf_result;
-  while( (r = webserver_recv_body(req, buf, 8192)) != 0 ){
+  while( (r = webserver_recv_body(req, buf, RCV_BUFFER_SIZE)) != 0 ){
     while(xRingbufferSend(upload_params->buf_handle, buf, r, portMAX_DELAY) != pdTRUE){
-      vTaskDelay(10/portTICK_PERIOD_MS);
+      vTaskDelay(1/portTICK_PERIOD_MS);
     }
 
     total_bytes += r;
@@ -92,6 +136,8 @@ err_t webserver_pipe_body_to_file(http_req *req, char *file_path){
   free(buf);
 
   upload_params->running = false;
+*/
+
 
   double delta_time = (esp_timer_get_time() - start_time) / (1000.0 * 1000.0);
   double result = (total_bytes / 1024.0) / delta_time;
@@ -175,6 +221,9 @@ int webserver_set_method(http_req *req, char *str_method){
   else if (strcmp(str_method, "DELETE") == 0) {
     req->method = DELETE;
   }
+  else if (strcmp(str_method, "OPTIONS") == 0) {
+    req->method = OPTIONS;
+  }
   else{
     return -1;
   }
@@ -254,42 +303,16 @@ void webserver_free_request_headers(http_req *req){
   }
 }
 
-void webserver_send_status(http_req *req, int status_code, char *status_text){
-  char buf[128];
-
-  sprintf(buf, http_resp_main_header, status_code, status_text);
-  send(req->sock, buf, strlen(buf), 0);
-}
-
-void webserver_send_header(http_req *req, char *key, char *value){
-  char buf[128];
-
-  sprintf(buf, http_resp_header, key, value);
-  send(req->sock, buf, strlen(buf), 0);
-}
-
-void webserver_send_body(http_req *req, char *body, unsigned int body_len){
-  send(req->sock, "\r\n", 2, 0);
-  send(req->sock, body, body_len, 0);
-}
-
-void webserver_send_response(http_req *req, http_res *res)
-{
-  webserver_send_status(req, res->status_code, res->status_text);
-  webserver_send_header(req, "Content-Type", res->content_type);
-  webserver_send_body(req, res->body, res->body_len);
-}
-
 void webserver_send_file_response(http_req *req, char *file_path, char *content_type)
 {
-  char buf[128];
-  size_t n;
+  char *buf = malloc(SEND_BUFFER_SIZE);
+  size_t n = 0;
 
   FILE* f = fopen(file_path, "r");
 
   if (f == NULL) {
     ESP_LOGE(TAG, "File not found %s", file_path);
-    webserver_send_not_found(req->sock);
+    webserver_send_not_found(req);
     return;
   }
 
@@ -297,20 +320,27 @@ void webserver_send_file_response(http_req *req, char *file_path, char *content_
   size_t file_size = ftell(f);
   rewind(f);
 
-  webserver_send_status(req->sock, 200, "OK");
-  webserver_send_header(req->sock, "Content-Type", content_type);
+  webserver_send_status(req, 200, "OK");
+  webserver_send_header(req, "Access-Control-Allow-Origin", "*");
+  webserver_send_header(req, "Access-Control-Expose-Headers", "Content-Length");
+  webserver_send_header(req, "Content-Type", content_type);
   sprintf(buf, "%u", file_size);
-  webserver_send_header(req->sock, "Content-Length", buf);
+  webserver_send_header(req, "Content-Length", buf);
 
-  send(sock, "\r\n", 2, 0);
+  send(req->sock, "\r\n", 2, 0);
   
-  while((n = fread(buf, 1, 128, f)) != 0){
-    send(sock, buf, n, 0);
-  }
+
+  
+  while(
+    (n = fread(buf, 1, SEND_BUFFER_SIZE, f)) != 0 &&
+    send(req->sock, buf, n, 0) != -1
+  ){}
+
   fclose(f);
+  free(buf);
 }
 
-static void webserver_send_not_found(int sock){
+static void webserver_send_not_found(http_req *req){
   http_res res = {
     .status_code = 404,
     .status_text = "Not Found",
@@ -319,7 +349,7 @@ static void webserver_send_not_found(int sock){
     .body_len = 9
   };
 
-  webserver_send_response(sock, &res);
+  webserver_send_response(req, &res);
 }
 
 static bool webserver_is_ws_request(http_req* req){
@@ -340,8 +370,10 @@ ws_ctx* register_ws_ctx(ws_ctx *ctx){
       return ctx;
     }
   }
-  xSemaphoreGive(ws_connection_semaphore);
+
   free(ctx);
+  xSemaphoreGive(ws_connection_semaphore);
+
   return NULL;
 }
 
@@ -351,6 +383,7 @@ void remove_ws_ctx(ws_ctx *ctx){
   for(int i=0; i < MAX_WS_CONNECTIONS; i++){
     if(ws_connections[i] == ctx) {
       free(ws_connections[i]);
+      ws_connections[i] = NULL;
       xSemaphoreGive(ws_connection_semaphore);
       return;
     }
@@ -372,36 +405,36 @@ err_t webserver_send_ws_message(ws_ctx *ctx, char* p_data, size_t length, ws_opc
 	if (ctx->sock == NULL)
 		return ERR_CONN;
 
+  const unsigned int data_offset = length < 126 ? sizeof(WS_frame_header_t) : sizeof(WS_frame_header_t) + 2;
+  char* data = malloc(data_offset + length);
+
 	//prepare header
-	WS_frame_header_t hdr;
-	hdr.fin = 0x1;
-	hdr.mask = 0;
-	hdr.reserved = 0;
-	hdr.opcode = opcode;
+	WS_frame_header_t *hdr = (WS_frame_header_t*) data;
+	hdr->fin = 0x1;
+	hdr->mask = 0;
+	hdr->reserved = 0;
+	hdr->opcode = opcode;
 
   if(length < 126) {
-  	hdr.payload_length = length;
-	  send(ctx->sock, &hdr, 2, 0);
+  	hdr->payload_length = length;
   } else {
-  	hdr.payload_length = 126;
-	  send(ctx->sock, &hdr, 2, 0);
+  	hdr->payload_length = 126;
 
-    char extended_length[2];
-    extended_length[0] = (length >> 8) & 0xff;
-    extended_length[1] = length & 0xff;
-
-	  send(ctx->sock, extended_length, 2, 0);
+    data[sizeof(WS_frame_header_t)] = (length >> 8) & 0xff;
+    data[sizeof(WS_frame_header_t) + 1] = length & 0xff;
   }
   
-  send(ctx->sock, p_data, length, 0);
+  memcpy(data + data_offset, p_data, length);
+  send(ctx->sock, data, data_offset + length, 0);
 
+  free(data);
   return ESP_OK;
 }
 
-void webserver_accept_ws(ws_ctx *ctx){  
-  webserver_send_status(ctx->sock, 101, "Switching Protocols");
-  webserver_send_header(ctx->sock, "Upgrade", "websocket");
-  webserver_send_header(ctx->sock, "Connection", "Upgrade");
+void webserver_accept_ws(ws_ctx *ctx){
+  webserver_send_status(ctx, 101, "Switching Protocols");
+  webserver_send_header(ctx, "Upgrade", "websocket");
+  webserver_send_header(ctx, "Connection", "Upgrade");
 
   char *ws_client_key = webserver_get_request_header(ctx->req, "Sec-WebSocket-Key");
   char *ws_concat_keys = malloc(strlen(ws_client_key) + strlen(ws_sec_key) + 1);
@@ -416,7 +449,7 @@ void webserver_accept_ws(ws_ctx *ctx){
   unsigned char reply_key[64];
   mbedtls_base64_encode(reply_key, 64, &reply_key_size, sha1_result, 20);
 
-  webserver_send_header(ctx->sock, "Sec-WebSocket-Accept", (char *) reply_key);
+  webserver_send_header(ctx, "Sec-WebSocket-Accept", (char *) reply_key);
   send(ctx->sock, "\r\n", 2, 0);
 
   free(ws_concat_keys);
@@ -441,23 +474,22 @@ static void webserver_ws_task(void *pvParameter){
 
     ws_event event = {
       .event_type = WS_MESSAGE,
-      .payload = NULL
+      .payload = NULL,
+      .len = frame_header.payload_length
     };
 
-    // Read the payload length
-    payload_length = frame_header.payload_length;
 
-    if(payload_length == 126){
+    if(event.len == 126){
       char data[2];
       recv(ctx->sock, data, 2, 0);
 
-      payload_length = (data[0] << 8) + data[1];
+      event.len = (data[0] << 8) + data[1];
 
-    } else if(payload_length == 127){
+    } else if(event.len == 127){
       char data[4];
       recv(ctx->sock, data, 4, 0);
 
-      payload_length = (data[0] << 24) + (data[1] << 16) + (data[2] << 8) + data[3];
+      event.len = (data[0] << 24) + (data[1] << 16) + (data[2] << 8) + data[3];
     }
 
     // Read the mask
@@ -465,13 +497,13 @@ static void webserver_ws_task(void *pvParameter){
       recv(ctx->sock, (void *) &masking_key, sizeof(masking_key), 0);
     }
     
-    if(payload_length > 0){
-      event.payload = malloc(payload_length + 1);
-      recv(ctx->sock, event.payload, payload_length, 0);
- 		  event.payload[payload_length] = 0;
+    if(event.len > 0){
+      event.payload = malloc(event.len);
+      recv(ctx->sock, event.payload, event.len, 0);
+
 
       if(frame_header.mask){
-			  for(int i = 0; i < payload_length; i++)
+			  for(int i = 0; i < event.len; i++)
 				  event.payload[i] ^= masking_key[i % WS_MASK_LEN];
       }
     }
@@ -526,7 +558,7 @@ static void webserver_handle_ws(http_req *req){
       NULL
     );
   } else {
-    webserver_send_not_found(req->sock);
+    webserver_send_not_found(req);
     close(req->sock);
   }
 }
@@ -548,12 +580,12 @@ static void webserver_handle_http(http_req *req){
       char *content_length_str = webserver_get_request_header(req, "Content-Length");
 
       req->remaining_content_length = atoi(content_length_str);
-      req->remaining_content_length -= req->recv_buf_len;
+      //req->remaining_content_length -= req->recv_buf_len;
     }
 
     handler(req);
   } else {
-    webserver_send_not_found(req->sock);
+    webserver_send_not_found(req);
   }
 
   close(req->sock);
@@ -707,7 +739,7 @@ int webserver_listen(){
 	}
 
 	/** Make it a "listening socket". Limit to 20 connections */
-	if (listen(sockfd, 20) != 0)
+	if (listen(sockfd, 5) != 0)
 	{
 		ESP_LOGE(TAG, "Listen error");
 		return -1;
@@ -728,7 +760,11 @@ static void webserver_task()
 
 		/** accept an incomming connection  */
 		clientfd = accept(sockfd, (struct sockaddr *)&client_addr, &addrlen);
+
     ESP_LOGI(TAG, "%s:%d connected", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+    //int flags =1;
+    //setsockopt(clientfd, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
+
 
 		webserver_serve(clientfd);
 	}
@@ -738,5 +774,5 @@ static void webserver_task()
 void webserver_start(int port)
 {
   ws_connection_semaphore = xSemaphoreCreateMutex();
-  xTaskCreate(&webserver_task, "webserver_task", 4096, NULL, 5, NULL);
+  xTaskCreate(&webserver_task, "webserver_task", 4096, NULL, 10, NULL);
 }

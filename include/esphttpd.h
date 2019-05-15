@@ -4,7 +4,7 @@
 #include "lwip/api.h"
 #include "freertos/ringbuf.h"
 
-typedef enum http_method {GET, HEAD, POST, PUT, DELETE} http_method;
+typedef enum http_method {GET, HEAD, POST, PUT, DELETE, OPTIONS} http_method;
 typedef enum ws_event_type {WS_CONNECT, WS_DISCONNECT, WS_MESSAGE} ws_event_type;
 typedef enum {
 	WS_OP_CON = 0x0, 				/*!< Continuation Frame*/
@@ -50,6 +50,7 @@ typedef struct {
 typedef struct {
   ws_event_type event_type;
   char *payload;
+  unsigned int len;
 } ws_event;
 
 typedef struct {
@@ -82,16 +83,19 @@ typedef struct {
 err_t webserver_pipe_body_to_file(http_req *req, char *file_path);
 unsigned int webserver_recv_body(http_req *req, char *buf, unsigned int len);
 void webserver_accept_ws(ws_ctx *ctx);
-static void webserver_send_not_found(int sock);
+static void webserver_send_not_found(http_req *req);
 err_t webserver_broadcast_ws_message(char* p_data, size_t length, ws_opcode_t opcode);
 err_t webserver_send_ws_message(ws_ctx *ctx, char* p_data, size_t length, ws_opcode_t opcode);
-void webserver_send_response(int sock, http_res *res);
-void webserver_send_file_response(int sock, char *file_path, char *content_type);
+void webserver_send_response(http_req *req, http_res *res);
+void webserver_send_file_response(http_req *req, char *file_path, char *content_type);
 void webserver_add_route(http_route new_route);
 void webserver_add_ws_route(ws_route new_route);
 static void webserver_serve(int clientfd);
 static void webserver_task();
 void webserver_start(int port);
+void webserver_send_body(http_req *req, char *body, unsigned int body_len);
+void webserver_send_status(http_req *req, int status_code, char *status_text);
+void webserver_send_header(http_req *req, char *key, char *value);
 
 
 
