@@ -22,7 +22,7 @@
 #define WS_MASK_LEN (4)
 
 #define SEND_BUFFER_SIZE 1024
-#define RCV_BUFFER_SIZE 1024
+#define RCV_BUFFER_SIZE 2048
 
 http_route *http_routes = NULL;
 http_route *ws_routes = NULL;
@@ -81,13 +81,15 @@ void upload_writer_thread(http_upload_params *upload_params){
 }
 
 err_t webserver_pipe_body_to_file(http_req *req, char *file_path){
-  webserver_send_status(req, 100, "Continue");
+  char* expect = webserver_get_request_header(req, "Expect");
 
-  printf("req->remaining_content_length=%u\n", req->remaining_content_length);
+  if(expect != NULL){
+    webserver_send_status(req, 100, "Continue");
+  }
 
   unsigned long start_time = esp_timer_get_time();
   char *buf = malloc(RCV_BUFFER_SIZE);
-  int total_bytes = 0, r = 0;
+  unsigned int total_bytes = 0, r = 0, buffer_offset = 0;
 
   http_upload_params *upload_params = malloc(sizeof(http_upload_params));
   upload_params->running = true;
@@ -98,9 +100,18 @@ err_t webserver_pipe_body_to_file(http_req *req, char *file_path){
     return ESP_FAIL;
   }
 
-  while( (r = webserver_recv_body(req, buf, RCV_BUFFER_SIZE)) != 0 ){
-    fwrite(buf, r, 1, upload_params->file_handle);
-    total_bytes += r;
+  while( (r = webserver_recv_body(req, buf + buffer_offset, RCV_BUFFER_SIZE - buffer_offset)) != 0){
+    buffer_offset += r;
+
+    if(buffer_offset < RCV_BUFFER_SIZE && req->remaining_content_length > 0){
+      continue; // Keep receiving until the buffer is full
+    }
+
+    fwrite(buf, buffer_offset, 1, upload_params->file_handle);
+    total_bytes += buffer_offset;
+
+
+    buffer_offset = 0;
   }
 
   fclose(upload_params->file_handle);
@@ -161,7 +172,7 @@ unsigned int webserver_recv_body(http_req *req, char *buf, unsigned int len){
 
     req->recv_buf = leftover;
     req->recv_buf_len = leftover_len;
-
+    req->remaining_content_length -= len;
     return len;
   }
 
@@ -171,6 +182,7 @@ unsigned int webserver_recv_body(http_req *req, char *buf, unsigned int len){
     // copy the data we have
     memcpy(buf, req->recv_buf, req->recv_buf_len);
     copied_len += req->recv_buf_len;
+    req->remaining_content_length -= copied_len;
 
     buf += req->recv_buf_len;
     len -= req->recv_buf_len;
@@ -593,8 +605,6 @@ static void webserver_handle_http(http_req *req){
 
 static void webserver_serve(int clientfd)
 {
-  // TODO: Convert http request to event based?
-
   char rx_buffer[1024];
   unsigned int rx_buffer_length = 0;
 
@@ -764,7 +774,6 @@ static void webserver_task()
     ESP_LOGI(TAG, "%s:%d connected", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
     //int flags =1;
     //setsockopt(clientfd, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
-
 
 		webserver_serve(clientfd);
 	}

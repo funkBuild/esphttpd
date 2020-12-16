@@ -96,6 +96,7 @@ void webserver_start(int port);
 void webserver_send_body(http_req *req, char *body, unsigned int body_len);
 void webserver_send_status(http_req *req, int status_code, char *status_text);
 void webserver_send_header(http_req *req, char *key, char *value);
+char* webserver_get_request_header(http_req *req, char *key);
 
 
 
