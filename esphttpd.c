@@ -1,8 +1,7 @@
 #include "esphttpd.h"
 
 #include "freertos/FreeRTOS.h"
-#include "esp_heap_alloc_caps.h"
-#include "hwcrypto/sha.h"
+#include "esp32/sha.h"
 #include "esp_system.h"
 #include "mbedtls/base64.h"
 #include "esp_log.h"
