@@ -50,7 +50,17 @@ void webserver_send_header(http_req *req, char *key, char *value){
 
 void webserver_send_body(http_req *req, char *body, unsigned int body_len){
   send(req->sock, "\r\n", 2, 0);
-  send(req->sock, body, body_len, 0);
+
+  int offset = 0;
+
+  while(offset < body_len){
+    int len = 1024;
+    if(offset + len > body_len)
+      len = body_len - offset;
+
+    send(req->sock, body + offset, len, 0);
+    offset += 1024;
+  }
 }
 
 void webserver_send_response(http_req *req, http_res *res)
@@ -116,39 +126,6 @@ err_t webserver_pipe_body_to_file(http_req *req, char *file_path){
   fclose(upload_params->file_handle);
   free(buf);
 
-/*
-  upload_params->buf_handle = xRingbufferCreate(4*RCV_BUFFER_SIZE, RINGBUF_TYPE_NOSPLIT);
-
-  if (upload_params->buf_handle == NULL) {
-    return ESP_ERR_NO_MEM;
-  }
-
-  TaskHandle_t thread_handle = NULL;
-
-  xTaskCreate(
-    upload_writer_thread,
-    "upload_writer_thread",
-    2048,
-    (void *) upload_params,
-    10,
-    &thread_handle
-  );
-
-  UBaseType_t rbuf_result;
-  while( (r = webserver_recv_body(req, buf, RCV_BUFFER_SIZE)) != 0 ){
-    while(xRingbufferSend(upload_params->buf_handle, buf, r, portMAX_DELAY) != pdTRUE){
-      vTaskDelay(1/portTICK_PERIOD_MS);
-    }
-
-    total_bytes += r;
-  }
-
-  free(buf);
-
-  upload_params->running = false;
-*/
-
-
   double delta_time = (esp_timer_get_time() - start_time) / (1000.0 * 1000.0);
   double result = (total_bytes / 1024.0) / delta_time;
   ESP_LOGE(TAG, "total_bytes=%d, kB/s=%f, t=%f\n", total_bytes, result, delta_time);
@@ -183,12 +160,10 @@ unsigned int webserver_recv_body(http_req *req, char *buf, unsigned int len){
     copied_len += req->recv_buf_len;
     req->remaining_content_length -= copied_len;
 
-    buf += req->recv_buf_len;
-    len -= req->recv_buf_len;
-
     free(req->recv_buf);
     req->recv_buf = NULL;
     req->recv_buf_len = 0;
+    return copied_len;
   }
 
   int rxlen = recv(req->sock, buf + copied_len, len, 0);
@@ -314,6 +289,35 @@ void webserver_free_request_headers(http_req *req){
   }
 }
 
+bool webserver_check_basic_auth(http_req *req, char *auth_user, char* auth_password){
+  char *auth_header = webserver_get_request_header(req, "Authorization");
+
+  if(!auth_header)
+    return false;
+
+  strtok(auth_header, " ");
+  char *value = strtok(NULL, "");
+
+  char auth_value[128];
+  size_t auth_value_len = 0;
+  mbedtls_base64_decode((unsigned char*)auth_value, 128, &auth_value_len, (unsigned char*)value, strlen(value));
+
+  auth_value[auth_value_len] = 0;
+
+  char *username = strtok(auth_value, ":");
+  char *password = strtok(NULL, "");
+
+  return strcmp(username, auth_user) == 0 && strcmp(password, auth_password) == 0;
+}
+
+void webserver_auth_challenge(http_req *req)
+{
+  webserver_send_status(req, 401, "Unauthorized");
+  webserver_send_header(req, "WWW-Authenticate", "Basic realm=\"ESPHTTPD\"");
+  webserver_send_header(req, "Access-Control-Allow-Origin", "*");
+  send(req->sock, "\r\n", 2, 0);
+}
+
 void webserver_send_file_response(http_req *req, char *file_path, char *content_type)
 {
   char *buf = malloc(SEND_BUFFER_SIZE);
@@ -339,9 +343,7 @@ void webserver_send_file_response(http_req *req, char *file_path, char *content_
   webserver_send_header(req, "Content-Length", buf);
 
   send(req->sock, "\r\n", 2, 0);
-  
-
-  
+   
   while(
     (n = fread(buf, 1, SEND_BUFFER_SIZE, f)) != 0 &&
     send(req->sock, buf, n, 0) != -1
@@ -368,7 +370,6 @@ static bool webserver_is_ws_request(http_req* req){
 
   return (ws_header != NULL) && (strcmp(ws_header, "websocket") == 0);
 }
-
 
 ws_ctx* register_ws_ctx(ws_ctx *ctx){
   xSemaphoreTake(ws_connection_semaphore, portMAX_DELAY);
@@ -782,5 +783,5 @@ static void webserver_task()
 void webserver_start(int port)
 {
   ws_connection_semaphore = xSemaphoreCreateMutex();
-  xTaskCreate(&webserver_task, "webserver_task", 4096, NULL, 10, NULL);
+  xTaskCreate(&webserver_task, "webserver_task", 16384, NULL, 10, NULL);
 }

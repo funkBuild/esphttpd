@@ -97,7 +97,7 @@ void webserver_send_body(http_req *req, char *body, unsigned int body_len);
 void webserver_send_status(http_req *req, int status_code, char *status_text);
 void webserver_send_header(http_req *req, char *key, char *value);
 char* webserver_get_request_header(http_req *req, char *key);
-
-
+void webserver_auth_challenge(http_req *req);
+bool webserver_check_basic_auth(http_req *req, char *auth_user, char* auth_password);
 
 #endif
