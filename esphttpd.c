@@ -15,7 +15,6 @@
 #include <lwip/netdb.h>
 #include <arpa/inet.h>
 
-
 #define WEBSERVER_PORT (80)
 #define MAX_WS_CONNECTIONS (16)
 #define WS_MASK_LEN (4)
@@ -23,39 +22,44 @@
 #define SEND_BUFFER_SIZE 1024
 #define RCV_BUFFER_SIZE 2048
 
-http_route *http_routes = NULL;
-http_route *ws_routes = NULL;
+static TaskHandle_t esphttpd_task_handle = NULL;
+static http_route *http_routes = NULL;
+static http_route *ws_routes = NULL;
 
 static const char ws_sec_key[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 static const char http_resp_main_header[] = "HTTP/1.1 %d %s\r\n";
 static const char http_resp_header[] = "%s: %s\r\n";
-static const char* TAG = "ESPHTTPD";
+static const char *TAG = "ESPHTTPD";
 
-SemaphoreHandle_t ws_connection_semaphore;
-ws_ctx *ws_connections[16] = { NULL };
+static SemaphoreHandle_t ws_connection_semaphore;
+static ws_ctx *ws_connections[16] = {NULL};
 
-void webserver_send_status(http_req *req, int status_code, char *status_text){
+void webserver_send_status(http_req *req, int status_code, char *status_text)
+{
   char buf[128];
 
   sprintf(buf, http_resp_main_header, status_code, status_text);
   send(req->sock, buf, strlen(buf), 0);
 }
 
-void webserver_send_header(http_req *req, char *key, char *value){
+void webserver_send_header(http_req *req, char *key, char *value)
+{
   char buf[128];
 
   sprintf(buf, http_resp_header, key, value);
   send(req->sock, buf, strlen(buf), 0);
 }
 
-void webserver_send_body(http_req *req, char *body, unsigned int body_len){
+void webserver_send_body(http_req *req, char *body, unsigned int body_len)
+{
   send(req->sock, "\r\n", 2, 0);
 
   int offset = 0;
 
-  while(offset < body_len){
+  while (offset < body_len)
+  {
     int len = 1024;
-    if(offset + len > body_len)
+    if (offset + len > body_len)
       len = body_len - offset;
 
     send(req->sock, body + offset, len, 0);
@@ -68,18 +72,25 @@ void webserver_send_response(http_req *req, http_res *res)
   webserver_send_status(req, res->status_code, res->status_text);
   webserver_send_header(req, "Access-Control-Allow-Origin", "*");
   webserver_send_header(req, "Content-Type", res->content_type);
+
+  if (res->content_encoding != NULL)
+    webserver_send_header(req, "Content-Encoding", res->content_encoding);
+
   webserver_send_body(req, res->body, res->body_len);
 }
 
-void upload_writer_thread(http_upload_params *upload_params){
+void upload_writer_thread(http_upload_params *upload_params)
+{
   size_t item_size;
 
-  while(upload_params->running){
-    char *item = (char *)xRingbufferReceive(upload_params->buf_handle, &item_size, 100/portTICK_PERIOD_MS);
+  while (upload_params->running)
+  {
+    char *item = (char *)xRingbufferReceive(upload_params->buf_handle, &item_size, 100 / portTICK_PERIOD_MS);
 
-    if(item != NULL){
-      //fwrite(item, item_size, 1, upload_params->file_handle);
-      vRingbufferReturnItem(upload_params->buf_handle, (void *) item);
+    if (item != NULL)
+    {
+      // fwrite(item, item_size, 1, upload_params->file_handle);
+      vRingbufferReturnItem(upload_params->buf_handle, (void *)item);
     }
   }
 
@@ -89,10 +100,12 @@ void upload_writer_thread(http_upload_params *upload_params){
   vTaskDelete(NULL);
 }
 
-err_t webserver_pipe_body_to_file(http_req *req, char *file_path){
-  char* expect = webserver_get_request_header(req, "Expect");
+err_t webserver_pipe_body_to_file(http_req *req, char *file_path)
+{
+  char *expect = webserver_get_request_header(req, "Expect");
 
-  if(expect != NULL){
+  if (expect != NULL)
+  {
     webserver_send_status(req, 100, "Continue");
   }
 
@@ -104,21 +117,23 @@ err_t webserver_pipe_body_to_file(http_req *req, char *file_path){
   upload_params->running = true;
   upload_params->file_handle = fopen(file_path, "w");
 
-  if (upload_params->file_handle == NULL){
+  if (upload_params->file_handle == NULL)
+  {
     printf("Upload failed\n");
     return ESP_FAIL;
   }
 
-  while( (r = webserver_recv_body(req, buf + buffer_offset, RCV_BUFFER_SIZE - buffer_offset)) != 0){
+  while ((r = webserver_recv_body(req, buf + buffer_offset, RCV_BUFFER_SIZE - buffer_offset)) != 0)
+  {
     buffer_offset += r;
 
-    if(buffer_offset < RCV_BUFFER_SIZE && req->remaining_content_length > 0){
+    if (buffer_offset < RCV_BUFFER_SIZE && req->remaining_content_length > 0)
+    {
       continue; // Keep receiving until the buffer is full
     }
 
     fwrite(buf, buffer_offset, 1, upload_params->file_handle);
     total_bytes += buffer_offset;
-
 
     buffer_offset = 0;
   }
@@ -133,12 +148,15 @@ err_t webserver_pipe_body_to_file(http_req *req, char *file_path){
   return ESP_OK;
 }
 
-unsigned int webserver_recv_body(http_req *req, char *buf, unsigned int len){
+unsigned int webserver_recv_body(http_req *req, char *buf, unsigned int len)
+{
   len = req->remaining_content_length < len ? req->remaining_content_length : len;
 
-  if(len == 0) return 0;
+  if (len == 0)
+    return 0;
 
-  if(req->recv_buf && len <= req->recv_buf_len) {
+  if (req->recv_buf && len <= req->recv_buf_len)
+  {
     memcpy(buf, req->recv_buf, len);
 
     unsigned int leftover_len = req->recv_buf_len - len;
@@ -154,7 +172,8 @@ unsigned int webserver_recv_body(http_req *req, char *buf, unsigned int len){
 
   int copied_len = 0;
 
-  if(req->recv_buf){
+  if (req->recv_buf)
+  {
     // copy the data we have
     memcpy(buf, req->recv_buf, req->recv_buf_len);
     copied_len += req->recv_buf_len;
@@ -174,47 +193,128 @@ unsigned int webserver_recv_body(http_req *req, char *buf, unsigned int len){
   return copied_len;
 }
 
-
-bool url_match(const char *pattern, const char *candidate, int p, int c) {
-  if (pattern[p] == '\0') {
+bool url_match(const char *pattern, const char *candidate, int p, int c)
+{
+  if (pattern[p] == '\0')
+  {
     return candidate[c] == '\0';
-  } else if (pattern[p] == '*') {
-    for (; candidate[c] != '\0'; c++) {
-      if (url_match(pattern, candidate, p+1, c))
+  }
+  else if (pattern[p] == '*')
+  {
+    for (; candidate[c] != '\0'; c++)
+    {
+      if (url_match(pattern, candidate, p + 1, c))
         return true;
     }
-    return url_match(pattern, candidate, p+1, c);
-  } else if (pattern[p] != '?' && pattern[p] != candidate[c]) {
+    return url_match(pattern, candidate, p + 1, c);
+  }
+  else if (pattern[p] != '?' && pattern[p] != candidate[c])
+  {
     return false;
-  }  else {
-    return url_match(pattern, candidate, p+1, c+1);
+  }
+  else
+  {
+    return url_match(pattern, candidate, p + 1, c + 1);
   }
 }
 
-int webserver_set_method(http_req *req, char *str_method){
-  if (strcmp(str_method, "GET") == 0) {
+int webserver_set_method(http_req *req, char *str_method)
+{
+  if (strcmp(str_method, "GET") == 0)
+  {
     req->method = GET;
   }
-  else if (strcmp(str_method, "HEAD") == 0) {
+  else if (strcmp(str_method, "HEAD") == 0)
+  {
     req->method = HEAD;
   }
-  else if (strcmp(str_method, "POST") == 0) {
+  else if (strcmp(str_method, "POST") == 0)
+  {
     req->method = POST;
   }
-  else if (strcmp(str_method, "PUT") == 0) {
+  else if (strcmp(str_method, "PUT") == 0)
+  {
     req->method = PUT;
   }
-  else if (strcmp(str_method, "DELETE") == 0) {
+  else if (strcmp(str_method, "DELETE") == 0)
+  {
     req->method = DELETE;
   }
-  else if (strcmp(str_method, "OPTIONS") == 0) {
+  else if (strcmp(str_method, "OPTIONS") == 0)
+  {
     req->method = OPTIONS;
   }
-  else{
+  else
+  {
     return -1;
   }
 
   return 0;
+}
+
+http_param *webserver_get_param(http_req *req, char *name)
+{
+  http_param *p = req->params;
+  while (p != NULL)
+  {
+    if (strcmp(p->name, name) == 0)
+    {
+      return p;
+    }
+    p = p->next;
+  }
+
+  return NULL;
+}
+
+void webserver_add_param(http_req *req, char *name, char *value)
+{
+  if (req->params == NULL)
+  {
+    req->params = malloc(sizeof(http_param));
+    req->params->next = NULL;
+  }
+  else
+  {
+    http_param *p = req->params;
+    while (p->next != NULL)
+    {
+      p = p->next;
+    }
+    p->next = malloc(sizeof(http_param));
+    p->next->next = NULL;
+  }
+  req->params->name = strdup(name);
+  req->params->value = strdup(value);
+}
+
+void webserver_free_params(http_req *req)
+{
+  http_param *p = req->params;
+  while (p != NULL)
+  {
+    http_param *next = p->next;
+    free(p->name);
+    free(p->value);
+    free(p);
+    p = next;
+  }
+}
+
+void webserver_parse_params(http_req *req, char *params)
+{
+  char *param = strtok(params, "&");
+  while (param != NULL)
+  {
+    char *name = strtok(param, "=");
+    char *value = strtok(NULL, "=");
+    if (value == NULL)
+    {
+      value = "";
+    }
+    webserver_add_param(req, name, value);
+    param = strtok(NULL, "&");
+  }
 }
 
 int webserver_parse_url_params(http_req *req, char *str_url)
@@ -224,18 +324,19 @@ int webserver_parse_url_params(http_req *req, char *str_url)
 
   req->url = strdup(url);
 
-  if(params != NULL)
-    req->params = strdup(params);
+  if (params != NULL)
+    webserver_parse_params(req, params);
 
   return 0;
 }
 
-char* webserver_get_request_header(http_req *req, char *key)
+char *webserver_get_request_header(http_req *req, char *key)
 {
   http_header *current = req->headers;
 
-  while(current){
-    if(strcmp(current->key, key) == 0)
+  while (current)
+  {
+    if (strcmp(current->key, key) == 0)
       return current->value;
 
     current = current->next;
@@ -252,33 +353,39 @@ void webserver_append_request_header(http_req *req, char *str_header)
   char *value = strtok(NULL, "") + 1;
 
   // Remove the space at the start of the value if it exists
-  if(value[0] == ' ') new_header->value++;
+  if (value[0] == ' ')
+    new_header->value++;
 
   new_header->next = NULL;
   new_header->key = strdup(key);
   new_header->value = strdup(value);
 
-  if(req->headers == NULL){
+  if (req->headers == NULL)
+  {
     req->headers = new_header;
     return;
   }
 
   http_header *current = req->headers;
 
-  while(current->next != NULL){
+  while (current->next != NULL)
+  {
     current = current->next;
   }
 
   current->next = new_header;
 }
 
-void webserver_free_request_headers(http_req *req){
-  if(req->headers == NULL) return;
+void webserver_free_request_headers(http_req *req)
+{
+  if (req->headers == NULL)
+    return;
 
   http_header *current = req->headers;
   http_header *next;
 
-  while(current){
+  while (current)
+  {
     next = current->next;
 
     free(current->key);
@@ -289,10 +396,11 @@ void webserver_free_request_headers(http_req *req){
   }
 }
 
-bool webserver_check_basic_auth(http_req *req, char *auth_user, char* auth_password){
+bool webserver_check_basic_auth(http_req *req, char *auth_user, char *auth_password)
+{
   char *auth_header = webserver_get_request_header(req, "Authorization");
 
-  if(!auth_header)
+  if (!auth_header)
     return false;
 
   strtok(auth_header, " ");
@@ -300,12 +408,15 @@ bool webserver_check_basic_auth(http_req *req, char *auth_user, char* auth_passw
 
   char auth_value[128];
   size_t auth_value_len = 0;
-  mbedtls_base64_decode((unsigned char*)auth_value, 128, &auth_value_len, (unsigned char*)value, strlen(value));
+  mbedtls_base64_decode((unsigned char *)auth_value, 128, &auth_value_len, (unsigned char *)value, strlen(value));
 
   auth_value[auth_value_len] = 0;
 
   char *username = strtok(auth_value, ":");
   char *password = strtok(NULL, "");
+
+  if (username == NULL || password == NULL)
+    return false;
 
   return strcmp(username, auth_user) == 0 && strcmp(password, auth_password) == 0;
 }
@@ -315,6 +426,17 @@ void webserver_auth_challenge(http_req *req)
   webserver_send_status(req, 401, "Unauthorized");
   webserver_send_header(req, "WWW-Authenticate", "Basic realm=\"ESPHTTPD\"");
   webserver_send_header(req, "Access-Control-Allow-Origin", "*");
+
+  send(req->sock, "\r\n", 2, 0);
+}
+
+void webserver_handle_cors_options(http_req *req)
+{
+  webserver_send_status(req, 200, "OK");
+  webserver_send_header(req, "Access-Control-Allow-Origin", "*");
+  webserver_send_header(req, "Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+  webserver_send_header(req, "Access-Control-Allow-Methods", "GET,HEAD,OPTIONS,POST,PUT");
+
   send(req->sock, "\r\n", 2, 0);
 }
 
@@ -323,9 +445,10 @@ void webserver_send_file_response(http_req *req, char *file_path, char *content_
   char *buf = malloc(SEND_BUFFER_SIZE);
   size_t n = 0;
 
-  FILE* f = fopen(file_path, "r");
+  FILE *f = fopen(file_path, "r");
 
-  if (f == NULL) {
+  if (f == NULL)
+  {
     ESP_LOGE(TAG, "File not found %s", file_path);
     webserver_send_not_found(req);
     return;
@@ -343,39 +466,44 @@ void webserver_send_file_response(http_req *req, char *file_path, char *content_
   webserver_send_header(req, "Content-Length", buf);
 
   send(req->sock, "\r\n", 2, 0);
-   
-  while(
-    (n = fread(buf, 1, SEND_BUFFER_SIZE, f)) != 0 &&
-    send(req->sock, buf, n, 0) != -1
-  ){}
+
+  while (
+      (n = fread(buf, 1, SEND_BUFFER_SIZE, f)) != 0 &&
+      send(req->sock, buf, n, 0) != -1)
+  {
+  }
 
   fclose(f);
   free(buf);
 }
 
-static void webserver_send_not_found(http_req *req){
+static void webserver_send_not_found(http_req *req)
+{
   http_res res = {
-    .status_code = 404,
-    .status_text = "Not Found",
-    .content_type = "text/html",
-    .body = "Not found",
-    .body_len = 9
-  };
+      .status_code = 404,
+      .status_text = "Not Found",
+      .content_type = "text/html",
+      .body = "Not found",
+      .body_len = 9};
 
   webserver_send_response(req, &res);
 }
 
-static bool webserver_is_ws_request(http_req* req){
+static bool webserver_is_ws_request(http_req *req)
+{
   char *ws_header = webserver_get_request_header(req, "Upgrade");
 
   return (ws_header != NULL) && (strcmp(ws_header, "websocket") == 0);
 }
 
-ws_ctx* register_ws_ctx(ws_ctx *ctx){
+ws_ctx *register_ws_ctx(ws_ctx *ctx)
+{
   xSemaphoreTake(ws_connection_semaphore, portMAX_DELAY);
 
-  for(int i=0; i < MAX_WS_CONNECTIONS; i++){
-    if(ws_connections[i] == NULL) {
+  for (int i = 0; i < MAX_WS_CONNECTIONS; i++)
+  {
+    if (ws_connections[i] == NULL)
+    {
       ws_connections[i] = ctx;
       xSemaphoreGive(ws_connection_semaphore);
 
@@ -389,11 +517,14 @@ ws_ctx* register_ws_ctx(ws_ctx *ctx){
   return NULL;
 }
 
-void remove_ws_ctx(ws_ctx *ctx){
+void remove_ws_ctx(ws_ctx *ctx)
+{
   xSemaphoreTake(ws_connection_semaphore, portMAX_DELAY);
 
-  for(int i=0; i < MAX_WS_CONNECTIONS; i++){
-    if(ws_connections[i] == ctx) {
+  for (int i = 0; i < MAX_WS_CONNECTIONS; i++)
+  {
+    if (ws_connections[i] == ctx)
+    {
       free(ws_connections[i]);
       ws_connections[i] = NULL;
       xSemaphoreGive(ws_connection_semaphore);
@@ -404,38 +535,44 @@ void remove_ws_ctx(ws_ctx *ctx){
   xSemaphoreGive(ws_connection_semaphore);
 }
 
-err_t webserver_broadcast_ws_message(char* p_data, size_t length, ws_opcode_t opcode){
-  for(int i=0; i < MAX_WS_CONNECTIONS; i++){
-    if(ws_connections[i] != NULL)
+err_t webserver_broadcast_ws_message(char *p_data, size_t length, ws_opcode_t opcode)
+{
+  for (int i = 0; i < MAX_WS_CONNECTIONS; i++)
+  {
+    if (ws_connections[i] != NULL)
       webserver_send_ws_message(ws_connections[i], p_data, length, opcode);
   }
 
   return ESP_OK;
 }
 
-err_t webserver_send_ws_message(ws_ctx *ctx, char* p_data, size_t length, ws_opcode_t opcode){
-	if (ctx->sock == NULL)
-		return ERR_CONN;
+err_t webserver_send_ws_message(ws_ctx *ctx, char *p_data, size_t length, ws_opcode_t opcode)
+{
+  if (ctx->sock == NULL)
+    return ERR_CONN;
 
   const unsigned int data_offset = length < 126 ? sizeof(WS_frame_header_t) : sizeof(WS_frame_header_t) + 2;
-  char* data = malloc(data_offset + length);
+  char *data = malloc(data_offset + length);
 
-	//prepare header
-	WS_frame_header_t *hdr = (WS_frame_header_t*) data;
-	hdr->fin = 0x1;
-	hdr->mask = 0;
-	hdr->reserved = 0;
-	hdr->opcode = opcode;
+  // prepare header
+  WS_frame_header_t *hdr = (WS_frame_header_t *)data;
+  hdr->fin = 0x1;
+  hdr->mask = 0;
+  hdr->reserved = 0;
+  hdr->opcode = opcode;
 
-  if(length < 126) {
-  	hdr->payload_length = length;
-  } else {
-  	hdr->payload_length = 126;
+  if (length < 126)
+  {
+    hdr->payload_length = length;
+  }
+  else
+  {
+    hdr->payload_length = 126;
 
     data[sizeof(WS_frame_header_t)] = (length >> 8) & 0xff;
     data[sizeof(WS_frame_header_t) + 1] = length & 0xff;
   }
-  
+
   memcpy(data + data_offset, p_data, length);
   send(ctx->sock, data, data_offset + length, 0);
 
@@ -443,7 +580,8 @@ err_t webserver_send_ws_message(ws_ctx *ctx, char* p_data, size_t length, ws_opc
   return ESP_OK;
 }
 
-void webserver_accept_ws(ws_ctx *ctx){
+void webserver_accept_ws(ws_ctx *ctx)
+{
   webserver_send_status(ctx, 101, "Switching Protocols");
   webserver_send_header(ctx, "Upgrade", "websocket");
   webserver_send_header(ctx, "Connection", "Upgrade");
@@ -454,22 +592,23 @@ void webserver_accept_ws(ws_ctx *ctx){
   strcpy(ws_concat_keys, ws_client_key);
   strcat(ws_concat_keys, ws_sec_key);
 
-	unsigned char sha1_result[20];
-  esp_sha(SHA1, (unsigned char*) ws_concat_keys, strlen(ws_concat_keys), &sha1_result);
-  
+  unsigned char sha1_result[20];
+  esp_sha(SHA1, (unsigned char *)ws_concat_keys, strlen(ws_concat_keys), &sha1_result);
+
   size_t reply_key_size;
   unsigned char reply_key[64];
   mbedtls_base64_encode(reply_key, 64, &reply_key_size, sha1_result, 20);
 
-  webserver_send_header(ctx, "Sec-WebSocket-Accept", (char *) reply_key);
+  webserver_send_header(ctx, "Sec-WebSocket-Accept", (char *)reply_key);
   send(ctx->sock, "\r\n", 2, 0);
 
   free(ws_concat_keys);
 }
 
-static void webserver_ws_task(void *pvParameter){
-  ws_ctx *ctx = (ws_ctx *) pvParameter;
-	WS_frame_header_t frame_header;
+static void webserver_ws_task(void *pvParameter)
+{
+  ws_ctx *ctx = (ws_ctx *)pvParameter;
+  WS_frame_header_t frame_header;
   int length;
   uint64_t payload_length;
   uint8_t masking_key[4];
@@ -478,26 +617,28 @@ static void webserver_ws_task(void *pvParameter){
 
   register_ws_ctx(ctx);
 
-	while ((length = recv(ctx->sock, (void *) &frame_header, 2, 0)) == 2) {
-	  //check if clients wants to close the connection
-	  if (frame_header.opcode == WS_OP_CLS){
-		  break;
+  while ((length = recv(ctx->sock, (void *)&frame_header, 2, 0)) == 2)
+  {
+    // check if clients wants to close the connection
+    if (frame_header.opcode == WS_OP_CLS)
+    {
+      break;
     }
 
     ws_event event = {
-      .event_type = WS_MESSAGE,
-      .payload = NULL,
-      .len = frame_header.payload_length
-    };
+        .event_type = WS_MESSAGE,
+        .payload = NULL,
+        .len = frame_header.payload_length};
 
-
-    if(event.len == 126){
+    if (event.len == 126)
+    {
       char data[2];
       recv(ctx->sock, data, 2, 0);
 
       event.len = (data[0] << 8) + data[1];
-
-    } else if(event.len == 127){
+    }
+    else if (event.len == 127)
+    {
       char data[4];
       recv(ctx->sock, data, 4, 0);
 
@@ -505,18 +646,20 @@ static void webserver_ws_task(void *pvParameter){
     }
 
     // Read the mask
-    if(frame_header.mask){
-      recv(ctx->sock, (void *) &masking_key, sizeof(masking_key), 0);
+    if (frame_header.mask)
+    {
+      recv(ctx->sock, (void *)&masking_key, sizeof(masking_key), 0);
     }
-    
-    if(event.len > 0){
+
+    if (event.len > 0)
+    {
       event.payload = malloc(event.len);
       recv(ctx->sock, event.payload, event.len, 0);
 
-
-      if(frame_header.mask){
-			  for(int i = 0; i < event.len; i++)
-				  event.payload[i] ^= masking_key[i % WS_MASK_LEN];
+      if (frame_header.mask)
+      {
+        for (int i = 0; i < event.len; i++)
+          event.payload[i] ^= masking_key[i % WS_MASK_LEN];
       }
     }
 
@@ -529,24 +672,28 @@ static void webserver_ws_task(void *pvParameter){
 
   ESP_LOGI(TAG, "WS task end");
 
-  vTaskDelete( NULL );
+  vTaskDelete(NULL);
 }
 
-static void webserver_handle_ws(http_req *req){
+static void webserver_handle_ws(http_req *req)
+{
   ESP_LOGI(TAG, "WS Connection start");
 
   void (*handler)(ws_ctx *, ws_event *) = NULL;
   ws_route *current = ws_routes;
 
-  while(current){
-    if(strcmp(req->url, current->url) == 0){
+  while (current)
+  {
+    if (strcmp(req->url, current->url) == 0)
+    {
       handler = current->callback;
       break;
     }
     current = current->next;
   };
 
-  if(handler){
+  if (handler)
+  {
     ws_ctx *ctx = calloc(1, sizeof(ws_ctx));
 
     ctx->sock = req->sock;
@@ -554,7 +701,7 @@ static void webserver_handle_ws(http_req *req){
     ctx->req = req;
 
     ws_event event = {
-      .event_type = WS_CONNECT,
+        .event_type = WS_CONNECT,
     };
 
     ctx->handler(ctx, &event);
@@ -562,41 +709,49 @@ static void webserver_handle_ws(http_req *req){
     ctx->req = NULL;
 
     xTaskCreate(
-      webserver_ws_task,
-      "webserver_ws_task",
-      2048,
-      ( void * ) ctx,
-      tskIDLE_PRIORITY,
-      NULL
-    );
-  } else {
+        webserver_ws_task,
+        "webserver_ws_task",
+        2048,
+        (void *)ctx,
+        tskIDLE_PRIORITY,
+        NULL);
+  }
+  else
+  {
     webserver_send_not_found(req);
     close(req->sock);
   }
 }
 
-static void webserver_handle_http(http_req *req){
+static void webserver_handle_http(http_req *req)
+{
   void (*handler)(http_req *) = NULL;
   http_route *current = http_routes;
 
-  while(current){
-    if(req->method == current->method && url_match(current->url, req->url, 0, 0)){
+  while (current)
+  {
+    if (req->method == current->method && url_match(current->url, req->url, 0, 0))
+    {
       handler = current->callback;
       break;
     }
     current = current->next;
   };
 
-  if(handler) {
-    if(req->method == POST){
+  if (handler)
+  {
+    if (req->method == POST)
+    {
       char *content_length_str = webserver_get_request_header(req, "Content-Length");
 
       req->remaining_content_length = atoi(content_length_str);
-      //req->remaining_content_length -= req->recv_buf_len;
+      // req->remaining_content_length -= req->recv_buf_len;
     }
 
     handler(req);
-  } else {
+  }
+  else
+  {
     webserver_send_not_found(req);
   }
 
@@ -610,24 +765,24 @@ static void webserver_serve(int clientfd)
 
   err_t err;
   http_req req = {
-    .sock = clientfd,
-    .headers = NULL,
-    .recv_buf = NULL,
-    .recv_buf_len = 0
-  };
+      .sock = clientfd,
+      .headers = NULL,
+      .recv_buf = NULL,
+      .recv_buf_len = 0};
   char *str_method = "GET";
-  
+
   unsigned int c = 0;
   bool reached_body = false;
   unsigned long start_time = esp_timer_get_time();
 
-
-  while(!reached_body){
+  while (!reached_body)
+  {
     int len = recv(req.sock, rx_buffer + rx_buffer_length, sizeof(rx_buffer) - rx_buffer_length - 1, 0);
 
-    if (len < 0) {
-        ESP_LOGE(TAG, "recv failed: errno %d", errno);
-        return;
+    if (len < 0)
+    {
+      ESP_LOGE(TAG, "recv failed: errno %d", errno);
+      return;
     }
 
     rx_buffer_length += len;
@@ -635,21 +790,26 @@ static void webserver_serve(int clientfd)
     char *line_start = rx_buffer;
     char *line_end = NULL;
 
-    while((line_end = strstr(line_start, "\r\n")) != NULL){
+    while ((line_end = strstr(line_start, "\r\n")) != NULL)
+    {
       line_end[0] = 0;
 
-      if(line_start == line_end){
+      if (line_start == line_end)
+      {
         // save anything leftover into the recv buffer
         line_end += 2;
         int leftover_len = (rx_buffer + rx_buffer_length) - line_end;
 
-        if(leftover_len > 0) {
+        if (leftover_len > 0)
+        {
           char *leftover = malloc(leftover_len);
           memcpy(leftover, line_end, leftover_len);
 
           req.recv_buf = leftover;
           req.recv_buf_len = leftover_len;
-        } else {
+        }
+        else
+        {
           free(req.recv_buf);
           req.recv_buf = NULL;
           req.recv_buf_len = 0;
@@ -657,13 +817,17 @@ static void webserver_serve(int clientfd)
 
         reached_body = true;
         break;
-      } else if(c == 0){ // first packet so parse http header
+      }
+      else if (c == 0)
+      { // first packet so parse http header
         str_method = strtok(line_start, " ");
         char *str_url = strtok(NULL, " ");
 
         webserver_set_method(&req, str_method);
         webserver_parse_url_params(&req, str_url);
-      } else {
+      }
+      else
+      {
         webserver_append_request_header(&req, line_start);
       }
 
@@ -672,10 +836,13 @@ static void webserver_serve(int clientfd)
     }
   }
 
-  if(webserver_is_ws_request(&req)){
+  if (webserver_is_ws_request(&req))
+  {
     str_method = "WS";
     webserver_handle_ws(&req);
-  } else {
+  }
+  else
+  {
     webserver_handle_http(&req);
   };
 
@@ -685,75 +852,82 @@ static void webserver_serve(int clientfd)
   webserver_free_request_headers(&req);
 
   free(req.url);
-  free(req.params);
+  webserver_free_params(&req);
 }
 
-void webserver_add_route(http_route new_route){
+void webserver_add_route(http_route new_route)
+{
   http_route *route = malloc(sizeof(http_route));
   memcpy(route, &new_route, sizeof(http_route));
   route->next = NULL;
 
-  if(http_routes == NULL){
+  if (http_routes == NULL)
+  {
     http_routes = route;
     return;
   }
 
   http_route *current_route = http_routes;
-  while(current_route->next){
+  while (current_route->next)
+  {
     current_route = current_route->next;
   }
 
   current_route->next = route;
 }
 
-void webserver_add_ws_route(ws_route new_route){
+void webserver_add_ws_route(ws_route new_route)
+{
   ws_route *route = malloc(sizeof(ws_route));
   memcpy(route, &new_route, sizeof(ws_route));
   route->next = NULL;
 
-  if(ws_routes == NULL){
+  if (ws_routes == NULL)
+  {
     ws_routes = route;
     return;
   }
 
   ws_route *current_route = ws_routes;
-  while(current_route->next){
+  while (current_route->next)
+  {
     current_route = current_route->next;
   }
 
   current_route->next = route;
 }
 
-int webserver_listen(){
+int webserver_listen()
+{
   int sockfd;
-	struct sockaddr_in self;
+  struct sockaddr_in self;
 
-	/** Create streaming socket */
+  /** Create streaming socket */
   if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
-	{
-		ESP_LOGE(TAG, "Socket error");
-		return -1;
-	}
+  {
+    ESP_LOGE(TAG, "Socket error");
+    return -1;
+  }
 
-	/** Initialize address/port structure */
-	bzero(&self, sizeof(self));
-	self.sin_family = AF_INET;
-	self.sin_port = htons(WEBSERVER_PORT);
-	self.sin_addr.s_addr = INADDR_ANY;
+  /** Initialize address/port structure */
+  bzero(&self, sizeof(self));
+  self.sin_family = AF_INET;
+  self.sin_port = htons(WEBSERVER_PORT);
+  self.sin_addr.s_addr = INADDR_ANY;
 
-	/** Assign a port number to the socket */
-  if (bind(sockfd, (struct sockaddr*)&self, sizeof(self)) != 0)
-	{
-		ESP_LOGE(TAG, "Bind error");
-		return -1;
-	}
+  /** Assign a port number to the socket */
+  if (bind(sockfd, (struct sockaddr *)&self, sizeof(self)) != 0)
+  {
+    ESP_LOGE(TAG, "Bind error");
+    return -1;
+  }
 
-	/** Make it a "listening socket". Limit to 20 connections */
-	if (listen(sockfd, 5) != 0)
-	{
-		ESP_LOGE(TAG, "Listen error");
-		return -1;
-	}
+  /** Make it a "listening socket". Limit to 20 connections */
+  if (listen(sockfd, 5) != 0)
+  {
+    ESP_LOGE(TAG, "Listen error");
+    return -1;
+  }
 
   return sockfd;
 }
@@ -763,25 +937,41 @@ static void webserver_task()
   int sockfd = webserver_listen();
 
   while (1)
-	{
+  {
     int clientfd;
-		struct sockaddr_in client_addr;
-		unsigned int addrlen = sizeof(client_addr);
+    struct sockaddr_in client_addr;
+    unsigned int addrlen = sizeof(client_addr);
 
-		/** accept an incomming connection  */
-		clientfd = accept(sockfd, (struct sockaddr *)&client_addr, &addrlen);
+    /** accept an incomming connection  */
+    clientfd = accept(sockfd, (struct sockaddr *)&client_addr, &addrlen);
 
     ESP_LOGI(TAG, "%s:%d connected", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-    //int flags =1;
-    //setsockopt(clientfd, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
 
-		webserver_serve(clientfd);
-	}
+    webserver_serve(clientfd);
+  }
 }
-
 
 void webserver_start(int port)
 {
+  if (esphttpd_task_handle != NULL)
+  {
+    ESP_LOGE(TAG, "webserver already started");
+    return;
+  }
+
   ws_connection_semaphore = xSemaphoreCreateMutex();
-  xTaskCreate(&webserver_task, "webserver_task", 16384, NULL, 10, NULL);
+  xTaskCreate(webserver_task, "webserver_task", 16384, NULL, 10, &esphttpd_task_handle);
+}
+
+void webserver_stop()
+{
+  if (esphttpd_task_handle == NULL)
+  {
+    ESP_LOGE(TAG, "webserver not started");
+    return;
+  }
+
+  vTaskDelete(esphttpd_task_handle);
+  esphttpd_task_handle = NULL;
+  vSemaphoreDelete(ws_connection_semaphore);
 }
