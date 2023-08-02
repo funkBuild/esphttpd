@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include "esp_timer.h"
 
 #include "lwip/err.h"
 #include "lwip/sockets.h"
@@ -20,7 +21,7 @@
 #define WS_MASK_LEN (4)
 
 #define SEND_BUFFER_SIZE 1024
-#define RCV_BUFFER_SIZE 2048
+#define RCV_BUFFER_SIZE 1024
 
 static TaskHandle_t esphttpd_task_handle = NULL;
 static http_route* http_routes = NULL;
@@ -31,8 +32,8 @@ static const char http_resp_main_header[] = "HTTP/1.1 %d %s\r\n";
 static const char http_resp_header[] = "%s: %s\r\n";
 static const char* TAG = "ESPHTTPD";
 
-static SemaphoreHandle_t ws_connection_semaphore;
-static ws_ctx* ws_connections[16] = {NULL};
+static SemaphoreHandle_t ws_connection_semaphore = NULL;
+static ws_ctx* ws_connections[MAX_WS_CONNECTIONS] = {NULL};
 
 void webserver_send_status(http_req* req, int status_code, char* status_text) {
   char buf[128];
@@ -58,7 +59,13 @@ void webserver_send_body(http_req* req, char* body, unsigned int body_len) {
     if (offset + len > body_len) len = body_len - offset;
 
     send(req->sock, body + offset, len, 0);
-    offset += 1024;
+
+    if (errno < 0) {
+      ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
+      break;
+    }
+
+    offset += len;
   }
 }
 
@@ -175,16 +182,21 @@ err_t webserver_pipe_body_to_file(http_req* req, char* file_path) {
     webserver_send_status(req, 100, "Continue");
   }
 
-  unsigned long start_time = esp_timer_get_time();
   char* buf = malloc(RCV_BUFFER_SIZE);
-  unsigned int total_bytes = 0, r = 0, buffer_offset = 0;
+
+  if (buf == NULL) {
+    ESP_LOGE(TAG, "Failed to allocate buffer for upload");
+    return ESP_FAIL;
+  }
+
+  unsigned int r = 0, buffer_offset = 0;
 
   http_upload_params* upload_params = malloc(sizeof(http_upload_params));
   upload_params->running = true;
   upload_params->file_handle = fopen(file_path, "w");
 
   if (upload_params->file_handle == NULL) {
-    printf("Upload failed\n");
+    ESP_LOGE(TAG, "Failed to open file for upload");
     return ESP_FAIL;
   }
 
@@ -196,17 +208,11 @@ err_t webserver_pipe_body_to_file(http_req* req, char* file_path) {
     }
 
     fwrite(buf, buffer_offset, 1, upload_params->file_handle);
-    total_bytes += buffer_offset;
-
     buffer_offset = 0;
   }
 
   fclose(upload_params->file_handle);
   free(buf);
-
-  double delta_time = (esp_timer_get_time() - start_time) / (1000.0 * 1000.0);
-  double result = (total_bytes / 1024.0) / delta_time;
-  ESP_LOGE(TAG, "total_bytes=%d, kB/s=%f, t=%f\n", total_bytes, result, delta_time);
 
   return ESP_OK;
 }
@@ -505,6 +511,7 @@ ws_ctx* register_ws_ctx(ws_ctx* ctx) {
   for (int i = 0; i < MAX_WS_CONNECTIONS; i++) {
     if (ws_connections[i] == NULL) {
       ws_connections[i] = ctx;
+
       xSemaphoreGive(ws_connection_semaphore);
 
       return ctx;
@@ -532,7 +539,29 @@ void remove_ws_ctx(ws_ctx* ctx) {
   xSemaphoreGive(ws_connection_semaphore);
 }
 
+unsigned int webserver_ws_connection_count() {
+  unsigned int count = 0;
+
+  if (esphttpd_task_handle == NULL) return count;
+
+  xSemaphoreTake(ws_connection_semaphore, portMAX_DELAY);
+
+  vTaskDelay(100 / portTICK_PERIOD_MS);
+
+  for (int i = 0; i < MAX_WS_CONNECTIONS; i++) {
+    if (ws_connections[i] != NULL) count++;
+  }
+
+  vTaskDelay(100 / portTICK_PERIOD_MS);
+
+  xSemaphoreGive(ws_connection_semaphore);
+
+  return count;
+}
+
 err_t webserver_broadcast_ws_message(char* p_data, size_t length, ws_opcode_t opcode) {
+  if (esphttpd_task_handle == NULL) return ESP_OK;
+
   for (int i = 0; i < MAX_WS_CONNECTIONS; i++) {
     if (ws_connections[i] != NULL) webserver_send_ws_message(ws_connections[i], p_data, length, opcode);
   }
@@ -541,6 +570,8 @@ err_t webserver_broadcast_ws_message(char* p_data, size_t length, ws_opcode_t op
 }
 
 err_t webserver_send_ws_message(ws_ctx* ctx, char* p_data, size_t length, ws_opcode_t opcode) {
+  if (esphttpd_task_handle == NULL) return ESP_OK;
+
   if (ctx->sock == NULL) return ERR_CONN;
 
   const unsigned int data_offset = length < 126 ? sizeof(WS_frame_header_t) : sizeof(WS_frame_header_t) + 2;
@@ -570,6 +601,10 @@ err_t webserver_send_ws_message(ws_ctx* ctx, char* p_data, size_t length, ws_opc
 }
 
 void webserver_accept_ws(ws_ctx* ctx) {
+  if (ctx->accepted) return;
+
+  ctx->accepted = true;
+
   webserver_send_status(ctx, 101, "Switching Protocols");
   webserver_send_header(ctx, "Upgrade", "websocket");
   webserver_send_header(ctx, "Connection", "Upgrade");
@@ -591,18 +626,15 @@ void webserver_accept_ws(ws_ctx* ctx) {
   send(ctx->sock, "\r\n", 2, 0);
 
   free(ws_concat_keys);
+
+  register_ws_ctx(ctx);
 }
 
 static void webserver_ws_task(void* pvParameter) {
   ws_ctx* ctx = (ws_ctx*)pvParameter;
   WS_frame_header_t frame_header;
   int length;
-  uint64_t payload_length;
   uint8_t masking_key[4];
-
-  ESP_LOGI(TAG, "WS task start");
-
-  register_ws_ctx(ctx);
 
   while ((length = recv(ctx->sock, (void*)&frame_header, 2, 0)) == 2) {
     // check if clients wants to close the connection
@@ -642,10 +674,8 @@ static void webserver_ws_task(void* pvParameter) {
     free(event.payload);
   }
 
-  close(ctx->sock);
   remove_ws_ctx(ctx);
-
-  ESP_LOGI(TAG, "WS task end");
+  close(ctx->sock);
 
   vTaskDelete(NULL);
 }
@@ -677,9 +707,14 @@ static void webserver_handle_ws(http_req* req) {
 
     ctx->handler(ctx, &event);
 
-    ctx->req = NULL;
-
-    xTaskCreate(webserver_ws_task, "webserver_ws_task", 2048, (void*)ctx, tskIDLE_PRIORITY, NULL);
+    if (ctx->accepted) {
+      ctx->req = NULL;
+      xTaskCreate(webserver_ws_task, "webserver_ws_task", 3072, (void*)ctx, tskIDLE_PRIORITY, NULL);
+    } else {
+      webserver_send_not_found(req);
+      close(ctx->sock);
+      free(ctx);
+    }
   } else {
     webserver_send_not_found(req);
     close(req->sock);
@@ -718,19 +753,24 @@ static void webserver_serve(int clientfd) {
   char rx_buffer[1024];
   unsigned int rx_buffer_length = 0;
 
-  err_t err;
   http_req req = {.sock = clientfd, .headers = NULL, .recv_buf = NULL, .recv_buf_len = 0};
   char* str_method = "GET";
 
   unsigned int c = 0;
   bool reached_body = false;
-  unsigned long start_time = esp_timer_get_time();
+  int64_t start_time = esp_timer_get_time();
 
   while (!reached_body) {
     int len = recv(req.sock, rx_buffer + rx_buffer_length, sizeof(rx_buffer) - rx_buffer_length - 1, 0);
 
     if (len < 0) {
       ESP_LOGE(TAG, "recv failed: errno %d", errno);
+
+      close(clientfd);
+      webserver_free_request_headers(&req);
+      webserver_free_params(&req);
+      free(req.url);
+
       return;
     }
 
@@ -781,10 +821,11 @@ static void webserver_serve(int clientfd) {
     webserver_handle_ws(&req);
   } else {
     webserver_handle_http(&req);
+    close(clientfd);
   };
 
-  unsigned long end_time = (esp_timer_get_time() - start_time) / 1000;
-  ESP_LOGI(TAG, "%d %s %lums\n", req.method, req.url, end_time);
+  int64_t end_time = (esp_timer_get_time() - start_time) / 1000;
+  ESP_LOGI(TAG, "%d %s %lldms\n", req.method, req.url, end_time);
 
   webserver_free_request_headers(&req);
 
@@ -883,7 +924,12 @@ void webserver_start(int port) {
   }
 
   ws_connection_semaphore = xSemaphoreCreateMutex();
-  xTaskCreate(webserver_task, "webserver_task", 16384, NULL, 10, &esphttpd_task_handle);
+
+  for (int i = 0; i < MAX_WS_CONNECTIONS; i++) {
+    ws_connections[i] = NULL;
+  }
+
+  xTaskCreate(webserver_task, "webserver_task", 16384, NULL, 6, &esphttpd_task_handle);
 }
 
 void webserver_stop() {

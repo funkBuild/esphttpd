@@ -73,6 +73,7 @@ typedef struct {
 
 struct ws_ctx_t {
   int sock;
+  bool accepted;
   void (*handler)(struct ws_ctx_t*, ws_event*);
   struct http_req_t* req;
 };
@@ -104,6 +105,7 @@ typedef struct {
 err_t webserver_pipe_body_to_file(http_req* req, char* file_path);
 unsigned int webserver_recv_body(http_req* req, char* buf, unsigned int len);
 void webserver_accept_ws(ws_ctx* ctx);
+unsigned int webserver_ws_connection_count();
 static void webserver_send_not_found(http_req* req);
 err_t webserver_broadcast_ws_message(char* p_data, size_t length, ws_opcode_t opcode);
 err_t webserver_send_ws_message(ws_ctx* ctx, char* p_data, size_t length, ws_opcode_t opcode);
