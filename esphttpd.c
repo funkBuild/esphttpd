@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include "esp_timer.h"
+#include <errno.h>
 
 #include "lwip/err.h"
 #include "lwip/sockets.h"
@@ -55,11 +56,10 @@ void webserver_send_body(http_req* req, char* body, unsigned int body_len) {
   int offset = 0;
 
   while (offset < body_len) {
-    int len = 1024;
+    int len = 512;
     if (offset + len > body_len) len = body_len - offset;
 
     send(req->sock, body + offset, len, 0);
-
     if (errno < 0) {
       ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
       break;
