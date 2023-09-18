@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include "esp_timer.h"
 #include <errno.h>
+#include "freertos/event_groups.h"
 
 #include "lwip/err.h"
 #include "lwip/sockets.h"
@@ -24,9 +25,13 @@
 #define SEND_BUFFER_SIZE 1024
 #define RCV_BUFFER_SIZE 1024
 
+#define ESPHTTPD_SHUTDOWN_BIT (1 << 0)
+#define ESPHTTPD_SHUTDOWN_REQUEST_BIT (1 << 1)
+
 static TaskHandle_t esphttpd_task_handle = NULL;
+static EventGroupHandle_t esphttpd_event_group = NULL;
 static http_route* http_routes = NULL;
-static http_route* ws_routes = NULL;
+static ws_route* ws_routes = NULL;
 
 static const char ws_sec_key[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 static const char http_resp_main_header[] = "HTTP/1.1 %d %s\r\n";
@@ -73,8 +78,6 @@ bool starts_with(const char* str, const char* prefix) { return strncmp(str, pref
 
 void webserver_send_body_template(http_req* req, char* body, unsigned int body_len, const char* start_delim,
                                   const char* end_delim, variable_callback var_cb) {
-  ESP_LOGI(TAG, "start delim: %s, end delim: %s", start_delim, end_delim);
-
   send(req->sock, "\r\n", 2, 0);
 
   int offset = 0;
@@ -306,8 +309,6 @@ http_param* webserver_get_param(http_req* req, char* name) {
 }
 
 void webserver_add_param(http_req* req, char* name, char* value) {
-  ESP_LOGI(TAG, "PARAM. name=%s value=%s", name, value);
-
   http_param* new_param = malloc(sizeof(http_param));
   new_param->name = strdup(name);
   new_param->value = strdup(value);
@@ -336,8 +337,6 @@ void webserver_free_params(http_req* req) {
 }
 
 void webserver_parse_params(http_req* req, char* params) {
-  ESP_LOGI(TAG, "PARAMS. %s", params);
-
   char* saveptr1;
   char* saveptr2;
   char* param = strtok_r(params, "&", &saveptr1);
@@ -480,7 +479,7 @@ void webserver_send_file_response(http_req* req, char* file_path, char* content_
   webserver_send_header(req, "Access-Control-Allow-Origin", "*");
   webserver_send_header(req, "Access-Control-Expose-Headers", "Content-Length");
   webserver_send_header(req, "Content-Type", content_type);
-  sprintf(buf, "%u", file_size);
+  snprintf(buf, 128, "%u", file_size);
   webserver_send_header(req, "Content-Length", buf);
 
   send(req->sock, "\r\n", 2, 0);
@@ -605,9 +604,9 @@ void webserver_accept_ws(ws_ctx* ctx) {
 
   ctx->accepted = true;
 
-  webserver_send_status(ctx, 101, "Switching Protocols");
-  webserver_send_header(ctx, "Upgrade", "websocket");
-  webserver_send_header(ctx, "Connection", "Upgrade");
+  webserver_send_status(ctx->req, 101, "Switching Protocols");
+  webserver_send_header(ctx->req, "Upgrade", "websocket");
+  webserver_send_header(ctx->req, "Connection", "Upgrade");
 
   char* ws_client_key = webserver_get_request_header(ctx->req, "Sec-WebSocket-Key");
   char* ws_concat_keys = malloc(strlen(ws_client_key) + strlen(ws_sec_key) + 1);
@@ -622,7 +621,7 @@ void webserver_accept_ws(ws_ctx* ctx) {
   unsigned char reply_key[64];
   mbedtls_base64_encode(reply_key, 64, &reply_key_size, sha1_result, 20);
 
-  webserver_send_header(ctx, "Sec-WebSocket-Accept", (char*)reply_key);
+  webserver_send_header(ctx->req, "Sec-WebSocket-Accept", (char*)reply_key);
   send(ctx->sock, "\r\n", 2, 0);
 
   free(ws_concat_keys);
@@ -635,10 +634,36 @@ static void webserver_ws_task(void* pvParameter) {
   WS_frame_header_t frame_header;
   int length;
   uint8_t masking_key[4];
+  fd_set read_fds;
+  struct timeval timeout;
 
-  while ((length = recv(ctx->sock, (void*)&frame_header, 2, 0)) == 2) {
-    // check if clients wants to close the connection
-    if (frame_header.opcode == WS_OP_CLS) {
+  while (1) {
+    FD_ZERO(&read_fds);
+    FD_SET(ctx->sock, &read_fds);
+
+    // Set timeout for select
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+
+    int ret = select(ctx->sock + 1, &read_fds, NULL, NULL, &timeout);
+
+    if (ret < 0) {
+      ESP_LOGE(TAG, "Select error: %s", strerror(errno));
+      break;
+    } else if (ret == 0) {
+      // Timeout
+      if ((xEventGroupGetBits(esphttpd_event_group) & ESPHTTPD_SHUTDOWN_REQUEST_BIT) != 0) {
+        ESP_LOGI(TAG, "Shutdown request received. Exiting websocket task.");
+        break;
+      }
+      continue;
+    }
+
+    // If we're here, there's data ready to be received
+    length = recv(ctx->sock, (void*)&frame_header, 2, 0);
+
+    // Check if client wants to close the connection or if recv() had an error
+    if (length != 2 || frame_header.opcode == WS_OP_CLS) {
       break;
     }
 
@@ -647,12 +672,10 @@ static void webserver_ws_task(void* pvParameter) {
     if (event.len == 126) {
       char data[2];
       recv(ctx->sock, data, 2, 0);
-
       event.len = (data[0] << 8) + data[1];
     } else if (event.len == 127) {
       char data[4];
       recv(ctx->sock, data, 4, 0);
-
       event.len = (data[0] << 24) + (data[1] << 16) + (data[2] << 8) + data[3];
     }
 
@@ -674,9 +697,8 @@ static void webserver_ws_task(void* pvParameter) {
     free(event.payload);
   }
 
-  remove_ws_ctx(ctx);
   close(ctx->sock);
-
+  remove_ws_ctx(ctx);
   vTaskDelete(NULL);
 }
 
@@ -709,7 +731,7 @@ static void webserver_handle_ws(http_req* req) {
 
     if (ctx->accepted) {
       ctx->req = NULL;
-      xTaskCreate(webserver_ws_task, "webserver_ws_task", 3072, (void*)ctx, tskIDLE_PRIORITY, NULL);
+      xTaskCreate(webserver_ws_task, "webserver_ws_task", 3072, (void*)ctx, tskIDLE_PRIORITY, &ctx->task_handle);
     } else {
       webserver_send_not_found(req);
       close(ctx->sock);
@@ -869,31 +891,59 @@ void webserver_add_ws_route(ws_route new_route) {
   current_route->next = route;
 }
 
+void webserver_remove_all_routes() {
+  http_route* current_route = http_routes;
+
+  while (current_route) {
+    http_route* next_route = current_route->next;
+    free(current_route);
+    current_route = next_route;
+  }
+
+  http_routes = NULL;
+}
+
+void webserver_remove_all_ws_routes() {
+  ws_route* current_route = ws_routes;
+  while (current_route) {
+    ws_route* next_route = current_route->next;
+    free(current_route);
+    current_route = next_route;
+  }
+  ws_routes = NULL;
+}
+
 int webserver_listen() {
   int sockfd;
   struct sockaddr_in self;
 
-  /** Create streaming socket */
+  // Create streaming socket
   if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
     ESP_LOGE(TAG, "Socket error");
     return -1;
   }
 
-  /** Initialize address/port structure */
+  // Set socket to allow re-use of local addresses
+  int optval = 1;
+  setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+
+  // Initialize address/port structure
   bzero(&self, sizeof(self));
   self.sin_family = AF_INET;
   self.sin_port = htons(WEBSERVER_PORT);
   self.sin_addr.s_addr = INADDR_ANY;
 
-  /** Assign a port number to the socket */
+  // Assign a port number to the socket
   if (bind(sockfd, (struct sockaddr*)&self, sizeof(self)) != 0) {
     ESP_LOGE(TAG, "Bind error");
+    close(sockfd);
     return -1;
   }
 
-  /** Make it a "listening socket". Limit to 20 connections */
+  // Make it a "listening socket". Limit to 20 connections
   if (listen(sockfd, 5) != 0) {
     ESP_LOGE(TAG, "Listen error");
+    close(sockfd);
     return -1;
   }
 
@@ -902,19 +952,54 @@ int webserver_listen() {
 
 static void webserver_task() {
   int sockfd = webserver_listen();
+  fd_set read_fds;
+  struct timeval timeout;
 
   while (1) {
+    FD_ZERO(&read_fds);
+    FD_SET(sockfd, &read_fds);
+
+    // Set timeout for select
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+
+    int ret = select(sockfd + 1, &read_fds, NULL, NULL, &timeout);
+
+    if (ret < 0) {
+      ESP_LOGE(TAG, "Select error: %s", strerror(errno));
+      continue;
+    } else if (ret == 0) {
+      // Timeout
+      if ((xEventGroupGetBits(esphttpd_event_group) & ESPHTTPD_SHUTDOWN_REQUEST_BIT) != 0) {
+        ESP_LOGI(TAG, "Shutdown request received. Exiting webserver task.");
+        break;
+      }
+
+      continue;
+    }
+
+    // If we're here, there's a connection ready to be accepted
     int clientfd;
     struct sockaddr_in client_addr;
     unsigned int addrlen = sizeof(client_addr);
 
-    /** accept an incomming connection  */
     clientfd = accept(sockfd, (struct sockaddr*)&client_addr, &addrlen);
-
-    ESP_LOGI(TAG, "%s:%d connected", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-
-    webserver_serve(clientfd);
+    if (clientfd >= 0) {
+      ESP_LOGI(TAG, "%s:%d connected", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+      webserver_serve(clientfd);
+    }
   }
+
+  ESP_LOGI(TAG, "Exiting webserver task.");
+  close(sockfd);
+
+  while (webserver_ws_connection_count() > 0) {
+    ESP_LOGI(TAG, "Waiting for %d websocket connections to close", webserver_ws_connection_count());
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+
+  xEventGroupSetBits(esphttpd_event_group, ESPHTTPD_SHUTDOWN_BIT);
+  vTaskDelete(NULL);
 }
 
 void webserver_start(int port) {
@@ -923,7 +1008,13 @@ void webserver_start(int port) {
     return;
   }
 
+  ESP_LOGI(TAG, "Starting webserver on port %d", port);
+
   ws_connection_semaphore = xSemaphoreCreateMutex();
+  esphttpd_event_group = xEventGroupCreate();
+
+  // Clear all bits
+  xEventGroupClearBits(esphttpd_event_group, ESPHTTPD_SHUTDOWN_BIT | ESPHTTPD_SHUTDOWN_REQUEST_BIT);
 
   for (int i = 0; i < MAX_WS_CONNECTIONS; i++) {
     ws_connections[i] = NULL;
@@ -938,7 +1029,16 @@ void webserver_stop() {
     return;
   }
 
-  vTaskDelete(esphttpd_task_handle);
+  xEventGroupSetBits(esphttpd_event_group, ESPHTTPD_SHUTDOWN_REQUEST_BIT);
+
+  // Wait for the task to exit
+  xEventGroupWaitBits(esphttpd_event_group, ESPHTTPD_SHUTDOWN_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+
   esphttpd_task_handle = NULL;
+
   vSemaphoreDelete(ws_connection_semaphore);
+  vEventGroupDelete(esphttpd_event_group);
+
+  webserver_remove_all_routes();
+  webserver_remove_all_ws_routes();
 }
