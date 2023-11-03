@@ -24,17 +24,12 @@
 #include <arpa/inet.h>
 #include <lwip/netdb.h>
 
-#define SO_REUSE 1
-
 #define WEBSERVER_PORT (80)
 #define MAX_WS_CONNECTIONS (16)
 #define WS_MASK_LEN (4)
 
 #define SEND_BUFFER_SIZE 1024
 #define RCV_BUFFER_SIZE 1024
-
-#define ESPHTTPD_SHUTDOWN_BIT (1 << 0)
-#define ESPHTTPD_SHUTDOWN_REQUEST_BIT (1 << 1)
 
 static TaskHandle_t esphttpd_task_handle = NULL;
 static EventGroupHandle_t esphttpd_event_group = NULL;

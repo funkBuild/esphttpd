@@ -93,11 +93,7 @@ typedef struct http_route_t http_route;
 
 struct ws_route_t {
   char* url;
-<<<<<<< HEAD
   void (*callback)(ws_ctx*, ws_event*);
-=======
-  void (*callback)(struct ws_ctx_t*, ws_event*);
->>>>>>> master
   struct ws_route_t* next;
 };
 typedef struct ws_route_t ws_route;
