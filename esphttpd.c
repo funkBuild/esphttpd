@@ -33,10 +33,6 @@
 #define SEND_BUFFER_SIZE 1024
 #define RCV_BUFFER_SIZE 1024
 
-#define ERR_BUF_FULL -1      // Error code for buffer being full
-#define ERR_ALLOC_FAILED -2  // Error code for allocation failure
-#define ERR_RECV_FAILED -3   // Error code for receive failure
-
 static TaskHandle_t esphttpd_task_handle = NULL;
 static http_route* http_routes = NULL;
 static ws_route* ws_routes = NULL;
@@ -1052,7 +1048,6 @@ struct netconn* webserver_listen() {
     return NULL;
   }
 
-  /** Make it a "listening socket". Limit to 5 connections */
   if (netconn_listen(conn) != ERR_OK) {
     ESP_LOGE(TAG, "Listen error");
     netconn_delete(conn);
