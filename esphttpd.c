@@ -33,10 +33,13 @@
 #define SEND_BUFFER_SIZE 1024
 #define RCV_BUFFER_SIZE 1024
 
+#define ESPHTTPD_SHUTDOWN_BIT (1 << 0)
+#define ESPHTTPD_SHUTDOWN_REQUEST_BIT (1 << 1)
+
 static TaskHandle_t esphttpd_task_handle = NULL;
+static EventGroupHandle_t esphttpd_event_group = NULL;
 static http_route* http_routes = NULL;
 static ws_route* ws_routes = NULL;
-static EventGroupHandle_t esphttpd_event_group = NULL;
 static struct netconn* port_bind_conn = NULL;
 
 static const char ws_sec_key[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -547,7 +550,7 @@ void webserver_send_file_response(http_req* req, const char* file_path, const ch
   webserver_send_header(req, "Access-Control-Allow-Origin", "*");
   webserver_send_header(req, "Access-Control-Expose-Headers", "Content-Length");
   webserver_send_header(req, "Content-Type", content_type);
-  sprintf(buf, "%u", (unsigned int)file_size);
+  snprintf(buf, 128, "%u", (unsigned int)file_size);
   webserver_send_header(req, "Content-Length", buf);
 
   netconn_write(req->conn, "\r\n", 2, NETCONN_COPY);
@@ -857,7 +860,7 @@ static void webserver_handle_ws(http_req* req) {
 
     if (ctx->accepted) {
       ctx->req = NULL;
-      xTaskCreate(webserver_ws_task, "webserver_ws_task", 3072, (void*)ctx, tskIDLE_PRIORITY, NULL);
+      xTaskCreate(webserver_ws_task, "webserver_ws_task", 3072, (void*)ctx, tskIDLE_PRIORITY, &ctx->task_handle);
     } else {
       webserver_send_not_found(req);
       netconn_close(ctx->conn);
@@ -1105,6 +1108,8 @@ void webserver_start(int port) {
     ESP_LOGE(TAG, "webserver already started");
     return;
   }
+
+  ESP_LOGI(TAG, "Starting webserver on port %d", port);
 
   ws_connection_semaphore = xSemaphoreCreateMutex();
   esphttpd_event_group = xEventGroupCreate();

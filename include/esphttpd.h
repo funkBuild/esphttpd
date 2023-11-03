@@ -79,6 +79,7 @@ struct ws_ctx_t {
   bool accepted;
   void (*handler)(struct ws_ctx_t*, ws_event*);
   struct http_req_t* req;
+  TaskHandle_t task_handle;
 };
 typedef struct ws_ctx_t ws_ctx;
 
@@ -92,7 +93,11 @@ typedef struct http_route_t http_route;
 
 struct ws_route_t {
   char* url;
+<<<<<<< HEAD
   void (*callback)(ws_ctx*, ws_event*);
+=======
+  void (*callback)(struct ws_ctx_t*, ws_event*);
+>>>>>>> master
   struct ws_route_t* next;
 };
 typedef struct ws_route_t ws_route;
