@@ -1089,7 +1089,9 @@ static void webserver_task(void* pvParameters) {
       } else {
         // Handle other types of errors
         ESP_LOGE(TAG, "Accept error: %d", err);
-        break;  // or handle as needed
+        netconn_close(new_conn);
+        netconn_delete(new_conn);
+        break;
       }
     }
   }
@@ -1115,7 +1117,7 @@ void webserver_start(int port) {
     ws_connections[i] = NULL;
   }
 
-  xTaskCreate(webserver_task, "webserver_task", 16384, NULL, 5, &esphttpd_task_handle);
+  xTaskCreate(webserver_task, "webserver_task", 8192, NULL, 5, &esphttpd_task_handle);
 }
 
 void webserver_stop() {
