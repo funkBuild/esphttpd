@@ -2,6 +2,7 @@
 #define _ESPHTTPD_H_
 
 #include "lwip/api.h"
+#include "freertos/ringbuf.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -13,7 +14,7 @@ extern "C" {
 #define IS_SHUTDOWN() ((xEventGroupGetBits(esphttpd_event_group) & TASK_SHUTDOWN_BIT) != 0)
 
 typedef char* (*variable_callback)(const char* var_name);
-typedef enum http_method { GET, HEAD, POST, PUT, DELETE, OPTIONS } http_method;
+typedef enum http_method { GET, HEAD, POST, PUT, DELETE, OPTIONS, WS } http_method;
 typedef enum ws_event_type { WS_CONNECT, WS_DISCONNECT, WS_MESSAGE } ws_event_type;
 typedef enum {
   WS_OP_CON = 0x0, /*!< Continuation Frame*/
@@ -53,6 +54,7 @@ struct http_req_t {
   char* recv_buf;
   unsigned int recv_buf_len;
   unsigned int remaining_content_length;
+  unsigned int rx_bytes;
 };
 typedef struct http_req_t http_req;
 
@@ -80,6 +82,7 @@ struct ws_ctx_t {
   void (*handler)(struct ws_ctx_t*, ws_event*);
   struct http_req_t* req;
   TaskHandle_t task_handle;
+  RingbufHandle_t send_queue;
 };
 typedef struct ws_ctx_t ws_ctx;
 

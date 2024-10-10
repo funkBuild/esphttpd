@@ -232,92 +232,122 @@ err_t webserver_pipe_body_to_file(http_req* req, char* file_path) {
 }
 
 size_t webserver_recv_body(http_req* req, char* buf, unsigned int len) {
-  if (!req || !buf) {
-    ESP_LOGE(TAG, "Invalid request or buffer");
-    return 0;
-  }
-
-  len = req->remaining_content_length < len ? req->remaining_content_length : len;
-
-  if (len == 0) {
+  if (!req || !buf || len == 0) {
+    ESP_LOGE(TAG, "Invalid request, buffer, or zero length");
     return 0;
   }
 
   unsigned int copied_len = 0;
 
   // Handle previously received data that hasn't been processed yet.
-  if (req->recv_buf) {
+  if (req->recv_buf && req->recv_buf_len > 0) {
     unsigned int chunk_len = req->recv_buf_len < len ? req->recv_buf_len : len;
     memcpy(buf, req->recv_buf, chunk_len);
     copied_len += chunk_len;
-    req->remaining_content_length -= chunk_len;
 
     if (chunk_len < req->recv_buf_len) {
       unsigned int leftover_len = req->recv_buf_len - chunk_len;
-      char* leftover = (char*)malloc(leftover_len);
-      if (!leftover) {
-        ESP_LOGE(TAG, "Leftover memory allocation failed. %d", leftover_len);
-        vPortFree(req->recv_buf);
-        req->recv_buf = NULL;
-        req->recv_buf_len = 0;
-        return copied_len;
-      }
-
-      memcpy(leftover, req->recv_buf + chunk_len, leftover_len);
-      free(req->recv_buf);
-      req->recv_buf = leftover;
+      memmove(req->recv_buf, req->recv_buf + chunk_len, leftover_len);
       req->recv_buf_len = leftover_len;
+
+      // Optionally shrink the buffer to save memory
+      char* new_buf = (char*)realloc(req->recv_buf, leftover_len);
+      if (new_buf || leftover_len == 0) {
+        req->recv_buf = new_buf;
+      }
     } else {
       free(req->recv_buf);
       req->recv_buf = NULL;
       req->recv_buf_len = 0;
     }
 
-    if (copied_len == len) {
-      return copied_len;  // Buffer is full.
+    len -= chunk_len;
+    req->remaining_content_length -= chunk_len;
+
+    if (len == 0 || req->remaining_content_length == 0) {
+      return copied_len;  // Buffer is full or no more content
     }
   }
 
-  struct netbuf* nb;
-  if (netconn_recv(req->conn, &nb) == ERR_OK) {
-    void* data;
-    u16_t datalen;
-    netbuf_data(nb, &data, &datalen);
+  // Adjust len based on remaining content length
+  if (req->remaining_content_length < len) {
+    len = req->remaining_content_length;
+  }
 
-    ESP_LOGV(TAG, "Received %d bytes", datalen);
+  if (len == 0) {
+    return copied_len;  // No more data to read
+  }
 
-    unsigned int to_copy = len - copied_len < datalen ? len - copied_len : datalen;
-    memcpy(buf + copied_len, data, to_copy);
+  while (copied_len < len && req->remaining_content_length > 0) {
+    struct netbuf* nb;
+    err_t err = netconn_recv(req->conn, &nb);
+    if (err == ERR_OK) {
+      // Get the total length of data in netbuf
+      u16_t total_len = netbuf_len(nb);
 
-    req->remaining_content_length -= to_copy;
-    copied_len += to_copy;
+      // Compute the amount to copy
+      unsigned int to_copy = len - copied_len < total_len ? len - copied_len : total_len;
+      if (to_copy > req->remaining_content_length) {
+        to_copy = req->remaining_content_length;
+      }
 
-    if (datalen > to_copy) {
-      unsigned int leftover_len = datalen - to_copy;
+      // Copy to_copy bytes from netbuf into buf
+      netbuf_copy_partial(nb, buf + copied_len, to_copy, 0);
+      copied_len += to_copy;
+      req->remaining_content_length -= to_copy;
+      req->rx_bytes += to_copy;
 
-      if (leftover_len > 0) {
-        char* leftover = (char*)malloc(leftover_len);
-        if (!leftover) {
+      if (to_copy < total_len) {
+        // There is leftover data
+        unsigned int leftover_len = total_len - to_copy;
+
+        // Allocate memory for the new data
+        char* new_data = (char*)malloc(leftover_len);
+        if (!new_data) {
           ESP_LOGE(TAG, "Leftover memory allocation failed. %d", leftover_len);
           netbuf_delete(nb);
-          return copied_len;  // Note: Consider returning an error code here.
+          return 0;
         }
 
-        memcpy(leftover, (char*)data + to_copy, leftover_len);
+        // Copy the leftover data into new_data
+        netbuf_copy_partial(nb, new_data, leftover_len, to_copy);
+
         if (req->recv_buf) {
-          free(req->recv_buf);  // Free old buffer if it exists.
+          // Extend recv_buf to hold existing data plus new data
+          char* extended_buf = (char*)realloc(req->recv_buf, req->recv_buf_len + leftover_len);
+          if (!extended_buf) {
+            ESP_LOGE(TAG, "Realloc failed when extending recv_buf");
+            free(new_data);
+            netbuf_delete(nb);
+            return 0;
+          }
+          // Append new_data to the end of extended_buf
+          memcpy(extended_buf + req->recv_buf_len, new_data, leftover_len);
+          req->recv_buf = extended_buf;
+          req->recv_buf_len += leftover_len;
+          free(new_data);
+        } else {
+          // recv_buf does not exist, so set it to new_data
+          req->recv_buf = new_data;
+          req->recv_buf_len = leftover_len;
         }
-        req->recv_buf = leftover;
-        req->recv_buf_len = leftover_len;
       }
+
+      netbuf_delete(nb);
+
+      if (copied_len >= len || req->remaining_content_length == 0) {
+        // Buffer is full or no more content
+        break;
+      }
+    } else if (err == ERR_TIMEOUT) {
+      // Handle reception timeout
+      ESP_LOGE(TAG, "Reception timeout");
+      return 0;  // Indicate an error to the caller
+    } else {
+      // Handle reception error
+      ESP_LOGE(TAG, "Reception error: %d", err);
+      return 0;  // Indicate an error to the caller
     }
-
-    ESP_LOGV(TAG, "Remaining content length: %d", req->remaining_content_length);
-
-    netbuf_delete(nb);
-  } else {
-    // Handle reception error
-    ESP_LOGE(TAG, "Reception error");
   }
 
   return copied_len;
@@ -356,6 +386,27 @@ int webserver_set_method(http_req* req, char* str_method) {
   }
 
   return 0;
+}
+
+char* webserver_method_to_string(http_req* req) {
+  switch (req->method) {
+    case GET:
+      return "GET";
+    case HEAD:
+      return "HEAD";
+    case POST:
+      return "POST";
+    case PUT:
+      return "PUT";
+    case DELETE:
+      return "DELETE";
+    case OPTIONS:
+      return "OPTIONS";
+    case WS:
+      return "WS";
+    default:
+      return "UNKNOWN";
+  }
 }
 
 http_param* webserver_get_param(http_req* req, char* name) {
@@ -601,7 +652,6 @@ void remove_ws_ctx(ws_ctx* ctx) {
 
   for (int i = 0; i < MAX_WS_CONNECTIONS; i++) {
     if (ws_connections[i] == ctx) {
-      free(ws_connections[i]);
       ws_connections[i] = NULL;
       xSemaphoreGive(ws_connection_semaphore);
       return;
@@ -618,13 +668,9 @@ unsigned int webserver_ws_connection_count() {
 
   xSemaphoreTake(ws_connection_semaphore, portMAX_DELAY);
 
-  vTaskDelay(100 / portTICK_PERIOD_MS);
-
   for (int i = 0; i < MAX_WS_CONNECTIONS; i++) {
     if (ws_connections[i] != NULL) count++;
   }
-
-  vTaskDelay(100 / portTICK_PERIOD_MS);
 
   xSemaphoreGive(ws_connection_semaphore);
 
@@ -634,9 +680,29 @@ unsigned int webserver_ws_connection_count() {
 err_t webserver_broadcast_ws_message(char* p_data, size_t length, ws_opcode_t opcode) {
   if (esphttpd_task_handle == NULL) return ESP_OK;
 
+  xSemaphoreTake(ws_connection_semaphore, portMAX_DELAY);
+
   for (int i = 0; i < MAX_WS_CONNECTIONS; i++) {
-    if (ws_connections[i] != NULL) webserver_send_ws_message(ws_connections[i], p_data, length, opcode);
+    if (ws_connections[i] != NULL) {
+      uint8_t* buf;
+      const size_t ringbuf_item_size = length + 1;
+
+      if (xRingbufferSendAcquire(ws_connections[i]->send_queue, (void**)&buf, ringbuf_item_size, 0) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to acquire ringbuffer space");
+        continue;
+      }
+
+      buf[0] = opcode;
+      memcpy(buf + 1, p_data, length);
+
+      if (xRingbufferSendComplete(ws_connections[i]->send_queue, buf) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to complete ringbuffer send");
+        return false;
+      }
+    }
   }
+
+  xSemaphoreGive(ws_connection_semaphore);
 
   return ESP_OK;
 }
@@ -673,6 +739,8 @@ err_t webserver_send_ws_message(ws_ctx* ctx, const char* p_data, size_t length, 
   }
 
   memcpy(data + data_offset, p_data, length);
+
+  ESP_LOG_BUFFER_HEX(TAG, data, data_offset + length);
 
   err_t err = netconn_write(ctx->conn, data, data_offset + length, NETCONN_COPY);
 
@@ -728,23 +796,74 @@ static void webserver_ws_task(void* pvParameter) {
   struct netbuf* buf;
   uint8_t masking_key[WS_MASK_LEN] = {0, 0, 0, 0};
 
-  netconn_set_recvtimeout(ctx->conn, 1000);  // timeout in milliseconds
+  netconn_set_recvtimeout(ctx->conn, 250);
+  // netconn_set_sendtimeout(ctx->conn, 100); // NOTE: DO NOT USE THIS. Sending will fail.
+
+  ESP_LOGW(TAG, "WS Task started. conn=%p", ctx->conn);
 
   while (!IS_SHUTDOWN_REQUESTED()) {
+    // Check for messages in the queue
+    size_t send_size;
+    uint8_t* send_data = NULL;
+
+    while ((send_data = (uint8_t*)xRingbufferReceive(ctx->send_queue, &send_size, 0)) != NULL) {
+      ws_opcode_t opcode = send_data[0];
+      char* payload = (char*)send_data + 1;
+      size_t payload_len = send_size - 1;
+
+      webserver_send_ws_message(ctx, payload, payload_len, opcode);
+      vRingbufferReturnItem(ctx->send_queue, send_data);
+    }
+
+    // Receive data from the client
     err_t err = netconn_recv(ctx->conn, &buf);
 
     if (err == ERR_OK) {
-      uint8_t* data;
-      u16_t len;
-      netbuf_data(buf, (void*)&data, &len);
-
-      WS_frame_header_t* frame_header = (WS_frame_header_t*)data;
-      data += sizeof(WS_frame_header_t);
-
-      // check if clients want to close the connection
-      if (frame_header->opcode == WS_OP_CLS) {
+      // Get the total length of data in the netbuf chain
+      u16_t total_len = netbuf_len(buf);
+      if (total_len == 0) {
         netbuf_delete(buf);
-        buf = NULL;
+        continue;
+      }
+
+      // Allocate a buffer to hold all data
+      uint8_t* data = (uint8_t*)malloc(total_len);
+      if (!data) {
+        ESP_LOGE(TAG, "Memory allocation failed");
+        netbuf_delete(buf);
+        continue;
+      }
+
+      // Copy all data from netbuf into data buffer
+      u16_t copied_len = netbuf_copy(buf, data, total_len);
+      if (copied_len != total_len) {
+        ESP_LOGE(TAG, "Failed to copy all data from netbuf");
+        free(data);
+        netbuf_delete(buf);
+        continue;
+      }
+
+      // Delete the netbuf as we've copied all its data
+      netbuf_delete(buf);
+      buf = NULL;
+
+      uint8_t* ptr = data;  // Pointer to navigate through data
+      uint8_t* data_end = data + total_len;
+
+      // Ensure there's enough data for the frame header
+      if (total_len < sizeof(WS_frame_header_t)) {
+        ESP_LOGE(TAG, "Incomplete frame header");
+        free(data);
+        continue;
+      }
+
+      // Parse the frame header
+      WS_frame_header_t* frame_header = (WS_frame_header_t*)ptr;
+      ptr += sizeof(WS_frame_header_t);
+
+      // Check if the client wants to close the connection
+      if (frame_header->opcode == WS_OP_CLS) {
+        free(data);
         break;
       }
 
@@ -754,67 +873,102 @@ static void webserver_ws_task(void* pvParameter) {
           .len = frame_header->payload_length,
       };
 
+      // Handle extended payload lengths
       if (event.len == 126) {
-        event.len = (data[0] << 8) + data[1];
-        data += 2;
+        // Ensure enough data for extended payload length (16 bits)
+        if ((ptr + 2) > data_end) {
+          ESP_LOGE(TAG, "Incomplete extended payload length (16 bits)");
+          free(data);
+          continue;
+        }
+        event.len = (ptr[0] << 8) | ptr[1];
+        ptr += 2;
       } else if (event.len == 127) {
-        // Use uint64_t for the extended payload length
-
+        // Ensure enough data for extended payload length (64 bits)
+        if ((ptr + 8) > data_end) {
+          ESP_LOGE(TAG, "Incomplete extended payload length (64 bits)");
+          free(data);
+          continue;
+        }
         uint64_t extended_payload_length = 0;
         for (int i = 0; i < 8; i++) {
-          extended_payload_length = (extended_payload_length << 8) + (uint8_t)data[i];
+          extended_payload_length = (extended_payload_length << 8) | ptr[i];
         }
         event.len = extended_payload_length;
-
-        data += 8;
+        ptr += 8;
       }
 
-      // Read the mask
+      // Read the masking key if present
       if (frame_header->mask) {
-        memcpy(masking_key, data, WS_MASK_LEN);
-        data += WS_MASK_LEN;
+        if ((ptr + WS_MASK_LEN) > data_end) {
+          ESP_LOGE(TAG, "Incomplete masking key");
+          free(data);
+          continue;
+        }
+        memcpy(masking_key, ptr, WS_MASK_LEN);
+        ptr += WS_MASK_LEN;
       }
 
-      if (event.len > 0) {
-        event.payload = malloc(event.len);
+      // Ensure enough data for the payload
+      if ((ptr + event.len) > data_end) {
+        ESP_LOGE(TAG, "Incomplete payload data");
+        free(data);
+        continue;
+      }
 
-        if (event.payload == NULL) {
-          // Handle memory allocation failure
-          netbuf_delete(buf);
-          buf = NULL;
+      // Allocate memory for the payload
+      if (event.len > 0) {
+        event.payload = (char*)malloc(event.len);
+        if (!event.payload) {
+          ESP_LOGE(TAG, "Memory allocation failed for payload");
+          free(data);
           continue;
         }
 
+        // Unmask the payload if necessary
         if (frame_header->mask) {
-          for (int i = 0; i < event.len; i++) {
-            event.payload[i] = data[i] ^ masking_key[i % WS_MASK_LEN];
+          for (uint64_t i = 0; i < event.len; i++) {
+            event.payload[i] = ptr[i] ^ masking_key[i % WS_MASK_LEN];
           }
+        } else {
+          memcpy(event.payload, ptr, event.len);
         }
       }
 
+      // Call the handler with the event
       ctx->handler(ctx, &event);
 
-      if (event.payload != NULL) {
+      // Free allocated resources
+      if (event.payload) {
         free(event.payload);
       }
-
-      netbuf_delete(buf);
-      buf = NULL;
+      free(data);
     } else if (err == ERR_TIMEOUT) {
       continue;
     } else {
-      break;  // Socket error occured
+      // Break on other errors
+      ESP_LOGW(TAG, "WS Task error: %d", err);
+      break;
     }
 
+    // Cleanup in case of partial errors
     if (buf != NULL) {
       netbuf_delete(buf);
       buf = NULL;
     }
   }
 
+  // Cleanup context and close connection
+
+  ESP_LOGW(TAG, "WS Task ended. conn=%p", ctx->conn);
+
   if (ctx != NULL) {
     remove_ws_ctx(ctx);
     netconn_close(ctx->conn);
+    netconn_delete(ctx->conn);
+    ctx->conn = NULL;
+    vRingbufferDelete(ctx->send_queue);
+    free(ctx);
   }
 
   vTaskDelete(NULL);
@@ -832,40 +986,44 @@ static void webserver_handle_ws(http_req* req) {
     current = current->next;
   };
 
-  if (handler) {
-    ws_ctx* ctx = calloc(1, sizeof(ws_ctx));
-
-    if (!ctx) {
-      ESP_LOGE(TAG, "Failed to allocate memory for ws_ctx");
-      webserver_send_not_found(req);
-      netconn_close(req->conn);
-      netconn_delete(req->conn);
-      return;
-    }
-
-    ctx->conn = req->conn;  // replace sock with conn
-    ctx->handler = handler;
-    ctx->req = req;
-
-    ws_event event = {
-        .event_type = WS_CONNECT,
-    };
-
-    ctx->handler(ctx, &event);
-
-    if (ctx->accepted) {
-      ctx->req = NULL;
-      xTaskCreate(webserver_ws_task, "webserver_ws_task", 3072, (void*)ctx, tskIDLE_PRIORITY, &ctx->task_handle);
-    } else {
-      webserver_send_not_found(req);
-      netconn_close(ctx->conn);
-      netconn_delete(ctx->conn);
-      free(ctx);
-    }
-  } else {
+  if (!handler) {
     webserver_send_not_found(req);
     netconn_close(req->conn);
     netconn_delete(req->conn);
+    return;
+  }
+
+  ws_ctx* ctx = calloc(1, sizeof(ws_ctx));
+
+  if (!ctx) {
+    ESP_LOGE(TAG, "Failed to allocate memory for ws_ctx");
+    webserver_send_not_found(req);
+    netconn_close(req->conn);
+    netconn_delete(req->conn);
+    return;
+  }
+
+  ctx->conn = req->conn;  // replace sock with conn
+  ctx->handler = handler;
+  ctx->req = req;
+  ctx->send_queue = xRingbufferCreate(2048, RINGBUF_TYPE_NOSPLIT);
+
+  ws_event event = {
+      .event_type = WS_CONNECT,
+  };
+
+  ctx->handler(ctx, &event);
+
+  if (ctx->accepted) {
+    ctx->req = NULL;
+    xTaskCreate(webserver_ws_task, "webserver_ws_task", 3072, (void*)ctx, tskIDLE_PRIORITY, &ctx->task_handle);
+  } else {
+    webserver_send_not_found(req);
+    netconn_close(ctx->conn);
+    netconn_delete(ctx->conn);
+    ctx->conn = NULL;
+    vRingbufferDelete(ctx->send_queue);
+    free(ctx);
   }
 }
 
@@ -901,75 +1059,118 @@ static void webserver_handle_http(http_req* req) {
 static void webserver_serve(struct netconn* conn) {
   if (!conn) return;
 
-  // Set a 30 second timeout on new connections
-  netconn_set_recvtimeout(conn, 30000);
+  // Set a 5-second timeout on new connections
+  netconn_set_recvtimeout(conn, 5000);
 
-  struct netbuf* buf;
-  void* data;
-  u16_t len;
-
-  http_req req = {.conn = conn, .headers = NULL, .recv_buf = NULL, .recv_buf_len = 0};
-  char* str_method = "GET";
-
-  unsigned int c = 0;
+  http_req req = {.conn = conn, .headers = NULL, .recv_buf = NULL, .recv_buf_len = 0, .rx_bytes = 0};
+  unsigned int c = 0;  // Line counter
   bool reached_body = false;
   int64_t start_time = esp_timer_get_time();
 
+  // Buffer to hold received data until headers are fully read
   while (!reached_body) {
+    struct netbuf* buf;
     err_t err = netconn_recv(conn, &buf);
     if (err != ERR_OK) {
       ESP_LOGE(TAG, "recv failed: error %d", err);
       goto cleanup;
     }
 
-    netbuf_data(buf, &data, &len);
+    // Get total length of data in netbuf
+    u16_t total_len = netbuf_len(buf);
+    if (total_len == 0) {
+      netbuf_delete(buf);
+      continue;
+    }
 
-    // Assuming data is a char buffer; if not, you'll have to adjust this
-    char* rx_buffer = (char*)data;
-    unsigned int rx_buffer_length = len;
+    // Allocate or extend recv_buf to hold existing data plus new data
+    char* new_recv_buf = (char*)realloc(req.recv_buf, req.recv_buf_len + total_len);
+    if (!new_recv_buf) {
+      ESP_LOGE(TAG, "Memory allocation failed");
+      netbuf_delete(buf);
+      goto cleanup;
+    }
+    req.recv_buf = new_recv_buf;
 
-    char* line_start = rx_buffer;
-    char* line_end = NULL;
+    // Copy all data from netbuf into recv_buf
+    u16_t copied = netbuf_copy(buf, req.recv_buf + req.recv_buf_len, total_len);
+    if (copied != total_len) {
+      ESP_LOGE(TAG, "Failed to copy all data from netbuf");
+      netbuf_delete(buf);
+      goto cleanup;
+    }
+    req.recv_buf_len += copied;
+    req.rx_bytes += copied;
 
-    while ((line_end = strstr(line_start, "\r\n")) != NULL) {
-      *line_end = 0;
+    netbuf_delete(buf);
 
-      if (line_start == line_end) {
-        line_end += 2;
-        int leftover_len = (rx_buffer + rx_buffer_length) - line_end;
+    // Check if recv_buf contains "\r\n\r\n"
+    if (req.recv_buf_len >= 4) {
+      char* header_end = strstr(req.recv_buf, "\r\n\r\n");
+      if (header_end != NULL) {
+        reached_body = true;
+      }
+    }
+    // Continue receiving data until headers are fully read
+  }
 
-        if (leftover_len > 0) {
-          char* leftover = malloc(leftover_len);
-          memcpy(leftover, line_end, leftover_len);
+  // Now parse the headers from req.recv_buf
+  if (reached_body) {
+    char* header_end = strstr(req.recv_buf, "\r\n\r\n");
+    if (header_end != NULL) {
+      size_t headers_length = header_end - req.recv_buf + 4;  // Include "\r\n\r\n"
+      size_t leftover_len = req.recv_buf_len - headers_length;
 
-          req.recv_buf = leftover;
-          req.recv_buf_len = leftover_len;
+      // Null-terminate the headers section
+      req.recv_buf[headers_length - 1] = '\0';
+
+      // Parse headers line by line
+      char* line_start = req.recv_buf;
+      char* line_end;
+
+      while ((line_end = strstr(line_start, "\r\n")) != NULL) {
+        *line_end = '\0';
+
+        if (line_start == line_end) {
+          // Empty line indicates end of headers
+          break;
+        } else if (c == 0) {
+          // First line contains method and URL
+          char* saveptr;
+          char* str_method = strtok_r(line_start, " ", &saveptr);
+          char* str_url = strtok_r(NULL, " ", &saveptr);
+
+          webserver_set_method(&req, str_method);
+          webserver_parse_url_params(&req, str_url);
         } else {
-          free(req.recv_buf);
-          req.recv_buf = NULL;
-          req.recv_buf_len = 0;
+          // Header line
+          webserver_append_request_header(&req, line_start);
         }
 
-        reached_body = true;
-        break;
-      } else if (c == 0) {
-        str_method = strtok(line_start, " ");
-        char* str_url = strtok(NULL, " ");
-
-        webserver_set_method(&req, str_method);
-        webserver_parse_url_params(&req, str_url);
-      } else {
-        webserver_append_request_header(&req, line_start);
+        c++;
+        line_start = line_end + 2;
       }
 
-      c++;
-      line_start = line_end + 2;
+      // Move any leftover data (body) to the beginning of recv_buf
+      if (leftover_len > 0) {
+        memmove(req.recv_buf, req.recv_buf + headers_length, leftover_len);
+        req.recv_buf_len = leftover_len;
+        // Optionally shrink recv_buf to fit leftover data
+        char* temp_buf = (char*)realloc(req.recv_buf, leftover_len);
+        if (temp_buf || leftover_len == 0) {
+          req.recv_buf = temp_buf;
+        }
+      } else {
+        // No leftover data
+        free(req.recv_buf);
+        req.recv_buf = NULL;
+        req.recv_buf_len = 0;
+      }
     }
-    netbuf_delete(buf);
   }
 
   if (webserver_is_ws_request(&req)) {
-    str_method = "WS";
+    req.method = WS;
     webserver_handle_ws(&req);
   } else {
     webserver_handle_http(&req);
@@ -978,7 +1179,7 @@ static void webserver_serve(struct netconn* conn) {
   };
 
   int64_t end_time = (esp_timer_get_time() - start_time) / 1000;
-  ESP_LOGI(TAG, "%d %s %lldms\n", req.method, req.url, end_time);
+  ESP_LOGI(TAG, "%s %s %lldms", webserver_method_to_string(&req), req.url, end_time);
 
 cleanup:
   webserver_free_request_headers(&req);
@@ -1073,16 +1274,11 @@ static void webserver_task(void* pvParameters) {
     while (!IS_SHUTDOWN_REQUESTED()) {
       struct netconn* new_conn;
       err_t err;
-      ip_addr_t naddr;
-      u16_t port;
 
       err = netconn_accept(conn, &new_conn);
 
       if (err == ERR_OK) {
-        if (netconn_peer(new_conn, &naddr, &port) == ERR_OK) {
-          ESP_LOGI(TAG, "%s:%d connected", ipaddr_ntoa(&naddr), port);
-          webserver_serve(new_conn);
-        }
+        webserver_serve(new_conn);
       } else if (err == ERR_TIMEOUT) {
         // Accept timed out, no new connection, loop back and check for shutdown request
         continue;
