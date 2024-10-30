@@ -44,6 +44,8 @@ static const char* TAG = "ESPHTTPD";
 
 static SemaphoreHandle_t ws_connection_semaphore = NULL;
 static ws_ctx* ws_connections[MAX_WS_CONNECTIONS] = {NULL};
+static SemaphoreHandle_t ws_task_count_semaphore = NULL;
+static int active_ws_task_count = 0;
 
 static void webserver_serve(struct netconn* conn);
 static void webserver_task(void* pvParameters);
@@ -792,6 +794,10 @@ void webserver_accept_ws(ws_ctx* ctx) {
 }
 
 static void webserver_ws_task(void* pvParameter) {
+  xSemaphoreTake(ws_task_count_semaphore, portMAX_DELAY);
+  active_ws_task_count++;
+  xSemaphoreGive(ws_task_count_semaphore);
+
   ws_ctx* ctx = (ws_ctx*)pvParameter;
   struct netbuf* buf;
   uint8_t masking_key[WS_MASK_LEN] = {0, 0, 0, 0};
@@ -970,6 +976,10 @@ static void webserver_ws_task(void* pvParameter) {
     vRingbufferDelete(ctx->send_queue);
     free(ctx);
   }
+
+  xSemaphoreTake(ws_task_count_semaphore, portMAX_DELAY);
+  active_ws_task_count--;
+  xSemaphoreGive(ws_task_count_semaphore);
 
   vTaskDelete(NULL);
 }
@@ -1305,6 +1315,7 @@ void webserver_start(int port) {
   ESP_LOGI(TAG, "Starting webserver on port %d", port);
 
   ws_connection_semaphore = xSemaphoreCreateMutex();
+  ws_task_count_semaphore = xSemaphoreCreateMutex();
   esphttpd_event_group = xEventGroupCreate();
 
   xEventGroupClearBits(esphttpd_event_group, TASK_SHUTDOWN_BIT | TASK_REQUEST_SHUTDOWN_BIT);
@@ -1333,16 +1344,23 @@ void webserver_stop() {
     vTaskDelete(esphttpd_task_handle);
   }
 
-  // Wait up to 10 seconds for the websocket connections to close
-  int wait_count = 0;
-  while (webserver_ws_connection_count() > 0 && wait_count < 100) {
-    ESP_LOGI(TAG, "Waiting for %d websocket connections to close", webserver_ws_connection_count());
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-    wait_count++;
+  while (true) {
+    xSemaphoreTake(ws_task_count_semaphore, portMAX_DELAY);
+    if (active_ws_task_count == 0) {
+      xSemaphoreGive(ws_task_count_semaphore);
+      break;
+    }
+    xSemaphoreGive(ws_task_count_semaphore);
+    vTaskDelay(100 / portTICK_PERIOD_MS);  // Wait before checking again
   }
 
   vEventGroupDelete(esphttpd_event_group);
+
   vSemaphoreDelete(ws_connection_semaphore);
+  vSemaphoreDelete(ws_task_count_semaphore);
+
+  ws_connection_semaphore = NULL;
+  ws_task_count_semaphore = NULL;
 
   esphttpd_task_handle = NULL;
 }
