@@ -1337,12 +1337,7 @@ void webserver_stop() {
   xEventGroupSetBits(esphttpd_event_group, TASK_REQUEST_SHUTDOWN_BIT);
 
   // Wait for shutdown
-  xEventGroupWaitBits(esphttpd_event_group, TASK_SHUTDOWN_BIT, pdFALSE, pdTRUE, 5000 / portTICK_PERIOD_MS);
-
-  if (!IS_SHUTDOWN()) {
-    ESP_LOGE(TAG, "webserver shutdown timed out, forcing shutdown");
-    vTaskDelete(esphttpd_task_handle);
-  }
+  xEventGroupWaitBits(esphttpd_event_group, TASK_SHUTDOWN_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
 
   while (true) {
     xSemaphoreTake(ws_task_count_semaphore, portMAX_DELAY);
