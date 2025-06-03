@@ -14,7 +14,7 @@ extern "C" {
 #define IS_SHUTDOWN() ((xEventGroupGetBits(esphttpd_event_group) & TASK_SHUTDOWN_BIT) != 0)
 
 typedef char* (*variable_callback)(const char* var_name);
-typedef enum http_method { GET, HEAD, POST, PUT, DELETE, OPTIONS, WS } http_method;
+typedef enum http_method { GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH, WS } http_method;
 typedef enum ws_event_type { WS_CONNECT, WS_DISCONNECT, WS_MESSAGE } ws_event_type;
 typedef enum {
   WS_OP_CON = 0x0, /*!< Continuation Frame*/

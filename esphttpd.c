@@ -140,13 +140,20 @@ void webserver_send_body_template(http_req* req, char* body, unsigned int body_l
 
     if (var_found && var_end > var_start) {
       int var_name_len = var_end - var_start - start_delim_len;
-      char var_name[var_name_len + 1];
-      strncpy(var_name, body + var_start + start_delim_len, var_name_len);
+      char* var_name = malloc(var_name_len + 1);
+
+      if (!var_name) {
+        ESP_LOGE(TAG, "Failed to allocate memory for variable name");
+        return;
+      }
+
+      memcpy(var_name, body + var_start + start_delim_len, var_name_len);
       var_name[var_name_len] = '\0';
 
       char* replacement = var_cb(var_name);
+      free(var_name);
 
-      if (replacement != NULL) {
+      if (replacement) {
         int prefix_len = var_start - offset;
         netconn_write(req->conn, body + offset, prefix_len, NETCONN_COPY);
         netconn_write(req->conn, replacement, strlen(replacement), NETCONN_COPY);
@@ -208,11 +215,19 @@ err_t webserver_pipe_body_to_file(http_req* req, char* file_path) {
   unsigned int r = 0, buffer_offset = 0;
 
   http_upload_params* upload_params = malloc(sizeof(http_upload_params));
+  if (!upload_params) {
+    ESP_LOGE(TAG, "Failed to allocate upload params");
+    free(buf);
+    return ESP_FAIL;
+  }
+
   upload_params->running = true;
   upload_params->file_handle = fopen(file_path, "w");
 
   if (upload_params->file_handle == NULL) {
     ESP_LOGE(TAG, "Failed to open file for upload");
+    free(upload_params);
+    free(buf);
     return ESP_FAIL;
   }
 
@@ -229,6 +244,7 @@ err_t webserver_pipe_body_to_file(http_req* req, char* file_path) {
 
   fclose(upload_params->file_handle);
   free(buf);
+  free(upload_params);
 
   return ESP_OK;
 }
@@ -355,19 +371,31 @@ size_t webserver_recv_body(http_req* req, char* buf, unsigned int len) {
   return copied_len;
 }
 
-bool url_match(const char* pattern, const char* candidate, int p, int c) {
-  if (pattern[p] == '\0') {
-    return candidate[c] == '\0';
-  } else if (pattern[p] == '*') {
-    for (; candidate[c] != '\0'; c++) {
-      if (url_match(pattern, candidate, p + 1, c)) return true;
+// Iterative wildcard match: '*' matches any sequence, '?' matches any single char.
+bool url_match(const char* pattern, const char* str) {
+  const char* s = str;
+  const char* p = pattern;
+  const char* last_star = NULL;
+  const char* s_star = NULL;
+
+  while (*s) {
+    if (*p == '?' || *p == *s) {
+      p++;
+      s++;
+    } else if (*p == '*') {
+      last_star = p++;
+      s_star = s;
+    } else if (last_star) {
+      p = last_star + 1;
+      s = ++s_star;
+    } else {
+      return false;
     }
-    return url_match(pattern, candidate, p + 1, c);
-  } else if (pattern[p] != '?' && pattern[p] != candidate[c]) {
-    return false;
-  } else {
-    return url_match(pattern, candidate, p + 1, c + 1);
   }
+  while (*p == '*') {
+    p++;
+  }
+  return *p == '\0';
 }
 
 int webserver_set_method(http_req* req, char* str_method) {
@@ -383,6 +411,8 @@ int webserver_set_method(http_req* req, char* str_method) {
     req->method = DELETE;
   } else if (strcmp(str_method, "OPTIONS") == 0) {
     req->method = OPTIONS;
+  } else if (strcmp(str_method, "PATCH") == 0) {
+    req->method = PATCH;
   } else {
     return -1;
   }
@@ -406,6 +436,8 @@ char* webserver_method_to_string(http_req* req) {
       return "OPTIONS";
     case WS:
       return "WS";
+    case PATCH:
+      return "PATCH";
     default:
       return "UNKNOWN";
   }
@@ -494,10 +526,10 @@ void webserver_append_request_header(http_req* req, char* str_header) {
   http_header* new_header = malloc(sizeof(http_header));
 
   char* key = strtok(str_header, ": ");
-  char* value = strtok(NULL, "") + 1;
+  char* value = strtok(NULL, "");
 
   // Remove the space at the start of the value if it exists
-  if (value[0] == ' ') new_header->value++;
+  if (value[0] == ' ') value++;
 
   new_header->next = NULL;
   new_header->key = strdup(key);
@@ -569,7 +601,7 @@ void webserver_handle_cors_options(http_req* req) {
   webserver_send_header(req, "Access-Control-Allow-Origin", "*");
   webserver_send_header(req, "Access-Control-Allow-Headers",
                         "Origin, X-Requested-With, Content-Type, Accept, Authorization");
-  webserver_send_header(req, "Access-Control-Allow-Methods", "GET,HEAD,OPTIONS,POST,PUT");
+  webserver_send_header(req, "Access-Control-Allow-Methods", "GET,HEAD,OPTIONS,POST,PUT,PATCH");
 
   netconn_write(req->conn, "\r\n", 2, NETCONN_COPY);
 }
@@ -741,8 +773,6 @@ err_t webserver_send_ws_message(ws_ctx* ctx, const char* p_data, size_t length, 
   }
 
   memcpy(data + data_offset, p_data, length);
-
-  ESP_LOG_BUFFER_HEX(TAG, data, data_offset + length);
 
   err_t err = netconn_write(ctx->conn, data, data_offset + length, NETCONN_COPY);
 
@@ -1042,7 +1072,7 @@ static void webserver_handle_http(http_req* req) {
   http_route* current = http_routes;
 
   while (current) {
-    if (req->method == current->method && url_match(current->url, req->url, 0, 0)) {
+    if (req->method == current->method && url_match(current->url, req->url)) {
       handler = current->callback;
       break;
     }
@@ -1050,7 +1080,7 @@ static void webserver_handle_http(http_req* req) {
   };
 
   if (handler) {
-    if (req->method == POST) {
+    if (req->method == POST || req->method == PATCH) {
       char* content_length_str = webserver_get_request_header(req, "Content-Length");
       if (content_length_str) {
         req->remaining_content_length = atoi(content_length_str);
@@ -1066,135 +1096,129 @@ static void webserver_handle_http(http_req* req) {
   }
 }
 
-static void webserver_serve(struct netconn* conn) {
-  if (!conn) return;
-
-  // Set a 5-second timeout on new connections
-  netconn_set_recvtimeout(conn, 5000);
-
-  http_req req = {.conn = conn, .headers = NULL, .recv_buf = NULL, .recv_buf_len = 0, .rx_bytes = 0};
-  unsigned int c = 0;  // Line counter
+bool read_request_headers(struct netconn* conn, http_req* req) {
   bool reached_body = false;
-  int64_t start_time = esp_timer_get_time();
+  unsigned int c = 0;
+  char* saveptr = NULL;
 
-  // Buffer to hold received data until headers are fully read
   while (!reached_body) {
     struct netbuf* buf;
     err_t err = netconn_recv(conn, &buf);
     if (err != ERR_OK) {
-      ESP_LOGE(TAG, "recv failed: error %d", err);
-      goto cleanup;
+      ESP_LOGE(TAG, "Header recv failed: %d", err);
+      return false;
     }
 
-    // Get total length of data in netbuf
     u16_t total_len = netbuf_len(buf);
     if (total_len == 0) {
       netbuf_delete(buf);
       continue;
     }
 
-    // Allocate or extend recv_buf to hold existing data plus new data
-    char* new_recv_buf = (char*)realloc(req.recv_buf, req.recv_buf_len + total_len);
-    if (!new_recv_buf) {
-      ESP_LOGE(TAG, "Memory allocation failed");
+    char* new_buf = realloc(req->recv_buf, req->recv_buf_len + total_len);
+    if (!new_buf) {
+      ESP_LOGE(TAG, "Header buffer realloc failed");
       netbuf_delete(buf);
-      goto cleanup;
+      return false;
     }
-    req.recv_buf = new_recv_buf;
+    req->recv_buf = new_buf;
 
-    // Copy all data from netbuf into recv_buf
-    u16_t copied = netbuf_copy(buf, req.recv_buf + req.recv_buf_len, total_len);
-    if (copied != total_len) {
-      ESP_LOGE(TAG, "Failed to copy all data from netbuf");
-      netbuf_delete(buf);
-      goto cleanup;
-    }
-    req.recv_buf_len += copied;
-    req.rx_bytes += copied;
-
+    u16_t copied = netbuf_copy(buf, req->recv_buf + req->recv_buf_len, total_len);
+    req->recv_buf_len += copied;
+    req->rx_bytes += copied;
     netbuf_delete(buf);
 
-    // Check if recv_buf contains "\r\n\r\n"
-    if (req.recv_buf_len >= 4) {
-      char* header_end = strstr(req.recv_buf, "\r\n\r\n");
-      if (header_end != NULL) {
-        reached_body = true;
-      }
-    }
-    // Continue receiving data until headers are fully read
-  }
-
-  // Now parse the headers from req.recv_buf
-  if (reached_body) {
-    char* header_end = strstr(req.recv_buf, "\r\n\r\n");
-    if (header_end != NULL) {
-      size_t headers_length = header_end - req.recv_buf + 4;  // Include "\r\n\r\n"
-      size_t leftover_len = req.recv_buf_len - headers_length;
-
-      // Null-terminate the headers section
-      req.recv_buf[headers_length - 1] = '\0';
-
-      // Parse headers line by line
-      char* line_start = req.recv_buf;
-      char* line_end;
-
-      while ((line_end = strstr(line_start, "\r\n")) != NULL) {
-        *line_end = '\0';
-
-        if (line_start == line_end) {
-          // Empty line indicates end of headers
-          break;
-        } else if (c == 0) {
-          // First line contains method and URL
-          char* saveptr;
-          char* str_method = strtok_r(line_start, " ", &saveptr);
-          char* str_url = strtok_r(NULL, " ", &saveptr);
-
-          webserver_set_method(&req, str_method);
-          webserver_parse_url_params(&req, str_url);
-        } else {
-          // Header line
-          webserver_append_request_header(&req, line_start);
-        }
-
-        c++;
-        line_start = line_end + 2;
-      }
-
-      // Move any leftover data (body) to the beginning of recv_buf
-      if (leftover_len > 0) {
-        memmove(req.recv_buf, req.recv_buf + headers_length, leftover_len);
-        req.recv_buf_len = leftover_len;
-        // Optionally shrink recv_buf to fit leftover data
-        char* temp_buf = (char*)realloc(req.recv_buf, leftover_len);
-        if (temp_buf || leftover_len == 0) {
-          req.recv_buf = temp_buf;
-        }
-      } else {
-        // No leftover data
-        free(req.recv_buf);
-        req.recv_buf = NULL;
-        req.recv_buf_len = 0;
-      }
+    if (req->recv_buf_len >= 4 && strstr(req->recv_buf, "\r\n\r\n") != NULL) {
+      reached_body = true;
     }
   }
 
-  if (webserver_is_ws_request(&req)) {
-    req.method = WS;
-    webserver_handle_ws(&req);
+  char* header_end = strstr(req->recv_buf, "\r\n\r\n");
+  size_t headers_len = header_end - req->recv_buf + 4;
+  size_t leftover = req->recv_buf_len - headers_len;
+
+  // Null-terminate headers
+  req->recv_buf[headers_len - 1] = '\0';
+
+  // Parse each header line
+  char* line = req->recv_buf;
+  char* next = NULL;
+  while ((next = strstr(line, "\r\n")) != NULL) {
+    *next = '\0';
+    if (line == next) {
+      // end of headers
+      break;
+    }
+    if (c == 0) {
+      // Request line: METHOD URL HTTP/1.1
+      char* method = strtok_r(line, " ", &saveptr);
+      char* url = strtok_r(NULL, " ", &saveptr);
+      webserver_set_method(req, method);
+      webserver_parse_url_params(req, url);
+    } else {
+      webserver_append_request_header(req, line);
+    }
+    c++;
+    line = next + 2;
+  }
+
+  // Move leftover body data to start of buffer
+  if (leftover > 0) {
+    memmove(req->recv_buf, req->recv_buf + headers_len, leftover);
+    req->recv_buf_len = leftover;
+    char* tmp = realloc(req->recv_buf, leftover);
+    if (tmp || leftover == 0) {
+      req->recv_buf = tmp;
+    }
   } else {
-    webserver_handle_http(&req);
-    netconn_close(conn);
+    free(req->recv_buf);
+    req->recv_buf = NULL;
+    req->recv_buf_len = 0;
+  }
+
+  return true;
+}
+
+// Dispatches an HTTP or WebSocket request based on parsed headers in 'req'.
+void dispatch_request(http_req* req) {
+  if (webserver_is_ws_request(req)) {
+    req->method = WS;
+    webserver_handle_ws(req);
+  } else {
+    webserver_handle_http(req);
+    netconn_close(req->conn);
+    netconn_delete(req->conn);
+  }
+  ESP_LOGI(TAG, "%s %s", webserver_method_to_string(req), req->url);
+}
+
+// The new, refactored webserver_serve using the helper functions above.
+static void webserver_serve(struct netconn* conn) {
+  if (!conn) return;
+
+  http_req* req = calloc(1, sizeof(*req));
+  if (!req) {
     netconn_delete(conn);
-  };
+    return;
+  }
+  req->conn = conn;
 
-  int64_t end_time = (esp_timer_get_time() - start_time) / 1000;
-  ESP_LOGI(TAG, "%s %s %lldms", webserver_method_to_string(&req), req.url, end_time);
+  netconn_set_recvtimeout(conn, 5000);
 
-cleanup:
-  webserver_free_request_headers(&req);
-  free(req.url);
-  webserver_free_params(&req);
+  if (!read_request_headers(conn, req)) {
+    webserver_free_request_headers(req);
+    free(req->url);
+    webserver_free_params(req);
+    return;
+  }
+
+  dispatch_request(req);
+
+  // Cleanup
+  webserver_free_request_headers(req);
+  free(req->url);
+  webserver_free_params(req);
+  free(req);
 }
 
 void webserver_add_route(http_route new_route) {
@@ -1324,7 +1348,7 @@ void webserver_start(int port) {
     ws_connections[i] = NULL;
   }
 
-  xTaskCreate(webserver_task, "webserver_task", 8192, NULL, 5, &esphttpd_task_handle);
+  xTaskCreate(webserver_task, "webserver_task", 4096, NULL, 5, &esphttpd_task_handle);
 }
 
 void webserver_stop() {
