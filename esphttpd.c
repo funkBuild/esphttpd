@@ -50,6 +50,30 @@ static int active_ws_task_count = 0;
 static void webserver_serve(struct netconn* conn);
 static void webserver_task(void* pvParameters);
 
+static ws_ctx* ws_ctx_acquire(int index) {
+  xSemaphoreTake(ws_connection_semaphore, portMAX_DELAY);
+  ws_ctx* ctx = ws_connections[index];
+  if (ctx != NULL) {
+    __atomic_add_fetch(&ctx->ref_count, 1, __ATOMIC_SEQ_CST);
+  }
+  xSemaphoreGive(ws_connection_semaphore);
+  return ctx;
+}
+
+static void ws_ctx_release(ws_ctx* ctx) {
+  if (ctx == NULL) return;
+
+  uint32_t old_count = __atomic_sub_fetch(&ctx->ref_count, 1, __ATOMIC_SEQ_CST);
+
+  if (old_count == 0) {
+    // Safe to free all resources
+    if (ctx->send_queue) {
+      vRingbufferDelete(ctx->send_queue);
+    }
+    free(ctx);
+  }
+}
+
 void webserver_send_status(http_req* req, int status_code, const char* status_text) {
   char buf[128];
   err_t err;
@@ -668,15 +692,20 @@ ws_ctx* register_ws_ctx(ws_ctx* ctx) {
   for (int i = 0; i < MAX_WS_CONNECTIONS; i++) {
     if (ws_connections[i] == NULL) {
       ws_connections[i] = ctx;
-
+      // Initialize ref_count to 1 (for the array's reference)
+      ctx->ref_count = 1;
       xSemaphoreGive(ws_connection_semaphore);
-
       return ctx;
     }
   }
 
-  free(ctx);
   xSemaphoreGive(ws_connection_semaphore);
+
+  // No free slot - cleanup
+  if (ctx->send_queue) {
+    vRingbufferDelete(ctx->send_queue);
+  }
+  free(ctx);
 
   return NULL;
 }
@@ -688,6 +717,9 @@ void remove_ws_ctx(ws_ctx* ctx) {
     if (ws_connections[i] == ctx) {
       ws_connections[i] = NULL;
       xSemaphoreGive(ws_connection_semaphore);
+
+      // Release the array's reference
+      ws_ctx_release(ctx);
       return;
     }
   }
@@ -703,7 +735,9 @@ unsigned int webserver_ws_connection_count() {
   xSemaphoreTake(ws_connection_semaphore, portMAX_DELAY);
 
   for (int i = 0; i < MAX_WS_CONNECTIONS; i++) {
-    if (ws_connections[i] != NULL) count++;
+    if (ws_connections[i] != NULL) {
+      count++;
+    }
   }
 
   xSemaphoreGive(ws_connection_semaphore);
@@ -714,31 +748,29 @@ unsigned int webserver_ws_connection_count() {
 err_t webserver_broadcast_ws_message(char* p_data, size_t length, ws_opcode_t opcode) {
   if (esphttpd_task_handle == NULL) return ESP_OK;
 
-  xSemaphoreTake(ws_connection_semaphore, portMAX_DELAY);
+  err_t result = ESP_OK;
 
   for (int i = 0; i < MAX_WS_CONNECTIONS; i++) {
-    if (ws_connections[i] != NULL) {
+    ws_ctx* ctx = ws_ctx_acquire(i);
+    if (ctx != NULL) {
       uint8_t* buf;
       const size_t ringbuf_item_size = length + 1;
 
-      if (xRingbufferSendAcquire(ws_connections[i]->send_queue, (void**)&buf, ringbuf_item_size, 0) != pdTRUE) {
-        ESP_LOGE(TAG, "Failed to acquire ringbuffer space");
-        continue;
-      }
+      if (ctx->send_queue != NULL &&
+          xRingbufferSendAcquire(ctx->send_queue, (void**)&buf, ringbuf_item_size, 0) == pdTRUE) {
+        buf[0] = opcode;
+        memcpy(buf + 1, p_data, length);
 
-      buf[0] = opcode;
-      memcpy(buf + 1, p_data, length);
-
-      if (xRingbufferSendComplete(ws_connections[i]->send_queue, buf) != pdTRUE) {
-        ESP_LOGE(TAG, "Failed to complete ringbuffer send");
-        return false;
+        if (xRingbufferSendComplete(ctx->send_queue, buf) != pdTRUE) {
+          ESP_LOGE(TAG, "Failed to complete ringbuffer send");
+          result = ESP_FAIL;
+        }
       }
+      ws_ctx_release(ctx);
     }
   }
 
-  xSemaphoreGive(ws_connection_semaphore);
-
-  return ESP_OK;
+  return result;
 }
 
 err_t webserver_send_ws_message(ws_ctx* ctx, const char* p_data, size_t length, ws_opcode_t opcode) {
@@ -829,11 +861,11 @@ static void webserver_ws_task(void* pvParameter) {
   xSemaphoreGive(ws_task_count_semaphore);
 
   ws_ctx* ctx = (ws_ctx*)pvParameter;
+
   struct netbuf* buf;
   uint8_t masking_key[WS_MASK_LEN] = {0, 0, 0, 0};
 
   netconn_set_recvtimeout(ctx->conn, 250);
-  // netconn_set_sendtimeout(ctx->conn, 100); // NOTE: DO NOT USE THIS. Sending will fail.
 
   ESP_LOGW(TAG, "WS Task started. conn=%p", ctx->conn);
 
@@ -883,7 +915,7 @@ static void webserver_ws_task(void* pvParameter) {
       netbuf_delete(buf);
       buf = NULL;
 
-      uint8_t* ptr = data;  // Pointer to navigate through data
+      uint8_t* ptr = data;
       uint8_t* data_end = data + total_len;
 
       // Ensure there's enough data for the frame header
@@ -911,7 +943,6 @@ static void webserver_ws_task(void* pvParameter) {
 
       // Handle extended payload lengths
       if (event.len == 126) {
-        // Ensure enough data for extended payload length (16 bits)
         if ((ptr + 2) > data_end) {
           ESP_LOGE(TAG, "Incomplete extended payload length (16 bits)");
           free(data);
@@ -920,7 +951,6 @@ static void webserver_ws_task(void* pvParameter) {
         event.len = (ptr[0] << 8) | ptr[1];
         ptr += 2;
       } else if (event.len == 127) {
-        // Ensure enough data for extended payload length (64 bits)
         if ((ptr + 8) > data_end) {
           ESP_LOGE(TAG, "Incomplete extended payload length (64 bits)");
           free(data);
@@ -995,17 +1025,19 @@ static void webserver_ws_task(void* pvParameter) {
   }
 
   // Cleanup context and close connection
-
   ESP_LOGW(TAG, "WS Task ended. conn=%p", ctx->conn);
 
   if (ctx != NULL) {
     remove_ws_ctx(ctx);
-    netconn_close(ctx->conn);
-    netconn_delete(ctx->conn);
-    ctx->conn = NULL;
-    vRingbufferDelete(ctx->send_queue);
-    free(ctx);
+    if (ctx->conn != NULL) {
+      netconn_close(ctx->conn);
+      netconn_delete(ctx->conn);
+      ctx->conn = NULL;
+    }
   }
+
+  // Release task's reference - this may free the context
+  ws_ctx_release(ctx);
 
   xSemaphoreTake(ws_task_count_semaphore, portMAX_DELAY);
   active_ws_task_count--;
@@ -1043,10 +1075,19 @@ static void webserver_handle_ws(http_req* req) {
     return;
   }
 
-  ctx->conn = req->conn;  // replace sock with conn
+  ctx->conn = req->conn;
   ctx->handler = handler;
   ctx->req = req;
   ctx->send_queue = xRingbufferCreate(2048, RINGBUF_TYPE_NOSPLIT);
+
+  if (ctx->send_queue == NULL) {
+    ESP_LOGE(TAG, "Failed to create ring buffer");
+    free(ctx);
+    webserver_send_not_found(req);
+    netconn_close(req->conn);
+    netconn_delete(req->conn);
+    return;
+  }
 
   ws_event event = {
       .event_type = WS_CONNECT,
@@ -1056,6 +1097,9 @@ static void webserver_handle_ws(http_req* req) {
 
   if (ctx->accepted) {
     ctx->req = NULL;
+    // Acquire reference for this task before creating the task
+    __atomic_add_fetch(&ctx->ref_count, 1, __ATOMIC_SEQ_CST);
+
     xTaskCreate(webserver_ws_task, "webserver_ws_task", 3072, (void*)ctx, tskIDLE_PRIORITY, &ctx->task_handle);
   } else {
     webserver_send_not_found(req);
@@ -1198,6 +1242,7 @@ static void webserver_serve(struct netconn* conn) {
 
   http_req* req = calloc(1, sizeof(*req));
   if (!req) {
+    netconn_close(conn);
     netconn_delete(conn);
     return;
   }
@@ -1207,18 +1252,29 @@ static void webserver_serve(struct netconn* conn) {
 
   if (!read_request_headers(conn, req)) {
     webserver_free_request_headers(req);
-    free(req->url);
+    if (req->url) {
+      free(req->url);
+      req->url = NULL;
+    }
     webserver_free_params(req);
+    free(req);
+    netconn_close(conn);
+    netconn_delete(conn);
     return;
   }
 
   dispatch_request(req);
 
-  // Cleanup
-  webserver_free_request_headers(req);
-  free(req->url);
-  webserver_free_params(req);
-  free(req);
+  // Cleanup (only if not WebSocket - WS takes ownership)
+  if (req->method != WS) {
+    webserver_free_request_headers(req);
+    if (req->url) {
+      free(req->url);
+      req->url = NULL;
+    }
+    webserver_free_params(req);
+    free(req);
+  }
 }
 
 void webserver_add_route(http_route new_route) {

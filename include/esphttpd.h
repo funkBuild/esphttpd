@@ -83,6 +83,7 @@ struct ws_ctx_t {
   struct http_req_t* req;
   TaskHandle_t task_handle;
   RingbufHandle_t send_queue;
+  uint32_t ref_count;
 };
 typedef struct ws_ctx_t ws_ctx;
 
