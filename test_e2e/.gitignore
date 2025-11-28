@@ -1,0 +1,18 @@
+# Build artifacts
+build/
+sdkconfig.old
+
+# Log files
+logs/
+*.log
+
+# Node modules
+jest-tests/node_modules/
+jest-tests/coverage/
+
+# Managed components (downloaded dependencies)
+managed_components/
+
+# IDE
+.vscode/
+.idea/

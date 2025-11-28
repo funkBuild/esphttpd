@@ -1,0 +1,20 @@
+dependencies:
+  esp_littlefs:
+    component_hash: 9d4f35d00b4e36d3fd3f7a2a32e806f44d7e5032d61f9e7f70381d4576ad9383
+    dependencies:
+    - name: idf
+      version: '>=5.0'
+    source:
+      git: https://github.com/joltwallet/esp_littlefs.git
+      path: .
+      type: git
+    version: ae1b7a36807d52e7b5a646f9198c0df7c5c0c0da
+  idf:
+    source:
+      type: idf
+    version: 5.5.1
+direct_dependencies:
+- esp_littlefs
+manifest_hash: 0c3275f80e8c0cfb1eaf8a236aea0853263db56d9e34239cbb8111a14aea0b43
+target: esp32s3
+version: 2.0.0

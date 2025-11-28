@@ -1,0 +1,119 @@
+menu "ESPHTTPD Configuration"
+
+    menu "Router Configuration"
+
+        config HTTPD_MAX_ROUTERS
+            int "Maximum number of routers"
+            default 8
+            range 1 32
+            help
+                Maximum router instances that can be created.
+                Each router uses approximately 200 bytes base memory plus
+                memory for routes and middleware.
+
+        config HTTPD_MAX_ROUTER_NESTING
+            int "Maximum router nesting depth"
+            default 4
+            range 1 8
+            help
+                Maximum depth of nested routers.
+                For example, /api/v1/users/profile = 4 levels.
+                Affects stack usage during routing.
+
+        config HTTPD_MAX_RADIX_NODES
+            int "Maximum radix tree nodes per router"
+            default 64
+            range 16 256
+            help
+                Maximum nodes in the route tree per router.
+                Typical usage: 2-3 nodes per route.
+
+        config HTTPD_MAX_ROUTE_PARAMS
+            int "Maximum route parameters"
+            default 8
+            range 2 16
+            help
+                Maximum number of :param captures per route.
+                Example: /users/:userId/posts/:postId requires 2.
+
+        config HTTPD_MAX_MIDDLEWARE_PER_ROUTER
+            int "Maximum middleware per router"
+            default 8
+            range 1 16
+            help
+                Maximum middleware functions that can be registered
+                per router using httpd_router_use().
+
+        config HTTPD_MAX_ROUTE_MIDDLEWARE
+            int "Maximum middleware per route"
+            default 4
+            range 1 8
+            help
+                Maximum middleware functions that can be attached
+                to a single route.
+
+        config HTTPD_MAX_TOTAL_MIDDLEWARE
+            int "Maximum middleware chain length"
+            default 16
+            range 4 32
+            help
+                Total maximum middleware across all routers + route
+                for a single request. This is the sum of:
+                - Server global middleware
+                - All router middleware in the chain
+                - Route-specific middleware
+
+    endmenu
+
+    menu "Connection Configuration"
+
+        config HTTPD_MAX_CONNECTIONS
+            int "Maximum concurrent connections"
+            default 16
+            range 1 64
+            help
+                Maximum number of simultaneous HTTP connections.
+                Each connection uses approximately 2KB of memory.
+
+        config HTTPD_DEFAULT_PORT
+            int "Default server port"
+            default 80
+            range 1 65535
+            help
+                Default port for HTTP server to listen on.
+
+        config HTTPD_RECV_BUFFER_SIZE
+            int "Receive buffer size"
+            default 1024
+            range 512 4096
+            help
+                Size of receive buffer for incoming data.
+
+        config HTTPD_SEND_BUFFER_SIZE
+            int "Send buffer size"
+            default 1024
+            range 512 4096
+            help
+                Size of send buffer for outgoing data.
+
+    endmenu
+
+    menu "WebSocket Configuration"
+
+        config HTTPD_MAX_WS_CONNECTIONS
+            int "Maximum WebSocket connections"
+            default 16
+            range 1 32
+            help
+                Maximum number of simultaneous WebSocket connections.
+
+        config HTTPD_WS_SEND_QUEUE_SIZE
+            int "WebSocket send queue size"
+            default 2048
+            range 512 8192
+            help
+                Size of ring buffer for queuing WebSocket messages.
+
+    endmenu
+
+endmenu

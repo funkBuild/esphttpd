@@ -1,0 +1,221 @@
+name: Tests
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup ESP-IDF
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.1
+          target: esp32s3
+
+      - name: Install QEMU for ESP32
+        run: |
+          # Install QEMU dependencies
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-0 libpixman-1-0 libslirp0
+
+          # Download pre-built QEMU for ESP32 from Espressif
+          wget -q https://github.com/espressif/qemu/releases/download/esp-develop-8.2.0-20240122/qemu-xtensa-softmmu-esp_develop_8.2.0_20240122-x86_64-linux-gnu.tar.xz
+          tar -xf qemu-xtensa-softmmu-esp_develop_8.2.0_20240122-x86_64-linux-gnu.tar.xz
+          sudo mv qemu /opt/qemu-esp32
+          echo "/opt/qemu-esp32/bin" >> $GITHUB_PATH
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: test_e2e/jest-tests/package-lock.json
+
+      - name: Install Jest dependencies
+        run: |
+          cd test_e2e/jest-tests
+          npm ci
+
+      - name: Build Unit Tests
+        run: |
+          cd test_app
+          idf.py build
+
+      - name: Build E2E Tests
+        run: |
+          cd test_e2e
+          idf.py build
+
+      - name: Create QEMU Images
+        run: |
+          # Unit test image
+          cd test_app/build
+          esptool.py --chip=esp32s3 merge_bin --output=qemu_flash.bin \
+            --fill-flash-size=2MB --flash_mode dio --flash_freq 80m --flash_size 2MB \
+            0x0 bootloader/bootloader.bin \
+            0x10000 esphttpd_test_app.bin \
+            0x8000 partition_table/partition-table.bin
+
+          # E2E test image
+          cd ../../test_e2e/build
+          esptool.py --chip=esp32s3 merge_bin --output=qemu_flash.bin \
+            --fill-flash-size=2MB --flash_mode dio --flash_freq 80m --flash_size 2MB \
+            0x0 bootloader/bootloader.bin \
+            0x10000 esphttpd_e2e_test.bin \
+            0x8000 partition_table/partition-table.bin
+
+      - name: Run Unit Tests
+        id: unit_tests
+        run: |
+          cd test_app/build
+
+          echo "============================================================"
+          echo "Running Unit Tests"
+          echo "============================================================"
+
+          # Create efuse file
+          dd if=/dev/zero of=qemu_efuse.bin bs=1K count=4 2>/dev/null
+
+          timeout 180 qemu-system-xtensa -M esp32s3 \
+            -drive file=qemu_flash.bin,if=mtd,format=raw \
+            -drive file=qemu_efuse.bin,if=none,format=raw,id=efuse \
+            -global driver=nvram.esp32c3.efuse,property=drive,value=efuse \
+            -global driver=timer.esp32s3.timg,property=wdt_disable,value=true \
+            -nic user,model=open_eth \
+            -nographic 2>&1 | tee /tmp/unit_test_output.txt || true
+
+          # Check for pass/fail
+          if grep -q "QEMU_TEST_COMPLETE: PASS" /tmp/unit_test_output.txt; then
+            echo "unit_tests_passed=true" >> $GITHUB_OUTPUT
+            echo "Unit Tests: PASSED"
+          else
+            echo "unit_tests_passed=false" >> $GITHUB_OUTPUT
+            echo "Unit Tests: FAILED"
+          fi
+
+          # Extract test counts
+          PASSED=$(grep -c ":PASS" /tmp/unit_test_output.txt 2>/dev/null | tr -cd '0-9' || echo "0")
+          FAILED=$(grep -c ":FAIL" /tmp/unit_test_output.txt 2>/dev/null | tr -cd '0-9' || echo "0")
+          PASSED=${PASSED:-0}
+          FAILED=${FAILED:-0}
+          echo "unit_passed=$PASSED" >> $GITHUB_OUTPUT
+          echo "unit_failed=$FAILED" >> $GITHUB_OUTPUT
+
+      - name: Run E2E Tests
+        id: e2e_tests
+        run: |
+          cd test_e2e/build
+
+          echo "============================================================"
+          echo "Running E2E Tests"
+          echo "============================================================"
+
+          # Create efuse file
+          dd if=/dev/zero of=qemu_efuse.bin bs=1K count=4 2>/dev/null
+
+          # Start QEMU in background
+          qemu-system-xtensa -M esp32s3 \
+            -drive file=qemu_flash.bin,if=mtd,format=raw \
+            -drive file=qemu_efuse.bin,if=none,format=raw,id=efuse \
+            -global driver=nvram.esp32c3.efuse,property=drive,value=efuse \
+            -global driver=timer.esp32s3.timg,property=wdt_disable,value=true \
+            -nic user,model=open_eth,hostfwd=tcp::10080-:80 \
+            -nographic > /tmp/qemu_e2e.log 2>&1 &
+
+          QEMU_PID=$!
+
+          # Wait for server to start
+          echo "Waiting for server to start..."
+          sleep 15
+
+          # Retry until server is ready
+          for i in 1 2 3 4 5; do
+            if curl -s --max-time 5 http://127.0.0.1:10080/hello > /dev/null 2>&1; then
+              echo "Server is ready!"
+              break
+            fi
+            echo "Retry $i..."
+            sleep 5
+          done
+
+          # Run Jest tests
+          cd ../jest-tests
+          SERVER_URL=http://127.0.0.1:10080 npm test -- --json --outputFile=/tmp/jest_results.json 2>&1 | tee /tmp/e2e_test_output.txt || true
+
+          # Kill QEMU
+          kill $QEMU_PID 2>/dev/null || true
+          pkill -9 qemu-system-xtensa 2>/dev/null || true
+
+          # Parse results
+          if [ -f /tmp/jest_results.json ]; then
+            PASSED=$(jq '.numPassedTests // 0' /tmp/jest_results.json)
+            FAILED=$(jq '.numFailedTests // 0' /tmp/jest_results.json)
+            SUCCESS=$(jq '.success // false' /tmp/jest_results.json)
+
+            echo "e2e_passed=$PASSED" >> $GITHUB_OUTPUT
+            echo "e2e_failed=$FAILED" >> $GITHUB_OUTPUT
+
+            if [ "$SUCCESS" = "true" ]; then
+              echo "e2e_tests_passed=true" >> $GITHUB_OUTPUT
+              echo "E2E Tests: PASSED"
+            else
+              echo "e2e_tests_passed=false" >> $GITHUB_OUTPUT
+              echo "E2E Tests: FAILED"
+            fi
+          else
+            echo "e2e_passed=0" >> $GITHUB_OUTPUT
+            echo "e2e_failed=1" >> $GITHUB_OUTPUT
+            echo "e2e_tests_passed=false" >> $GITHUB_OUTPUT
+            echo "E2E Tests: FAILED (no results file)"
+          fi
+
+      - name: Print Test Summary
+        run: |
+          echo ""
+          echo "============================================================"
+          echo "                    TEST SUMMARY"
+          echo "============================================================"
+          echo ""
+          echo "Unit Tests:"
+          echo "  Passed: ${{ steps.unit_tests.outputs.unit_passed }}"
+          echo "  Failed: ${{ steps.unit_tests.outputs.unit_failed }}"
+          echo "  Status: ${{ steps.unit_tests.outputs.unit_tests_passed == 'true' && 'PASSED' || 'FAILED' }}"
+          echo ""
+          echo "E2E Tests:"
+          echo "  Passed: ${{ steps.e2e_tests.outputs.e2e_passed }}"
+          echo "  Failed: ${{ steps.e2e_tests.outputs.e2e_failed }}"
+          echo "  Status: ${{ steps.e2e_tests.outputs.e2e_tests_passed == 'true' && 'PASSED' || 'FAILED' }}"
+          echo ""
+
+          TOTAL_PASSED=$(( ${{ steps.unit_tests.outputs.unit_passed }} + ${{ steps.e2e_tests.outputs.e2e_passed }} ))
+          TOTAL_FAILED=$(( ${{ steps.unit_tests.outputs.unit_failed }} + ${{ steps.e2e_tests.outputs.e2e_failed }} ))
+
+          echo "============================================================"
+          echo "TOTAL: $TOTAL_PASSED passed, $TOTAL_FAILED failed"
+          echo "============================================================"
+
+      - name: Check Test Results
+        if: steps.unit_tests.outputs.unit_tests_passed != 'true' || steps.e2e_tests.outputs.e2e_tests_passed != 'true'
+        run: |
+          echo "Some tests failed!"
+          exit 1
+
+      - name: Upload Test Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            /tmp/unit_test_output.txt
+            /tmp/e2e_test_output.txt
+            /tmp/jest_results.json
+            /tmp/qemu_e2e.log
+          retention-days: 7

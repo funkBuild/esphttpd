@@ -1,0 +1,29 @@
+# Build artifacts
+build/
+sdkconfig.old
+
+# Managed components (downloaded dependencies)
+managed_components/
+
+# Test app artifacts
+test_app/build/
+test_app/managed_components/
+test_app/sdkconfig.old
+test_app/test_output.txt
+
+# Test e2e artifacts
+test_e2e/build/
+test_e2e/managed_components/
+test_e2e/sdkconfig.old
+test_e2e/logs/
+test_e2e/__pycache__/
+test_e2e/jest-tests/node_modules/
+test_e2e/jest-tests/coverage/
+
+# IDE
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc

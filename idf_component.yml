@@ -1,0 +1,3 @@
+dependencies:
+  esp_littlefs:
+    git: https://github.com/joltwallet/esp_littlefs.git
