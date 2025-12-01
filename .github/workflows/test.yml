@@ -20,7 +20,7 @@ jobs:
           esp_idf_version: v5.5.1
           target: esp32s3
           path: test_app
-          command: idf.py build
+          command: rm -rf managed_components && idf.py build
 
       - name: Build E2E Tests
         uses: espressif/esp-idf-ci-action@v1
@@ -28,7 +28,7 @@ jobs:
           esp_idf_version: v5.5.1
           target: esp32s3
           path: test_e2e
-          command: idf.py build
+          command: rm -rf managed_components && idf.py build
 
       - name: Create QEMU Images
         uses: espressif/esp-idf-ci-action@v1
