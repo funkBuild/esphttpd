@@ -8,16 +8,22 @@
 #include "filesystem.h"
 #include "radix_tree.h"
 
-// Max routes for capacity tests - must match esphttpd.c
-#define MAX_WS_ROUTES 16
-#define MAX_MIDDLEWARES 8
-
+// Configuration defaults - must match esphttpd.c
+#ifndef CONFIG_HTTPD_MAX_WS_ROUTES
+#define CONFIG_HTTPD_MAX_WS_ROUTES 8
+#endif
+#ifndef CONFIG_HTTPD_MAX_SERVER_MIDDLEWARES
+#define CONFIG_HTTPD_MAX_SERVER_MIDDLEWARES 4
+#endif
 #ifndef CONFIG_HTTPD_MAX_ROUTERS
 #define CONFIG_HTTPD_MAX_ROUTERS 8
 #endif
 
+#define MAX_WS_ROUTES CONFIG_HTTPD_MAX_WS_ROUTES
+#define MAX_MIDDLEWARES CONFIG_HTTPD_MAX_SERVER_MIDDLEWARES
+
 // Channel hash table configuration - must match esphttpd.c
-#define CHANNEL_HASH_BUCKETS 16
+#define CHANNEL_HASH_BUCKETS 32
 
 // WebSocket route entry (must match esphttpd.c)
 typedef struct {
@@ -71,8 +77,8 @@ typedef struct {
     // Server-level error handler
     httpd_err_handler_t error_handler;
 
-    // WebSocket channel registry (hash table for O(1) lookup)
-    test_channel_hash_entry_t channel_hash[CHANNEL_HASH_BUCKETS];
+    // WebSocket channel registry (hash table for O(1) lookup) - lazy allocated
+    test_channel_hash_entry_t* channel_hash;  // Pointer (NULL until first channel join)
     test_channel_hash_entry_t* channel_by_index[HTTPD_WS_MAX_CHANNELS];
     uint8_t channel_count;
 

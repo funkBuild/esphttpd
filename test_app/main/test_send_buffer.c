@@ -5,23 +5,6 @@
 
 static const char* TAG = "TEST_SEND_BUF";
 
-// Global pool for tests
-static send_buffer_pool_t test_pool;
-
-// Helper to reset test state
-static void reset_test_pool(void) {
-    send_buffer_pool_init(&test_pool);
-}
-
-// Test pool initialization
-static void test_pool_init(void)
-{
-    send_buffer_pool_t pool;
-    send_buffer_pool_init(&pool);
-
-    TEST_ASSERT_EQUAL(0, pool.in_use_mask);
-}
-
 // Test buffer initialization
 static void test_buffer_init(void)
 {
@@ -41,37 +24,32 @@ static void test_buffer_init(void)
 // Test buffer allocation
 static void test_buffer_alloc(void)
 {
-    reset_test_pool();
     send_buffer_t sb;
     send_buffer_init(&sb);
 
     // Allocate should succeed
-    bool result = send_buffer_alloc(&sb, &test_pool);
+    bool result = send_buffer_alloc(&sb);
     TEST_ASSERT_TRUE(result);
     TEST_ASSERT_NOT_NULL(sb.buffer);
     TEST_ASSERT_EQUAL(SEND_BUFFER_SIZE, sb.size);
     TEST_ASSERT_TRUE(sb.allocated);
-    TEST_ASSERT_EQUAL(1, test_pool.in_use_mask);  // First slot used
 
     // Double alloc should be safe (no-op)
-    result = send_buffer_alloc(&sb, &test_pool);
+    result = send_buffer_alloc(&sb);
     TEST_ASSERT_TRUE(result);
-    TEST_ASSERT_EQUAL(1, test_pool.in_use_mask);  // Still just one slot
 
     // Free the buffer
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
     TEST_ASSERT_NULL(sb.buffer);
     TEST_ASSERT_FALSE(sb.allocated);
-    TEST_ASSERT_EQUAL(0, test_pool.in_use_mask);
 }
 
 // Test basic queue and peek operations
 static void test_queue_and_peek(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     // Queue some data
     const char* test_data = "Hello, World!";
@@ -90,16 +68,15 @@ static void test_queue_and_peek(void)
     TEST_ASSERT_EQUAL(0, send_buffer_pending(&sb));
     TEST_ASSERT_FALSE(send_buffer_has_data(&sb));
 
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // Test buffer space tracking
 static void test_buffer_space(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     // Initially should have nearly full space (minus 1 for empty/full distinction)
     size_t initial_space = send_buffer_space(&sb);
@@ -114,17 +91,16 @@ static void test_buffer_space(void)
     size_t remaining_space = send_buffer_space(&sb);
     TEST_ASSERT_EQUAL(initial_space - sizeof(data), remaining_space);
 
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // CRITICAL TEST: Ring buffer wrap-around reset
 // This tests the bug where head near end of buffer wasn't reset after consuming all data
 static void test_wrap_around_reset(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     ESP_LOGI(TAG, "Testing ring buffer wrap-around reset (the chunked encoding bug)");
 
@@ -167,16 +143,15 @@ static void test_wrap_around_reset(void)
         "Must have at least 10 bytes contiguous for chunk headers");
 
     free(fill_data);
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // Test wrap-around with partial consume
 static void test_wrap_around_partial_consume(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     // Fill buffer to move head near end
     size_t fill_size = SEND_BUFFER_SIZE - 100;
@@ -205,16 +180,15 @@ static void test_wrap_around_partial_consume(void)
         "Tail should be reset after consuming all remaining data");
 
     free(fill_data);
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // Test simulating the chunked encoding scenario that caused the original bug
 static void test_chunked_encoding_scenario(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     ESP_LOGI(TAG, "Simulating chunked encoding scenario");
 
@@ -258,16 +232,15 @@ static void test_chunked_encoding_scenario(void)
             "Tail must reset to 0 after draining buffer");
     }
 
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // Test write_ptr and commit for zero-copy writes
 static void test_zero_copy_write(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     // Get write pointer
     uint8_t* write_ptr;
@@ -289,47 +262,15 @@ static void test_zero_copy_write(void)
     TEST_ASSERT_EQUAL(len, peek_len);
     TEST_ASSERT_EQUAL_STRING_LEN(test_str, (const char*)peek, len);
 
-    send_buffer_free(&sb, &test_pool);
-}
-
-// Test pool exhaustion
-static void test_pool_exhaustion(void)
-{
-    reset_test_pool();
-    send_buffer_t buffers[SEND_BUFFER_POOL_SIZE + 1];
-
-    // Allocate all buffers in pool
-    for (int i = 0; i < SEND_BUFFER_POOL_SIZE; i++) {
-        send_buffer_init(&buffers[i]);
-        bool result = send_buffer_alloc(&buffers[i], &test_pool);
-        TEST_ASSERT_TRUE_MESSAGE(result, "Should be able to allocate buffer");
-    }
-
-    // Next allocation should fail
-    send_buffer_init(&buffers[SEND_BUFFER_POOL_SIZE]);
-    bool result = send_buffer_alloc(&buffers[SEND_BUFFER_POOL_SIZE], &test_pool);
-    TEST_ASSERT_FALSE_MESSAGE(result, "Pool should be exhausted");
-
-    // Free one buffer
-    send_buffer_free(&buffers[0], &test_pool);
-
-    // Now allocation should succeed
-    result = send_buffer_alloc(&buffers[SEND_BUFFER_POOL_SIZE], &test_pool);
-    TEST_ASSERT_TRUE_MESSAGE(result, "Should be able to allocate after free");
-
-    // Cleanup
-    for (int i = 1; i <= SEND_BUFFER_POOL_SIZE; i++) {
-        send_buffer_free(&buffers[i], &test_pool);
-    }
+    send_buffer_free(&sb);
 }
 
 // Test buffer reset (keeps allocation)
 static void test_buffer_reset(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     // Queue data and set flags
     send_buffer_queue(&sb, "test", 4);
@@ -348,7 +289,7 @@ static void test_buffer_reset(void)
     TEST_ASSERT_FALSE(sb.headers_done);
     TEST_ASSERT_FALSE(send_buffer_has_data(&sb));
 
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // ============================================================================
@@ -396,10 +337,9 @@ static void test_unallocated_buffer_operations(void)
 // Test queue with zero length
 static void test_queue_zero_length(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     // Queue zero bytes should fail (returns -1)
     ssize_t result = send_buffer_queue(&sb, "test", 0);
@@ -410,16 +350,15 @@ static void test_queue_zero_length(void)
     TEST_ASSERT_FALSE(send_buffer_has_data(&sb));
     TEST_ASSERT_EQUAL(0, send_buffer_pending(&sb));
 
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // Test consume more than pending (should be clamped)
 static void test_consume_overflow(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     // Queue some data
     send_buffer_queue(&sb, "test", 4);
@@ -437,16 +376,15 @@ static void test_consume_overflow(void)
     TEST_ASSERT_EQUAL(0, sb.head);
     TEST_ASSERT_EQUAL(0, sb.tail);
 
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // Test consume zero bytes (should be no-op)
 static void test_consume_zero(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     send_buffer_queue(&sb, "test", 4);
     uint16_t tail_before = sb.tail;
@@ -458,53 +396,44 @@ static void test_consume_zero(void)
         "Consume zero should not change tail");
     TEST_ASSERT_EQUAL(4, send_buffer_pending(&sb));
 
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // Test double free (should be safe)
 static void test_double_free(void)
 {
-    reset_test_pool();
     send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
-
-    TEST_ASSERT_EQUAL(1, test_pool.in_use_mask);
+    send_buffer_alloc(&sb);
 
     // First free
-    send_buffer_free(&sb, &test_pool);
-    TEST_ASSERT_EQUAL(0, test_pool.in_use_mask);
+    send_buffer_free(&sb);
     TEST_ASSERT_NULL(sb.buffer);
     TEST_ASSERT_FALSE(sb.allocated);
 
     // Second free should be safe (no-op)
-    send_buffer_free(&sb, &test_pool);
-    TEST_ASSERT_EQUAL_MESSAGE(0, test_pool.in_use_mask,
-        "Double free should not corrupt pool mask");
+    send_buffer_free(&sb);
     TEST_ASSERT_NULL(sb.buffer);
 }
 
 // Test free unallocated buffer
 static void test_free_unallocated(void)
 {
-    reset_test_pool();
     send_buffer_t sb;
     send_buffer_init(&sb);
 
     // Free without ever allocating - should be safe
-    send_buffer_free(&sb, &test_pool);
-
-    TEST_ASSERT_EQUAL_MESSAGE(0, test_pool.in_use_mask,
-        "Free of unallocated buffer should not corrupt pool");
+    send_buffer_free(&sb);
+    TEST_ASSERT_NULL(sb.buffer);
+    TEST_ASSERT_FALSE(sb.allocated);
 }
 
 // Test buffer completely full (minus 1 byte)
 static void test_buffer_full(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     // Fill to max capacity (size - 1)
     size_t max_fill = SEND_BUFFER_SIZE - 1;
@@ -526,16 +455,15 @@ static void test_buffer_full(void)
         "Queue to full buffer should return -1");
 
     free(fill_data);
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // Test queue exactly fills remaining space
 static void test_queue_exact_fit(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     // Queue to leave exactly 100 bytes
     size_t initial_fill = SEND_BUFFER_SIZE - 1 - 100;
@@ -557,16 +485,15 @@ static void test_queue_exact_fit(void)
     TEST_ASSERT_EQUAL(0, send_buffer_space(&sb));
 
     free(fill_data);
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // Test peek on empty buffer
 static void test_peek_empty(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     // Peek on empty allocated buffer
     const uint8_t* peek_ptr;
@@ -577,16 +504,15 @@ static void test_peek_empty(void)
     TEST_ASSERT_EQUAL_MESSAGE(0, peek_len,
         "Peek on empty buffer should return 0 length");
 
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // Test commit with bounds validation
 static void test_commit_bounds(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     // Get write pointer
     uint8_t* write_ptr;
@@ -600,16 +526,15 @@ static void test_commit_bounds(void)
     // Verify head advanced correctly
     TEST_ASSERT_EQUAL(10, sb.head);
 
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // Test wrap-around with exact boundary conditions
 static void test_wrap_boundary(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     // Fill to move head to exact end of buffer
     size_t fill_size = SEND_BUFFER_SIZE - 1;
@@ -635,16 +560,15 @@ static void test_wrap_boundary(void)
     TEST_ASSERT_EQUAL(0, sb.tail);
 
     free(fill_data);
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // Test data integrity through wrap-around
 static void test_wrap_data_integrity(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     // Create a pattern that will wrap around buffer
     // First, fill and drain to position head near end
@@ -684,54 +608,15 @@ static void test_wrap_data_integrity(void)
     TEST_ASSERT_EQUAL_STRING_LEN_MESSAGE(test_pattern, read_buffer, 32,
         "Data should survive wrap-around intact");
 
-    send_buffer_free(&sb, &test_pool);
-}
-
-// Test multiple allocations use different slots
-static void test_allocation_slots(void)
-{
-    reset_test_pool();
-    send_buffer_t buffers[SEND_BUFFER_POOL_SIZE];
-
-    // Allocate all and verify each uses different memory
-    for (int i = 0; i < SEND_BUFFER_POOL_SIZE; i++) {
-        send_buffer_init(&buffers[i]);
-        bool result = send_buffer_alloc(&buffers[i], &test_pool);
-        TEST_ASSERT_TRUE(result);
-
-        // Verify buffer points to pool memory
-        bool found = false;
-        for (int j = 0; j < SEND_BUFFER_POOL_SIZE; j++) {
-            if (buffers[i].buffer == test_pool.buffers[j]) {
-                found = true;
-                break;
-            }
-        }
-        TEST_ASSERT_TRUE_MESSAGE(found,
-            "Allocated buffer should point to pool memory");
-    }
-
-    // Verify all buffers are unique
-    for (int i = 0; i < SEND_BUFFER_POOL_SIZE; i++) {
-        for (int j = i + 1; j < SEND_BUFFER_POOL_SIZE; j++) {
-            TEST_ASSERT_NOT_EQUAL_MESSAGE(buffers[i].buffer, buffers[j].buffer,
-                "Each allocation should use unique buffer");
-        }
-    }
-
-    // Cleanup
-    for (int i = 0; i < SEND_BUFFER_POOL_SIZE; i++) {
-        send_buffer_free(&buffers[i], &test_pool);
-    }
+    send_buffer_free(&sb);
 }
 
 // Test reset preserves buffer allocation
 static void test_reset_preserves_allocation(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     uint8_t* original_buffer = sb.buffer;
     uint16_t original_size = sb.size;
@@ -752,7 +637,7 @@ static void test_reset_preserves_allocation(void)
     // But data should be gone
     TEST_ASSERT_EQUAL(0, send_buffer_pending(&sb));
 
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // ============================================================================
@@ -762,10 +647,9 @@ static void test_reset_preserves_allocation(void)
 // Test start_file with valid fd
 static void test_start_file_valid_fd(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     // Use a mock fd value (we're testing state changes, not actual I/O)
     int mock_fd = 42;
@@ -782,16 +666,15 @@ static void test_start_file_valid_fd(void)
 
     // Don't call send_buffer_free which would try to close the mock fd
     sb.file_fd = -1;  // Prevent close attempt
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // Test start_file with invalid fd (-1)
 static void test_start_file_invalid_fd(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     bool result = send_buffer_start_file(&sb, -1, 1024);
 
@@ -800,16 +683,15 @@ static void test_start_file_invalid_fd(void)
     TEST_ASSERT_FALSE(sb.streaming);
     TEST_ASSERT_FALSE(send_buffer_is_streaming(&sb));
 
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // Test start_file with zero size
 static void test_start_file_zero_size(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     // Zero size file is valid
     int mock_fd = 10;
@@ -821,16 +703,15 @@ static void test_start_file_zero_size(void)
     TEST_ASSERT_TRUE(sb.streaming);
 
     sb.file_fd = -1;  // Prevent close attempt
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // Test stop_file clears state
 static void test_stop_file_clears_state(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     // Setup file streaming state manually
     sb.file_fd = 99;  // Mock fd
@@ -846,16 +727,15 @@ static void test_stop_file_clears_state(void)
     TEST_ASSERT_FALSE(send_buffer_is_streaming(&sb));
     TEST_ASSERT_EQUAL(0, send_buffer_file_remaining(&sb));
 
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // Test stop_file when no file is open (should be safe)
 static void test_stop_file_no_file(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     // No file is open (file_fd = -1 from init)
     TEST_ASSERT_EQUAL(-1, sb.file_fd);
@@ -867,7 +747,7 @@ static void test_stop_file_no_file(void)
     TEST_ASSERT_EQUAL(-1, sb.file_fd);
     TEST_ASSERT_FALSE(sb.streaming);
 
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // Test is_streaming inline function
@@ -921,10 +801,9 @@ static void test_file_remaining_accessor(void)
 // Test reset clears file state
 static void test_reset_clears_file_state(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     // Setup file streaming state
     sb.file_fd = 123;  // Mock fd
@@ -938,16 +817,15 @@ static void test_reset_clears_file_state(void)
     TEST_ASSERT_EQUAL(0, sb.file_remaining);
     TEST_ASSERT_FALSE(sb.streaming);
 
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 // Test free closes file fd
 static void test_free_closes_file(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     // Setup mock file fd
     sb.file_fd = 200;  // Mock fd
@@ -955,7 +833,7 @@ static void test_free_closes_file(void)
 
     // Free should attempt to close the file
     // (close will fail on invalid fd, but shouldn't crash)
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 
     // After free, buffer should be reinitialized
     TEST_ASSERT_EQUAL(-1, sb.file_fd);
@@ -965,10 +843,9 @@ static void test_free_closes_file(void)
 // Test start_file replaces existing file
 static void test_start_file_replaces_existing(void)
 {
-    reset_test_pool();
-    send_buffer_t sb;
+        send_buffer_t sb;
     send_buffer_init(&sb);
-    send_buffer_alloc(&sb, &test_pool);
+    send_buffer_alloc(&sb);
 
     // Start first file
     sb.file_fd = 10;  // Pretend this is open
@@ -985,19 +862,17 @@ static void test_start_file_replaces_existing(void)
     TEST_ASSERT_TRUE(sb.streaming);
 
     sb.file_fd = -1;  // Prevent close attempt
-    send_buffer_free(&sb, &test_pool);
+    send_buffer_free(&sb);
 }
 
 void test_send_buffer_run(void)
 {
     // Basic functionality tests
-    RUN_TEST(test_pool_init);
     RUN_TEST(test_buffer_init);
     RUN_TEST(test_buffer_alloc);
     RUN_TEST(test_queue_and_peek);
     RUN_TEST(test_buffer_space);
     RUN_TEST(test_zero_copy_write);
-    RUN_TEST(test_pool_exhaustion);
     RUN_TEST(test_buffer_reset);
 
     // Critical wrap-around bug tests
@@ -1018,7 +893,6 @@ void test_send_buffer_run(void)
     RUN_TEST(test_commit_bounds);
     RUN_TEST(test_wrap_boundary);
     RUN_TEST(test_wrap_data_integrity);
-    RUN_TEST(test_allocation_slots);
     RUN_TEST(test_reset_preserves_allocation);
 
     // File streaming tests
@@ -1033,5 +907,5 @@ void test_send_buffer_run(void)
     RUN_TEST(test_free_closes_file);
     RUN_TEST(test_start_file_replaces_existing);
 
-    ESP_LOGI(TAG, "Send buffer tests completed (35 tests)");
+    ESP_LOGI(TAG, "Send buffer tests completed (32 tests)");
 }

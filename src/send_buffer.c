@@ -1,64 +1,47 @@
 #include "private/send_buffer.h"
 #include <string.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include "esp_log.h"
 
 static const char* TAG = "SEND_BUF";
-
-void send_buffer_pool_init(send_buffer_pool_t* pool) {
-    pool->in_use_mask = 0;
-}
 
 void send_buffer_init(send_buffer_t* sb) {
     memset(sb, 0, sizeof(send_buffer_t));
     sb->file_fd = -1;
 }
 
-bool send_buffer_alloc(send_buffer_t* sb, send_buffer_pool_t* pool) {
-    if (sb->allocated) {
+bool send_buffer_alloc(send_buffer_t* sb) {
+    if (sb->allocated && sb->buffer) {
         return true;  // Already allocated
     }
 
-    // Find free buffer in pool
-    uint8_t free_mask = ~pool->in_use_mask;
-    if (free_mask == 0) {
-        ESP_LOGW(TAG, "Send buffer pool exhausted");
+    // Dynamically allocate buffer
+    sb->buffer = (uint8_t*)malloc(SEND_BUFFER_SIZE);
+    if (!sb->buffer) {
+        ESP_LOGW(TAG, "Failed to allocate send buffer (%d bytes)", SEND_BUFFER_SIZE);
         return false;
     }
 
-    int slot = __builtin_ctz(free_mask);
-    if (slot >= SEND_BUFFER_POOL_SIZE) {
-        return false;
-    }
-
-    pool->in_use_mask |= (1U << slot);
-    sb->buffer = pool->buffers[slot];
     sb->size = SEND_BUFFER_SIZE;
     sb->head = 0;
     sb->tail = 0;
     sb->allocated = 1;
 
-    ESP_LOGD(TAG, "Allocated send buffer slot %d", slot);
+    ESP_LOGD(TAG, "Allocated send buffer (%d bytes)", SEND_BUFFER_SIZE);
     return true;
 }
 
-void send_buffer_free(send_buffer_t* sb, send_buffer_pool_t* pool) {
-    if (!sb->allocated || !sb->buffer) {
-        return;
-    }
-
-    // Find which slot this buffer belongs to
-    for (int i = 0; i < SEND_BUFFER_POOL_SIZE; i++) {
-        if (sb->buffer == pool->buffers[i]) {
-            pool->in_use_mask &= ~(1U << i);
-            ESP_LOGD(TAG, "Freed send buffer slot %d", i);
-            break;
-        }
-    }
-
+void send_buffer_free(send_buffer_t* sb) {
     // Close any open file
     if (sb->file_fd >= 0) {
         close(sb->file_fd);
+    }
+
+    // Free dynamically allocated buffer
+    if (sb->buffer) {
+        free(sb->buffer);
+        ESP_LOGD(TAG, "Freed send buffer");
     }
 
     send_buffer_init(sb);

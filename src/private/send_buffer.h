@@ -10,16 +10,12 @@
 extern "C" {
 #endif
 
-// Configuration - can be overridden via Kconfig
+// Default buffer size - can be overridden via Kconfig
 #ifndef SEND_BUFFER_SIZE
-#define SEND_BUFFER_SIZE 8192  // 8KB for better throughput with large transfers
+#define SEND_BUFFER_SIZE 4096
 #endif
 
-#ifndef SEND_BUFFER_POOL_SIZE
-#define SEND_BUFFER_POOL_SIZE 8  // Max concurrent send buffers
-#endif
-
-// Send buffer state
+// Send buffer state - dynamically allocated
 typedef struct {
     // Ring buffer for queued send data
     uint8_t* buffer;            // Buffer memory (NULL if not allocated)
@@ -39,23 +35,14 @@ typedef struct {
     uint8_t _reserved : 4;
 } send_buffer_t;
 
-// Buffer pool for memory management
-typedef struct {
-    uint8_t buffers[SEND_BUFFER_POOL_SIZE][SEND_BUFFER_SIZE];
-    uint8_t in_use_mask;        // Bitmask of allocated buffers
-} send_buffer_pool_t;
-
-// Initialize buffer pool
-void send_buffer_pool_init(send_buffer_pool_t* pool);
-
 // Initialize a send buffer (does not allocate memory yet)
 void send_buffer_init(send_buffer_t* sb);
 
-// Allocate buffer memory from pool (lazy allocation)
-bool send_buffer_alloc(send_buffer_t* sb, send_buffer_pool_t* pool);
+// Allocate buffer memory dynamically (lazy allocation)
+bool send_buffer_alloc(send_buffer_t* sb);
 
-// Free buffer back to pool
-void send_buffer_free(send_buffer_t* sb, send_buffer_pool_t* pool);
+// Free buffer memory
+void send_buffer_free(send_buffer_t* sb);
 
 // Reset buffer state (keep allocation)
 void send_buffer_reset(send_buffer_t* sb);

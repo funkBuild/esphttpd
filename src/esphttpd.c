@@ -29,15 +29,31 @@ static const char* TAG = "ESPHTTPD";
 // Internal Structures
 // ============================================================================
 
-#define MAX_MIDDLEWARES 8
-#define MAX_HTTP_ROUTES 64
-#define MAX_WS_ROUTES 16
-#define REQ_HEADER_BUF_SIZE 2048
-#define MAX_REQ_HEADERS 32
-
+// Configuration defaults (overridden by Kconfig)
+#ifndef CONFIG_HTTPD_MAX_SERVER_MIDDLEWARES
+#define CONFIG_HTTPD_MAX_SERVER_MIDDLEWARES 4
+#endif
+#ifndef CONFIG_HTTPD_MAX_WS_ROUTES
+#define CONFIG_HTTPD_MAX_WS_ROUTES 8
+#endif
+#ifndef CONFIG_HTTPD_MAX_REQ_HEADERS
+#define CONFIG_HTTPD_MAX_REQ_HEADERS 16
+#endif
+#ifndef CONFIG_HTTPD_MAX_QUERY_PARAMS
+#define CONFIG_HTTPD_MAX_QUERY_PARAMS 8
+#endif
 #ifndef CONFIG_HTTPD_MAX_ROUTERS
 #define CONFIG_HTTPD_MAX_ROUTERS 8
 #endif
+#ifndef CONFIG_HTTPD_MAX_WS_CHANNELS
+#define CONFIG_HTTPD_MAX_WS_CHANNELS 16
+#endif
+
+#define MAX_MIDDLEWARES CONFIG_HTTPD_MAX_SERVER_MIDDLEWARES
+#define MAX_WS_ROUTES CONFIG_HTTPD_MAX_WS_ROUTES
+#define REQ_HEADER_BUF_SIZE 2048
+#define MAX_REQ_HEADERS CONFIG_HTTPD_MAX_REQ_HEADERS
+#define MAX_QUERY_PARAMS CONFIG_HTTPD_MAX_QUERY_PARAMS
 
 // Header entry for per-request storage
 typedef struct {
@@ -77,7 +93,7 @@ typedef struct {
     int8_t index;               // Bitmask index (0-31), -1 if empty
 } channel_hash_entry_t;
 
-#define CHANNEL_HASH_BUCKETS 64  // Power of 2, > 2 * MAX_CHANNELS for low collision
+#define CHANNEL_HASH_BUCKETS 32  // Power of 2, >= MAX_CHANNELS for acceptable collision
 
 // FNV-1a hash for channel names
 static uint32_t channel_hash_fn(const char* str) {
@@ -119,29 +135,48 @@ struct httpd_server {
     // Server-level error handler
     httpd_err_handler_t error_handler;
 
-    // WebSocket channel registry (hash table for O(1) lookup)
-    channel_hash_entry_t channel_hash[CHANNEL_HASH_BUCKETS];  // Hash table
+    // WebSocket channel registry (hash table for O(1) lookup) - lazy allocated
+    channel_hash_entry_t* channel_hash;             // Hash table (NULL until first channel join)
     channel_hash_entry_t* channel_by_index[HTTPD_WS_MAX_CHANNELS];  // Index -> entry mapping
     uint8_t channel_count;                          // Next available channel index
-
-    // Send buffer pool for non-blocking sends
-    send_buffer_pool_t send_buffer_pool;
 
     // State
     bool initialized;
     bool running;
 };
 
-// Per-connection send buffers
-static send_buffer_t connection_send_buffers[MAX_CONNECTIONS];
-
-// Initialize channel hash table - O(1) memset instead of O(n) loop
-// Setting all bytes to 0xFF makes index = -1 (int8_t), marking slots as empty.
-// Name field contents don't matter for empty slots since we check index < 0 first.
-static inline void init_channel_hash(struct httpd_server* server) {
-    memset(server->channel_hash, 0xFF, sizeof(server->channel_hash));
+// Free channel hash table if allocated
+static inline void free_channel_hash(struct httpd_server* server) {
+    if (server->channel_hash) {
+        free(server->channel_hash);
+        server->channel_hash = NULL;
+    }
     memset(server->channel_by_index, 0, sizeof(server->channel_by_index));
     server->channel_count = 0;
+}
+
+// Lazy-allocate channel hash table (only when first channel is used)
+// Returns true if hash is available (already allocated or newly allocated)
+static inline bool ensure_channel_hash(struct httpd_server* server) {
+    if (server->channel_hash) return true;
+
+    server->channel_hash = (channel_hash_entry_t*)malloc(
+        CHANNEL_HASH_BUCKETS * sizeof(channel_hash_entry_t));
+    if (!server->channel_hash) {
+        ESP_LOGE(TAG, "Failed to allocate channel hash table");
+        return false;
+    }
+
+    // Initialize: set all index fields to -1 (empty)
+    memset(server->channel_hash, 0xFF, CHANNEL_HASH_BUCKETS * sizeof(channel_hash_entry_t));
+    memset(server->channel_by_index, 0, sizeof(server->channel_by_index));
+    server->channel_count = 0;
+    return true;
+}
+
+// Initialize/reset channel state (no allocation - lazy)
+static inline void init_channel_hash(struct httpd_server* server) {
+    free_channel_hash(server);
 }
 
 // Query parameter cache entry (pointers into query string)
@@ -152,18 +187,17 @@ typedef struct {
     uint8_t value_len;
 } query_param_entry_t;
 
-#define MAX_QUERY_PARAMS 8
-
 // Per-connection request context
 typedef struct {
     httpd_req_t req;                      // Public request struct
     req_header_entry_t headers[MAX_REQ_HEADERS];  // Header index
-    char header_buf[REQ_HEADER_BUF_SIZE]; // Header storage
-    char uri_buf[256];                    // URI storage
+    char* header_buf;                     // Header storage (dynamically allocated)
+    size_t header_buf_capacity;           // Allocated capacity
+    char* uri_buf;                        // URI storage (dynamically allocated)
     struct httpd_server* server;          // Back pointer to server
     httpd_route_entry_t* matched_route;   // Matched route
-    // Pre-received body data (received with headers)
-    uint8_t body_buf[1024];               // Buffer for body data received with headers
+    // Pre-received body data (received with headers) - dynamically allocated
+    uint8_t* body_buf;                    // Buffer for body data (NULL if not allocated)
     size_t body_buf_len;                  // Amount of data in body_buf
     size_t body_buf_pos;                  // Current read position in body_buf
     // Query parameter cache (lazy parsing)
@@ -201,6 +235,11 @@ typedef struct {
     uint32_t channel_mask;                // Bitmask of subscribed channels
 } ws_context_t;
 
+// Per-connection contexts (pointer arrays - dynamically allocated on connect)
+static request_context_t* request_contexts[MAX_CONNECTIONS];
+static ws_context_t* ws_contexts[MAX_CONNECTIONS];
+static send_buffer_t* connection_send_buffers[MAX_CONNECTIONS];
+
 // Global server instance (for now - could be made multi-instance later)
 static struct httpd_server server_instance;
 #ifdef CONFIG_ESPHTTPD_TEST_MODE
@@ -212,10 +251,6 @@ static filesystem_t fs_instance;
 
 // WebSocket client key buffer (used by http_parser)
 char ws_client_key[32] = {0};
-
-// Per-connection contexts
-static request_context_t request_contexts[MAX_CONNECTIONS];
-static ws_context_t ws_contexts[MAX_CONNECTIONS];
 
 // Track current connection being parsed (for header storage callback)
 static connection_t* g_parsing_connection = NULL;
@@ -232,15 +267,16 @@ static void store_header_in_req(request_context_t* ctx, const uint8_t* key, uint
 static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len);
 static void on_http_body(connection_t* conn, uint8_t* buffer, size_t len);
 static void on_ws_frame(connection_t* conn, uint8_t* buffer, size_t len);
+static void on_connect(connection_t* conn);
 static void on_ws_connect(connection_t* conn);
 static void on_ws_disconnect(connection_t* conn);
 static void on_disconnect(connection_t* conn);
 static void on_write_ready(connection_t* conn);
 static void server_task(void* pvParameters);
 
-// Get send buffer for connection
+// Get send buffer for connection (returns NULL if not allocated)
 static inline send_buffer_t* get_send_buffer(connection_t* conn) {
-    return &connection_send_buffers[conn->pool_index];
+    return connection_send_buffers[conn->pool_index];
 }
 
 // ============================================================================
@@ -251,6 +287,7 @@ static inline send_buffer_t* get_send_buffer(connection_t* conn) {
 // Returns true if buffer is now empty, false if more data pending
 static bool drain_send_buffer(connection_t* conn) {
     send_buffer_t* sb = get_send_buffer(conn);
+    if (!sb) return true;  // No buffer, nothing to drain
 
     while (send_buffer_has_data(sb)) {
         const uint8_t* data;
@@ -279,6 +316,10 @@ static ssize_t send_nonblocking(connection_t* conn, const void* data, size_t len
     }
 
     send_buffer_t* sb = get_send_buffer(conn);
+    if (!sb) {
+        ESP_LOGE(TAG, "No send buffer for connection");
+        return -1;
+    }
     const uint8_t* ptr = (const uint8_t*)data;
     size_t remaining = len;
 
@@ -315,7 +356,7 @@ static ssize_t send_nonblocking(connection_t* conn, const void* data, size_t len
 queue_data:
     // Ensure we have a buffer allocated
     if (!sb->allocated) {
-        if (!send_buffer_alloc(sb, &g_server->send_buffer_pool)) {
+        if (!send_buffer_alloc(sb)) {
             ESP_LOGE(TAG, "Failed to allocate send buffer");
             return -1;
         }
@@ -535,7 +576,7 @@ static inline bool str_casecmp(const char* a, const char* b, size_t len) {
 static request_context_t* get_req_context(httpd_req_t* req) {
     if (!req || !req->_internal || !g_server) return NULL;
     connection_t* conn = (connection_t*)req->_internal;
-    return &request_contexts[conn->pool_index];
+    return request_contexts[conn->pool_index];
 }
 
 // Parse query string once and cache results
@@ -625,26 +666,38 @@ const char* httpd_req_get_query_string(httpd_req_t* req) {
 // ============================================================================
 
 // O(1) context lookup using cached pool_index (avoids O(k) connection_get_index)
+// Returns NULL if context not allocated (connection not fully established)
 static inline request_context_t* get_request_context(connection_t* conn) {
     if (!g_server) return NULL;
-    return &request_contexts[conn->pool_index];
+    return request_contexts[conn->pool_index];
 }
 
 static inline ws_context_t* get_ws_context(connection_t* conn) {
     if (!g_server) return NULL;
-    return &ws_contexts[conn->pool_index];
+    return ws_contexts[conn->pool_index];
 }
 
 static void init_request_context(request_context_t* ctx, connection_t* conn) {
     // Selective initialization - avoid clearing large buffers (~3.5KB savings)
     // Only reset fields that need to be zeroed for a new request
 
+    // Free any previously allocated buffers
+    if (ctx->uri_buf) {
+        free(ctx->uri_buf);
+        ctx->uri_buf = NULL;
+    }
+    if (ctx->header_buf) {
+        free(ctx->header_buf);
+        ctx->header_buf = NULL;
+        ctx->header_buf_capacity = 0;
+    }
+
     // Essential pointers and connection info
     ctx->req.fd = conn->fd;
     ctx->req._internal = conn;
-    ctx->req.header_buf = ctx->header_buf;
-    ctx->req.header_buf_size = sizeof(ctx->header_buf);
-    ctx->req.uri = ctx->uri_buf;
+    ctx->req.header_buf = NULL;  // Will be allocated on first header
+    ctx->req.header_buf_size = 0;
+    ctx->req.uri = NULL;  // Will be set when URI is parsed
     ctx->req.status_code = 200;
     ctx->server = g_server;
 
@@ -679,6 +732,11 @@ static void init_request_context(request_context_t* ctx, connection_t* conn) {
 
     // Reset context fields
     ctx->matched_route = NULL;
+    // Free any previously allocated body buffer
+    if (ctx->body_buf) {
+        free(ctx->body_buf);
+        ctx->body_buf = NULL;
+    }
     ctx->body_buf_len = 0;
     ctx->body_buf_pos = 0;
     ctx->query_param_count = 0;
@@ -716,13 +774,40 @@ void esphttpd_store_header(const uint8_t* key, uint8_t key_len,
 }
 
 // New header storage that works with request context
-// Optimized: uses pointer arithmetic to avoid repeated offset calculations
+// Dynamically allocates and grows header buffer as needed
 static void store_header_in_req(request_context_t* ctx, const uint8_t* key, uint8_t key_len,
                                 const uint8_t* value, uint8_t value_len) {
     if (ctx->req.header_count >= MAX_REQ_HEADERS) return;
 
     size_t needed = key_len + 1 + value_len + 1;
-    if (ctx->req.header_buf_used + needed > ctx->req.header_buf_size) return;
+    size_t required = ctx->req.header_buf_used + needed;
+
+    // Allocate or grow header buffer if needed
+    if (required > ctx->header_buf_capacity) {
+        // Calculate new capacity - start with 256, grow to fit with margin
+        size_t new_capacity = ctx->header_buf_capacity ? ctx->header_buf_capacity : 256;
+        while (new_capacity < required) {
+            new_capacity = (new_capacity < 1024) ? new_capacity * 2 : new_capacity + 512;
+        }
+        // Cap at max size
+        if (new_capacity > REQ_HEADER_BUF_SIZE) {
+            new_capacity = REQ_HEADER_BUF_SIZE;
+        }
+        if (required > new_capacity) {
+            ESP_LOGW(TAG, "Header buffer full, dropping header");
+            return;
+        }
+
+        char* new_buf = (char*)realloc(ctx->header_buf, new_capacity);
+        if (!new_buf) {
+            ESP_LOGE(TAG, "Failed to allocate header buffer");
+            return;
+        }
+        ctx->header_buf = new_buf;
+        ctx->header_buf_capacity = new_capacity;
+        ctx->req.header_buf = new_buf;
+        ctx->req.header_buf_size = new_capacity;
+    }
 
     req_header_entry_t* entry = &ctx->headers[ctx->req.header_count];
     char* dst = &ctx->header_buf[ctx->req.header_buf_used];
@@ -776,11 +861,10 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
     event_loop_init(&server->event_loop, &server->connection_pool, &el_config);
     connection_pool_init(&server->connection_pool);
 
-    // Initialize send buffer pool and per-connection buffers
-    send_buffer_pool_init(&server->send_buffer_pool);
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        send_buffer_init(&connection_send_buffers[i]);
-    }
+    // Initialize per-connection context pointer arrays (all NULL initially)
+    memset(request_contexts, 0, sizeof(request_contexts));
+    memset(ws_contexts, 0, sizeof(ws_contexts));
+    memset(connection_send_buffers, 0, sizeof(connection_send_buffers));
 
     // Initialize channel hash table
     init_channel_hash(server);
@@ -796,6 +880,7 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
     server->handlers.on_http_request = on_http_request;
     server->handlers.on_http_body = on_http_body;
     server->handlers.on_ws_frame = on_ws_frame;
+    server->handlers.on_connect = on_connect;
     server->handlers.on_ws_connect = on_ws_connect;
     server->handlers.on_ws_disconnect = on_ws_disconnect;
     server->handlers.on_disconnect = on_disconnect;
@@ -1094,7 +1179,7 @@ int httpd_req_recv(httpd_req_t* req, void* buf, size_t len) {
     size_t total_received = 0;
 
     // First, return any pre-received body data from the initial request buffer
-    if (ctx->body_buf_pos < ctx->body_buf_len) {
+    if (ctx->body_buf && ctx->body_buf_pos < ctx->body_buf_len) {
         size_t pre_available = ctx->body_buf_len - ctx->body_buf_pos;
         size_t pre_to_copy = (len < pre_available) ? len : pre_available;
         if (pre_to_copy > remaining) pre_to_copy = remaining;
@@ -1103,6 +1188,14 @@ int httpd_req_recv(httpd_req_t* req, void* buf, size_t len) {
         ctx->body_buf_pos += pre_to_copy;
         req->body_received += pre_to_copy;
         total_received = pre_to_copy;
+
+        // Free body buffer early when fully consumed
+        if (ctx->body_buf_pos >= ctx->body_buf_len) {
+            free(ctx->body_buf);
+            ctx->body_buf = NULL;
+            ctx->body_buf_len = 0;
+            ctx->body_buf_pos = 0;
+        }
 
         // If we've filled the buffer or received all content, return
         if (total_received >= len || req->body_received >= req->content_length) {
@@ -1447,7 +1540,7 @@ httpd_err_t httpd_resp_send_provider(httpd_req_t* req, ssize_t content_length,
 
     // Allocate send buffer for the data provider
     send_buffer_t* sb = get_send_buffer(conn);
-    if (!send_buffer_alloc(sb, &g_server->send_buffer_pool)) {
+    if (!send_buffer_alloc(sb)) {
         ESP_LOGE(TAG, "Failed to allocate send buffer for provider");
         return HTTPD_ERR_NO_MEM;
     }
@@ -1607,7 +1700,7 @@ httpd_err_t httpd_req_defer(httpd_req_t* req, httpd_body_cb_t on_body, httpd_don
              req->content_length, req->body_received);
 
     // Deliver any pre-received body data that came with headers
-    if (ctx->body_buf_len > ctx->body_buf_pos && on_body) {
+    if (ctx->body_buf && ctx->body_buf_len > ctx->body_buf_pos && on_body) {
         size_t pre_data_len = ctx->body_buf_len - ctx->body_buf_pos;
         httpd_err_t err = on_body(req, &ctx->body_buf[ctx->body_buf_pos], pre_data_len);
         if (err != HTTPD_OK) {
@@ -1617,7 +1710,11 @@ httpd_err_t httpd_req_defer(httpd_req_t* req, httpd_body_cb_t on_body, httpd_don
             return err;
         }
         req->body_received += pre_data_len;
-        ctx->body_buf_pos = ctx->body_buf_len;  // Mark as consumed
+        // Free body buffer after consuming
+        free(ctx->body_buf);
+        ctx->body_buf = NULL;
+        ctx->body_buf_len = 0;
+        ctx->body_buf_pos = 0;
     }
 
     // Check if body is already complete (small POST that fit in header buffer)
@@ -1907,7 +2004,7 @@ static ws_context_t* get_ws_context_from_ws(httpd_ws_t* ws) {
 
 // Find channel index by name using hash table - O(1) average case
 static int find_channel(const char* channel) {
-    if (!g_server || !channel) return -1;
+    if (!g_server || !channel || !g_server->channel_hash) return -1;
 
     uint32_t hash = channel_hash_fn(channel);
     uint32_t bucket = hash & (CHANNEL_HASH_BUCKETS - 1);
@@ -1927,9 +2024,12 @@ static int find_channel(const char* channel) {
     return -1;  // Table full (shouldn't happen)
 }
 
-// Find or create a channel index (-1 if full)
+// Find or create a channel index (-1 if full or allocation failed)
 static int find_or_create_channel(const char* channel) {
     if (!g_server || !channel) return -1;
+
+    // Lazy-allocate channel hash on first use
+    if (!ensure_channel_hash(g_server)) return -1;
 
     uint32_t hash = channel_hash_fn(channel);
     uint32_t bucket = hash & (CHANNEL_HASH_BUCKETS - 1);
@@ -2037,8 +2137,8 @@ int httpd_ws_publish(httpd_handle_t handle, const char* channel,
         int i = __builtin_ctz(ws_mask);  // Get index of lowest set bit
         ws_mask &= ws_mask - 1;  // Clear lowest set bit
 
-        ws_context_t* ctx = &ws_contexts[i];
-        if (ctx->channel_mask & channel_mask) {
+        ws_context_t* ctx = ws_contexts[i];
+        if (ctx && (ctx->channel_mask & channel_mask)) {
             connection_t* conn = &server->connection_pool.connections[i];
             if (ws_send_frame(conn->fd, opcode, (const uint8_t*)data, len, false) >= 0) {
                 sent++;
@@ -2065,8 +2165,8 @@ unsigned int httpd_ws_channel_size(httpd_handle_t handle, const char* channel) {
         int i = __builtin_ctz(ws_mask);  // Get index of lowest set bit
         ws_mask &= ws_mask - 1;  // Clear lowest set bit
 
-        ws_context_t* ctx = &ws_contexts[i];
-        if (ctx->channel_mask & channel_mask) {
+        ws_context_t* ctx = ws_contexts[i];
+        if (ctx && (ctx->channel_mask & channel_mask)) {
             count++;
         }
     }
@@ -2194,24 +2294,31 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
         return;
     }
 
-    // Copy URL to request context
-    if (parser_ctx.url && parser_ctx.url_len < sizeof(ctx->uri_buf)) {
-        memcpy(ctx->uri_buf, parser_ctx.url, parser_ctx.url_len);
-        ctx->uri_buf[parser_ctx.url_len] = '\0';
-        ctx->req.uri = ctx->uri_buf;
-        ctx->req.uri_len = parser_ctx.url_len;
+    // Copy URL to request context (dynamically allocated)
+    if (parser_ctx.url && parser_ctx.url_len > 0 && parser_ctx.url_len < 2048) {
+        ctx->uri_buf = (char*)malloc(parser_ctx.url_len + 1);
+        if (ctx->uri_buf) {
+            memcpy(ctx->uri_buf, parser_ctx.url, parser_ctx.url_len);
+            ctx->uri_buf[parser_ctx.url_len] = '\0';
+            ctx->req.uri = ctx->uri_buf;
+            ctx->req.uri_len = parser_ctx.url_len;
 
-        // Split path and query
-        char* query = strchr(ctx->uri_buf, '?');
-        if (query) {
-            *query = '\0';
-            ctx->req.path = ctx->uri_buf;
-            ctx->req.path_len = query - ctx->uri_buf;
-            ctx->req.query = query + 1;
-            ctx->req.query_len = ctx->req.uri_len - ctx->req.path_len - 1;
+            // Split path and query
+            char* query = strchr(ctx->uri_buf, '?');
+            if (query) {
+                *query = '\0';
+                ctx->req.path = ctx->uri_buf;
+                ctx->req.path_len = query - ctx->uri_buf;
+                ctx->req.query = query + 1;
+                ctx->req.query_len = ctx->req.uri_len - ctx->req.path_len - 1;
+            } else {
+                ctx->req.path = ctx->uri_buf;
+                ctx->req.path_len = ctx->req.uri_len;
+            }
         } else {
-            ctx->req.path = ctx->uri_buf;
-            ctx->req.path_len = ctx->req.uri_len;
+            ESP_LOGE(TAG, "Failed to allocate URI buffer");
+            httpd_resp_send_error(&ctx->req, 500, "Internal Server Error");
+            return;
         }
     }
 
@@ -2232,13 +2339,18 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
     // conn->header_bytes contains the number of header bytes (including final CRLF)
     if (conn->content_length > 0 && len > conn->header_bytes) {
         size_t body_in_buffer = len - conn->header_bytes;
-        size_t to_copy = body_in_buffer;
-        if (to_copy > sizeof(ctx->body_buf)) {
-            to_copy = sizeof(ctx->body_buf);
+        // Dynamically allocate body buffer for pre-received data
+        ctx->body_buf = (uint8_t*)malloc(body_in_buffer);
+        if (ctx->body_buf) {
+            memcpy(ctx->body_buf, buffer + conn->header_bytes, body_in_buffer);
+            ctx->body_buf_len = body_in_buffer;
+            ctx->body_buf_pos = 0;
+        } else {
+            // Allocation failed - body data will be lost but request can continue
+            ESP_LOGW(TAG, "Failed to allocate body buffer (%zu bytes)", body_in_buffer);
+            ctx->body_buf_len = 0;
+            ctx->body_buf_pos = 0;
         }
-        memcpy(ctx->body_buf, buffer + conn->header_bytes, to_copy);
-        ctx->body_buf_len = to_copy;
-        ctx->body_buf_pos = 0;
     }
 
     // Save original URL
@@ -2579,6 +2691,39 @@ static void on_ws_frame(connection_t* conn, uint8_t* buffer, size_t len) {
     }
 }
 
+// Called when a new connection is accepted - allocate per-connection contexts
+static void on_connect(connection_t* conn) {
+    int idx = conn->pool_index;
+
+    // Allocate request context
+    if (!request_contexts[idx]) {
+        request_contexts[idx] = (request_context_t*)calloc(1, sizeof(request_context_t));
+        if (!request_contexts[idx]) {
+            ESP_LOGE(TAG, "Failed to allocate request context for connection %d", idx);
+            return;
+        }
+    }
+
+    // Allocate WebSocket context
+    if (!ws_contexts[idx]) {
+        ws_contexts[idx] = (ws_context_t*)calloc(1, sizeof(ws_context_t));
+        if (!ws_contexts[idx]) {
+            ESP_LOGE(TAG, "Failed to allocate ws context for connection %d", idx);
+            return;
+        }
+    }
+
+    // Allocate send buffer
+    if (!connection_send_buffers[idx]) {
+        connection_send_buffers[idx] = (send_buffer_t*)calloc(1, sizeof(send_buffer_t));
+        if (!connection_send_buffers[idx]) {
+            ESP_LOGE(TAG, "Failed to allocate send buffer for connection %d", idx);
+            return;
+        }
+        send_buffer_init(connection_send_buffers[idx]);
+    }
+}
+
 static void on_ws_connect(connection_t* conn) {
     // Handled in on_http_request when upgrade detected
     (void)conn;
@@ -2605,6 +2750,7 @@ static void on_ws_disconnect(connection_t* conn) {
 }
 
 static void on_disconnect(connection_t* conn) {
+    int idx = conn->pool_index;
     request_context_t* ctx = get_request_context(conn);
 
     // Handle disconnect for deferred requests
@@ -2642,10 +2788,35 @@ static void on_disconnect(connection_t* conn) {
         }
     }
 
-    // Clean up send buffer
-    send_buffer_t* sb = get_send_buffer(conn);
-    if (sb->allocated) {
-        send_buffer_free(sb, &g_server->send_buffer_pool);
+    // Free per-connection contexts (dynamic allocation)
+    // Free request context and its internal buffers
+    if (request_contexts[idx]) {
+        if (request_contexts[idx]->uri_buf) {
+            free(request_contexts[idx]->uri_buf);
+        }
+        if (request_contexts[idx]->header_buf) {
+            free(request_contexts[idx]->header_buf);
+        }
+        if (request_contexts[idx]->body_buf) {
+            free(request_contexts[idx]->body_buf);
+        }
+        free(request_contexts[idx]);
+        request_contexts[idx] = NULL;
+    }
+
+    // Free WebSocket context
+    if (ws_contexts[idx]) {
+        free(ws_contexts[idx]);
+        ws_contexts[idx] = NULL;
+    }
+
+    // Free send buffer
+    if (connection_send_buffers[idx]) {
+        if (connection_send_buffers[idx]->allocated) {
+            send_buffer_free(connection_send_buffers[idx]);
+        }
+        free(connection_send_buffers[idx]);
+        connection_send_buffers[idx] = NULL;
     }
 }
 
@@ -2653,6 +2824,9 @@ static void on_disconnect(connection_t* conn) {
 static void on_write_ready(connection_t* conn) {
     send_buffer_t* sb = get_send_buffer(conn);
     request_context_t* ctx = get_request_context(conn);
+
+    // Safety check for dynamic allocation
+    if (!sb || !ctx) return;
 
     // Main send loop - keep filling and sending until EAGAIN or complete
     for (;;) {
@@ -2795,7 +2969,7 @@ static void on_write_ready(connection_t* conn) {
 
         // If buffer was allocated but now empty, we can free it
         if (sb->allocated) {
-            send_buffer_free(sb, &g_server->send_buffer_pool);
+            send_buffer_free(sb);
         }
 
         // Check for async send completion

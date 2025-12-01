@@ -31,6 +31,9 @@ typedef struct {
     struct timeval select_timeout;  // Precomputed select timeout struct
     bool running;                   // Event loop is running
 
+    // I/O buffer (heap allocated to save stack space)
+    uint8_t* io_buffer;             // Receive buffer (allocated on start)
+
     // Statistics
     uint32_t total_connections;     // Total connections accepted
     uint32_t total_requests;        // Total HTTP requests

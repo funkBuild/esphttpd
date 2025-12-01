@@ -70,10 +70,11 @@ menu "ESPHTTPD Configuration"
         config HTTPD_MAX_CONNECTIONS
             int "Maximum concurrent connections"
             default 16
-            range 1 64
+            range 1 32
             help
                 Maximum number of simultaneous HTTP connections.
-                Each connection uses approximately 2KB of memory.
+                Per-connection contexts are allocated dynamically.
+                This only affects the connection pool size (~40 bytes each).
 
         config HTTPD_DEFAULT_PORT
             int "Default server port"
@@ -96,16 +97,49 @@ menu "ESPHTTPD Configuration"
             help
                 Size of send buffer for outgoing data.
 
+        config HTTPD_MAX_REQ_HEADERS
+            int "Maximum request headers"
+            default 16
+            range 8 32
+            help
+                Maximum number of HTTP headers to index per request.
+                Each header entry uses 6 bytes.
+
+        config HTTPD_MAX_QUERY_PARAMS
+            int "Maximum query parameters"
+            default 8
+            range 4 16
+            help
+                Maximum number of query string parameters to cache.
+                Each parameter entry uses ~12 bytes.
+
+        config HTTPD_MAX_SERVER_MIDDLEWARES
+            int "Maximum server-level middlewares"
+            default 4
+            range 1 16
+            help
+                Maximum middleware functions at server level.
+                Each middleware is a function pointer (4 bytes).
+
     endmenu
 
     menu "WebSocket Configuration"
 
-        config HTTPD_MAX_WS_CONNECTIONS
-            int "Maximum WebSocket connections"
-            default 16
+        config HTTPD_MAX_WS_ROUTES
+            int "Maximum WebSocket routes"
+            default 8
             range 1 32
             help
-                Maximum number of simultaneous WebSocket connections.
+                Maximum number of WebSocket route patterns.
+                Each route uses ~80 bytes (64-byte pattern + handlers).
+
+        config HTTPD_MAX_WS_CHANNELS
+            int "Maximum WebSocket pub/sub channels"
+            default 16
+            range 8 32
+            help
+                Maximum number of pub/sub channels.
+                Channel hash table is lazy-allocated on first use.
 
         config HTTPD_WS_SEND_QUEUE_SIZE
             int "WebSocket send queue size"

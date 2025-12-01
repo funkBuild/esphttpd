@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdlib.h>
 #include <errno.h>
 #include "esp_log.h"
 
@@ -331,8 +332,14 @@ int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, u
 }
 
 void event_loop_run(event_loop_t* loop, const event_handlers_t* handlers) {
-    // Allocate I/O buffer on stack
-    uint8_t io_buffer[1024]; // Using fixed size for embedded environment
+    // Allocate I/O buffer on heap (saves 1KB stack space for 4KB task compatibility)
+    if (!loop->io_buffer) {
+        loop->io_buffer = (uint8_t*)malloc(loop->config.io_buffer_size);
+        if (!loop->io_buffer) {
+            ESP_LOGE(TAG, "Failed to allocate I/O buffer");
+            return;
+        }
+    }
 
     if (loop->listen_fd < 0) {
         if (event_loop_create_listener(loop) < 0) {
@@ -345,7 +352,13 @@ void event_loop_run(event_loop_t* loop, const event_handlers_t* handlers) {
     ESP_LOGI(TAG, "Event loop started");
 
     while (loop->running) {
-        event_loop_iteration(loop, handlers, io_buffer);
+        event_loop_iteration(loop, handlers, loop->io_buffer);
+    }
+
+    // Free I/O buffer when loop stops
+    if (loop->io_buffer) {
+        free(loop->io_buffer);
+        loop->io_buffer = NULL;
     }
 
     ESP_LOGI(TAG, "Event loop stopped");

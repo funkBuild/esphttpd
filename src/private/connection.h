@@ -9,8 +9,11 @@
 extern "C" {
 #endif
 
-// Maximum number of concurrent connections
-#define MAX_CONNECTIONS 32
+// Maximum number of concurrent connections (configurable via Kconfig)
+#ifndef CONFIG_HTTPD_MAX_CONNECTIONS
+#define CONFIG_HTTPD_MAX_CONNECTIONS 16
+#endif
+#define MAX_CONNECTIONS CONFIG_HTTPD_MAX_CONNECTIONS
 
 // Connection states
 typedef enum {
