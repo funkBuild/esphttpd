@@ -14,12 +14,40 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup ESP-IDF
+      - name: Build Unit Tests
         uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: v5.5.1
           target: esp32s3
-          command: idf.py --version
+          path: test_app
+          command: idf.py build
+
+      - name: Build E2E Tests
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.1
+          target: esp32s3
+          path: test_e2e
+          command: idf.py build
+
+      - name: Create QEMU Images
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.1
+          target: esp32s3
+          command: |
+            cd test_app/build && \
+            esptool.py --chip=esp32s3 merge_bin --output=qemu_flash.bin \
+              --fill-flash-size=2MB --flash_mode dio --flash_freq 80m --flash_size 2MB \
+              0x0 bootloader/bootloader.bin \
+              0x10000 esphttpd_test_app.bin \
+              0x8000 partition_table/partition-table.bin && \
+            cd ../../test_e2e/build && \
+            esptool.py --chip=esp32s3 merge_bin --output=qemu_flash.bin \
+              --fill-flash-size=2MB --flash_mode dio --flash_freq 80m --flash_size 2MB \
+              0x0 bootloader/bootloader.bin \
+              0x10000 esphttpd_e2e_test.bin \
+              0x8000 partition_table/partition-table.bin
 
       - name: Install QEMU for ESP32
         run: |
@@ -44,34 +72,6 @@ jobs:
         run: |
           cd test_e2e/jest-tests
           npm ci
-
-      - name: Build Unit Tests
-        run: |
-          cd test_app
-          idf.py build
-
-      - name: Build E2E Tests
-        run: |
-          cd test_e2e
-          idf.py build
-
-      - name: Create QEMU Images
-        run: |
-          # Unit test image
-          cd test_app/build
-          esptool.py --chip=esp32s3 merge_bin --output=qemu_flash.bin \
-            --fill-flash-size=2MB --flash_mode dio --flash_freq 80m --flash_size 2MB \
-            0x0 bootloader/bootloader.bin \
-            0x10000 esphttpd_test_app.bin \
-            0x8000 partition_table/partition-table.bin
-
-          # E2E test image
-          cd ../../test_e2e/build
-          esptool.py --chip=esp32s3 merge_bin --output=qemu_flash.bin \
-            --fill-flash-size=2MB --flash_mode dio --flash_freq 80m --flash_size 2MB \
-            0x0 bootloader/bootloader.bin \
-            0x10000 esphttpd_e2e_test.bin \
-            0x8000 partition_table/partition-table.bin
 
       - name: Run Unit Tests
         id: unit_tests
