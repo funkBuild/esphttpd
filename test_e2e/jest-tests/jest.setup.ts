@@ -10,6 +10,29 @@ export const BASE_URL = process.env.SERVER_URL || 'http://127.0.0.1:9000';
 axios.defaults.baseURL = BASE_URL;
 axios.defaults.timeout = 15000; // Increased for QEMU emulation
 
+// Sanitize axios errors to remove circular references (socket objects)
+// This prevents "Converting circular structure to JSON" errors in Jest
+axios.interceptors.response.use(
+  response => response,
+  error => {
+    if (error.isAxiosError) {
+      // Create a clean error without circular references
+      const cleanError = new Error(error.message);
+      cleanError.name = 'AxiosError';
+      (cleanError as any).code = error.code;
+      (cleanError as any).status = error.response?.status;
+      (cleanError as any).response = error.response ? {
+        status: error.response.status,
+        statusText: error.response.statusText,
+        headers: error.response.headers,
+        data: error.response.data
+      } : undefined;
+      return Promise.reject(cleanError);
+    }
+    return Promise.reject(error);
+  }
+);
+
 // Helper to check if server is running
 export async function waitForServer(maxRetries = 10, delay = 1000): Promise<void> {
   for (let i = 0; i < maxRetries; i++) {
