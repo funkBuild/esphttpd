@@ -19,6 +19,7 @@ jobs:
         with:
           esp_idf_version: v5.5.1
           target: esp32s3
+          command: idf.py --version
 
       - name: Install QEMU for ESP32
         run: |
