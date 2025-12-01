@@ -64,6 +64,14 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
                                    size_t buffer_len,
                                    ws_frame_context_t* ctx,
                                    size_t* bytes_consumed) {
+    // Guard against NULL parameters
+    if (!conn || !ctx || !bytes_consumed) {
+        return WS_FRAME_ERROR;
+    }
+    if (!buffer && buffer_len > 0) {
+        return WS_FRAME_ERROR;
+    }
+
     size_t i = 0;
     *bytes_consumed = 0;
 
@@ -100,6 +108,22 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
                 // Most common case: payload_len < 126 (~95% of messages)
                 if (__builtin_expect(payload_len < 126, 1)) {
                     conn->ws_payload_len = payload_len;
+                    // Handle zero-length unmasked payload immediately (common for close/ping/pong)
+                    if (payload_len == 0 && !conn->ws_masked) {
+                        // For control frames with no payload, handle them now
+                        if (ws_is_control_frame(conn->ws_opcode)) {
+                            ws_frame_result_t result = ws_handle_control_frame(conn,
+                                conn->ws_opcode, NULL, 0);
+                            if (result == WS_FRAME_CLOSE) {
+                                *bytes_consumed = i + 1;
+                                return WS_FRAME_CLOSE;
+                            }
+                        }
+                        conn->ws_payload_read = 0;
+                        ctx->state = WS_STATE_COMPLETE;
+                        *bytes_consumed = i + 1;
+                        return WS_FRAME_COMPLETE;
+                    }
                     ctx->state = conn->ws_masked ? WS_STATE_MASK : WS_STATE_PAYLOAD;
                 } else if (payload_len == 126) {
                     ctx->state = WS_STATE_LENGTH_EXT_16;
@@ -226,7 +250,8 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
 }
 
 void ws_mask_payload(uint8_t* __restrict payload, size_t len, uint32_t mask_key, size_t offset) {
-    if (len == 0) return;
+    // Guard against NULL or zero length
+    if (!payload || len == 0) return;
 
     const uint8_t* mask_bytes = (const uint8_t*)&mask_key;
     size_t i = 0;
@@ -260,6 +285,9 @@ void ws_mask_payload(uint8_t* __restrict payload, size_t len, uint32_t mask_key,
 
 size_t ws_build_frame_header(uint8_t* buffer, ws_opcode_internal_t opcode,
                             size_t payload_len, bool mask) {
+    // Guard against NULL buffer
+    if (!buffer) return 0;
+
     size_t header_len = 2;
 
     // First byte: FIN=1, RSV=0, Opcode
@@ -350,6 +378,9 @@ ws_frame_result_t ws_handle_control_frame(connection_t* conn,
                                          ws_opcode_internal_t opcode,
                                          uint8_t* payload,
                                          size_t payload_len) {
+    // Guard against NULL connection
+    if (!conn) return WS_FRAME_ERROR;
+
     switch (opcode) {
         case WS_OPCODE_CLOSE:
             // Echo close frame back

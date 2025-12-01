@@ -105,6 +105,10 @@ bool filesystem_check_etag(connection_t* conn,
 void filesystem_set_etag(connection_t* conn,
                         file_metadata_t* metadata);
 
+// Path security validation
+// Returns true if path is safe to use, false if it contains traversal attempts
+bool filesystem_validate_path(const char* path);
+
 #ifdef __cplusplus
 }
 #endif

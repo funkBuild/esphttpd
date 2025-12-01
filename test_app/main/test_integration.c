@@ -368,6 +368,315 @@ static void test_concurrent_connections(void) {
     stop_test_server();
 }
 
+// ==================== ROUTER ON_ERROR TESTS ====================
+
+// Mock error handler for testing (signature: httpd_err_t handler(httpd_err_t error, httpd_req_t* req))
+static httpd_err_t mock_error_handler(httpd_err_t error, httpd_req_t* req) {
+    (void)error;
+    (void)req;
+    return HTTPD_OK;
+}
+
+// Test setting error handler on valid router
+static void test_router_on_error_valid(void) {
+    httpd_router_t router = httpd_router_create();
+    TEST_ASSERT_NOT_NULL(router);
+
+    // Initially error_handler should be NULL
+    TEST_ASSERT_NULL(router->error_handler);
+
+    // Set error handler
+    httpd_err_t result = httpd_router_on_error(router, mock_error_handler);
+    TEST_ASSERT_EQUAL(HTTPD_OK, result);
+
+    // Verify error_handler was set
+    TEST_ASSERT_EQUAL(mock_error_handler, router->error_handler);
+
+    httpd_router_destroy(router);
+}
+
+// Test with NULL router
+static void test_router_on_error_null_router(void) {
+    httpd_err_t result = httpd_router_on_error(NULL, mock_error_handler);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, result);
+}
+
+// Test with NULL handler
+static void test_router_on_error_null_handler(void) {
+    httpd_router_t router = httpd_router_create();
+    TEST_ASSERT_NOT_NULL(router);
+
+    httpd_err_t result = httpd_router_on_error(router, NULL);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, result);
+
+    // Verify error_handler is still NULL
+    TEST_ASSERT_NULL(router->error_handler);
+
+    httpd_router_destroy(router);
+}
+
+// Test replacing existing error handler
+static void test_router_on_error_replace(void) {
+    httpd_router_t router = httpd_router_create();
+    TEST_ASSERT_NOT_NULL(router);
+
+    // Set first handler
+    httpd_err_t result = httpd_router_on_error(router, mock_error_handler);
+    TEST_ASSERT_EQUAL(HTTPD_OK, result);
+    TEST_ASSERT_EQUAL(mock_error_handler, router->error_handler);
+
+    // Replace with same handler (should work)
+    result = httpd_router_on_error(router, mock_error_handler);
+    TEST_ASSERT_EQUAL(HTTPD_OK, result);
+    TEST_ASSERT_EQUAL(mock_error_handler, router->error_handler);
+
+    httpd_router_destroy(router);
+}
+
+// ==================== ROUTE PARAM TESTS ====================
+
+// Test httpd_req_get_param with valid params
+static void test_req_get_param_valid(void)
+{
+    httpd_req_t req = {0};
+
+    // Manually populate params (normally done by radix tree matcher)
+    req.param_count = 2;
+    req.params[0].key = "id";
+    req.params[0].key_len = 2;
+    req.params[0].value = "123";
+    req.params[0].value_len = 3;
+    req.params[1].key = "name";
+    req.params[1].key_len = 4;
+    req.params[1].value = "test";
+    req.params[1].value_len = 4;
+
+    // Test getting valid params
+    const char* id = httpd_req_get_param(&req, "id");
+    TEST_ASSERT_NOT_NULL(id);
+    TEST_ASSERT_EQUAL_STRING("123", id);
+
+    const char* name = httpd_req_get_param(&req, "name");
+    TEST_ASSERT_NOT_NULL(name);
+    TEST_ASSERT_EQUAL_STRING("test", name);
+}
+
+// Test httpd_req_get_param with nonexistent key
+static void test_req_get_param_not_found(void)
+{
+    httpd_req_t req = {0};
+
+    req.param_count = 1;
+    req.params[0].key = "id";
+    req.params[0].key_len = 2;
+    req.params[0].value = "123";
+    req.params[0].value_len = 3;
+
+    const char* result = httpd_req_get_param(&req, "nonexistent");
+    TEST_ASSERT_NULL(result);
+}
+
+// Test httpd_req_get_param with NULL request
+static void test_req_get_param_null_req(void)
+{
+    const char* result = httpd_req_get_param(NULL, "id");
+    TEST_ASSERT_NULL(result);
+}
+
+// Test httpd_req_get_param with NULL key
+static void test_req_get_param_null_key(void)
+{
+    httpd_req_t req = {0};
+    req.param_count = 1;
+    req.params[0].key = "id";
+    req.params[0].key_len = 2;
+    req.params[0].value = "123";
+    req.params[0].value_len = 3;
+
+    const char* result = httpd_req_get_param(&req, NULL);
+    TEST_ASSERT_NULL(result);
+}
+
+// Test httpd_req_get_param with empty params
+static void test_req_get_param_no_params(void)
+{
+    httpd_req_t req = {0};
+    req.param_count = 0;
+
+    const char* result = httpd_req_get_param(&req, "id");
+    TEST_ASSERT_NULL(result);
+}
+
+// Test httpd_req_get_param partial key match (shouldn't match)
+static void test_req_get_param_partial_match(void)
+{
+    httpd_req_t req = {0};
+
+    req.param_count = 1;
+    req.params[0].key = "userId";
+    req.params[0].key_len = 6;
+    req.params[0].value = "123";
+    req.params[0].value_len = 3;
+
+    // "user" should not match "userId"
+    const char* result = httpd_req_get_param(&req, "user");
+    TEST_ASSERT_NULL(result);
+
+    // "userIdX" should not match "userId"
+    result = httpd_req_get_param(&req, "userIdX");
+    TEST_ASSERT_NULL(result);
+}
+
+// ==================== BASIC AUTH TESTS ====================
+
+// Test httpd_check_basic_auth with NULL request
+static void test_basic_auth_null_req(void)
+{
+    bool result = httpd_check_basic_auth(NULL, "user", "pass");
+    TEST_ASSERT_FALSE(result);
+}
+
+// Test httpd_check_basic_auth with NULL username
+static void test_basic_auth_null_username(void)
+{
+    httpd_req_t req = {0};
+    bool result = httpd_check_basic_auth(&req, NULL, "pass");
+    TEST_ASSERT_FALSE(result);
+}
+
+// Test httpd_check_basic_auth with NULL password
+static void test_basic_auth_null_password(void)
+{
+    httpd_req_t req = {0};
+    bool result = httpd_check_basic_auth(&req, "user", NULL);
+    TEST_ASSERT_FALSE(result);
+}
+
+// Test httpd_check_basic_auth with empty request (no headers)
+static void test_basic_auth_no_header(void)
+{
+    httpd_req_t req = {0};
+    req.header_count = 0;
+    bool result = httpd_check_basic_auth(&req, "user", "pass");
+    TEST_ASSERT_FALSE(result);
+}
+
+// ==================== MEMORY ALLOCATION FAILURE TESTS ====================
+
+// Test radix tree operations with NULL tree
+static void test_radix_tree_null_operations(void)
+{
+    // Insert on NULL tree should fail
+    httpd_err_t result = radix_insert(NULL, "/test", HTTP_GET, test_handler, NULL, NULL, 0);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, result);
+
+    // Lookup on NULL tree should not match
+    radix_match_t lookup = radix_lookup(NULL, "/test", HTTP_GET, false);
+    TEST_ASSERT_FALSE(lookup.matched);
+    TEST_ASSERT_NULL(lookup.handler);
+}
+
+// Test router operations with NULL router
+static void test_router_null_operations(void)
+{
+    // NULL router operations should fail gracefully
+    httpd_err_t result = httpd_router_get(NULL, "/test", test_handler);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, result);
+
+    result = httpd_router_post(NULL, "/test", test_handler);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, result);
+
+    result = httpd_router_put(NULL, "/test", test_handler);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, result);
+
+    result = httpd_router_delete(NULL, "/test", test_handler);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, result);
+}
+
+// Test router destroy on NULL
+static void test_router_destroy_null(void)
+{
+    // Destroy NULL router should be safe (no crash)
+    httpd_router_destroy(NULL);
+    TEST_PASS();
+}
+
+// Test radix tree destroy on NULL
+static void test_radix_tree_destroy_null(void)
+{
+    // Destroy NULL tree should be safe (no crash)
+    radix_tree_destroy(NULL);
+    TEST_PASS();
+}
+
+// Test router creation and destruction lifecycle
+static void test_router_lifecycle(void)
+{
+    httpd_router_t router = httpd_router_create();
+    TEST_ASSERT_NOT_NULL(router);
+
+    // Add some routes
+    httpd_err_t result = httpd_router_get(router, "/api/users", test_handler);
+    TEST_ASSERT_EQUAL(HTTPD_OK, result);
+
+    result = httpd_router_post(router, "/api/users", test_handler);
+    TEST_ASSERT_EQUAL(HTTPD_OK, result);
+
+    // Clean destruction
+    httpd_router_destroy(router);
+    // If we get here without crashing, test passes
+    TEST_PASS();
+}
+
+// Test radix tree with many routes (stress test allocation)
+static void test_radix_tree_many_routes(void)
+{
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    // Add many routes
+    char path[64];
+    for (int i = 0; i < 50; i++) {
+        snprintf(path, sizeof(path), "/api/route/%d", i);
+        httpd_err_t result = radix_insert(tree, path, HTTP_GET, test_handler, NULL, NULL, 0);
+        TEST_ASSERT_EQUAL(HTTPD_OK, result);
+    }
+
+    // Verify some routes
+    radix_match_t lookup = radix_lookup(tree, "/api/route/25", HTTP_GET, false);
+    TEST_ASSERT_TRUE(lookup.matched);
+    TEST_ASSERT_NOT_NULL(lookup.handler);
+
+    lookup = radix_lookup(tree, "/api/route/49", HTTP_GET, false);
+    TEST_ASSERT_TRUE(lookup.matched);
+    TEST_ASSERT_NOT_NULL(lookup.handler);
+
+    radix_tree_destroy(tree);
+    TEST_PASS();
+}
+
+// Test WebSocket frame context init with NULL
+static void test_ws_context_null(void)
+{
+    // NULL context init - function returns 0 (no-op for NULL)
+    int result = ws_frame_ctx_init(NULL);
+    TEST_ASSERT_EQUAL(0, result);
+}
+
+// Mock middleware for testing
+static httpd_err_t mock_middleware(httpd_req_t* req, httpd_handler_t next) {
+    (void)req;
+    (void)next;
+    return HTTPD_OK;
+}
+
+// Test router use middleware on NULL router
+static void test_router_use_null(void)
+{
+    httpd_err_t result = httpd_router_use(NULL, mock_middleware);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, result);
+}
+
 // ==================== TEST RUNNER ====================
 
 void test_integration_run(void) {
@@ -382,5 +691,35 @@ void test_integration_run(void) {
     RUN_TEST(test_error_handling);
     RUN_TEST(test_concurrent_connections);
 
-    ESP_LOGI(TAG, "Integration tests completed");
+    // Router on_error tests
+    RUN_TEST(test_router_on_error_valid);
+    RUN_TEST(test_router_on_error_null_router);
+    RUN_TEST(test_router_on_error_null_handler);
+    RUN_TEST(test_router_on_error_replace);
+
+    // Route parameter extraction tests
+    RUN_TEST(test_req_get_param_valid);
+    RUN_TEST(test_req_get_param_not_found);
+    RUN_TEST(test_req_get_param_null_req);
+    RUN_TEST(test_req_get_param_null_key);
+    RUN_TEST(test_req_get_param_no_params);
+    RUN_TEST(test_req_get_param_partial_match);
+
+    // Basic auth tests
+    RUN_TEST(test_basic_auth_null_req);
+    RUN_TEST(test_basic_auth_null_username);
+    RUN_TEST(test_basic_auth_null_password);
+    RUN_TEST(test_basic_auth_no_header);
+
+    // Memory allocation failure tests
+    RUN_TEST(test_radix_tree_null_operations);
+    RUN_TEST(test_router_null_operations);
+    RUN_TEST(test_router_destroy_null);
+    RUN_TEST(test_radix_tree_destroy_null);
+    RUN_TEST(test_router_lifecycle);
+    RUN_TEST(test_radix_tree_many_routes);
+    RUN_TEST(test_ws_context_null);
+    RUN_TEST(test_router_use_null);
+
+    ESP_LOGI(TAG, "Integration tests completed (30 tests)");
 }

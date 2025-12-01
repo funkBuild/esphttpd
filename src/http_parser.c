@@ -12,6 +12,10 @@ extern void esphttpd_store_header(const uint8_t* key, uint8_t key_len,
                                   const uint8_t* value, uint8_t value_len);
 
 http_method_t http_parse_method(const uint8_t* method, uint8_t len) {
+    // Guard against NULL or zero length
+    if (method == NULL || len == 0) {
+        return HTTP_ANY;
+    }
     // Fast path using first character + length to minimize comparisons
     // Most common method (GET) is checked first with inline char comparison
     if (len == 3 && method[0] == 'G' && method[1] == 'E' && method[2] == 'T') {
@@ -40,6 +44,10 @@ http_method_t http_parse_method(const uint8_t* method, uint8_t len) {
 }
 
 header_type_t http_identify_header(const uint8_t* key, uint8_t len) {
+    // Guard against NULL or zero length
+    if (key == NULL || len == 0) {
+        return HEADER_UNKNOWN;
+    }
     // Normalize first char to lowercase once (eliminates duplicate case labels)
     uint8_t first = key[0] | 0x20;
 
@@ -117,6 +125,10 @@ header_type_t http_identify_header(const uint8_t* key, uint8_t len) {
 }
 
 uint32_t http_parse_content_length(const uint8_t* value, uint8_t len) {
+    // Guard against NULL or zero length
+    if (value == NULL || len == 0) {
+        return 0;
+    }
     // Fast path: if length > 10 digits, definitely overflows uint32_t (max 4294967295)
     if (len > 10) {
         return UINT32_MAX;
@@ -141,6 +153,10 @@ uint32_t http_parse_content_length(const uint8_t* value, uint8_t len) {
 }
 
 bool http_parse_keep_alive(const uint8_t* value, uint8_t len) {
+    // Guard against NULL or zero length - default to keep-alive
+    if (value == NULL || len == 0) {
+        return true;
+    }
     // Fast path: check for exact common values first (most HTTP clients send these)
     if (len == 10 && header_equals(value, 10, "keep-alive")) {
         return true;

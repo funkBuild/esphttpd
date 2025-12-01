@@ -811,6 +811,389 @@ static httpd_err_t handle_perf(httpd_req_t* req) {
     return HTTPD_OK;
 }
 
+// GET /large-body/:size - generates a large response via httpd_resp_send (non-chunked)
+// This tests that httpd_resp_send correctly sends responses larger than socket buffer
+// Pattern: /large-body/* where * is the size in bytes (e.g., /large-body/4096 for 4KB)
+static httpd_err_t handle_large_body(httpd_req_t* req) {
+    request_count++;
+
+    // Extract size from URL (after /large-body/)
+    const char* url = httpd_req_get_uri(req);
+    const char* size_str = url + 12;  // Skip "/large-body/"
+    int size_bytes = atoi(size_str);
+
+    // Sanity check: limit to 16KB max (reasonable for stack-based buffer)
+    if (size_bytes <= 0) size_bytes = 4096;  // Default 4KB
+    if (size_bytes > 16384) size_bytes = 16384;  // Max 16KB
+
+    ESP_LOGI(TAG, "Generating %d byte response via httpd_resp_send", size_bytes);
+
+    // Allocate buffer - this tests httpd_resp_send with data larger than socket buffer
+    char* buffer = malloc(size_bytes);
+    if (!buffer) {
+        ESP_LOGE(TAG, "Failed to allocate %d bytes", size_bytes);
+        return httpd_resp_send_error(req, 500, "Out of memory");
+    }
+
+    // Fill with predictable pattern: repeating "ABCDEFGHIJKLMNOP" (16 bytes)
+    // with position markers every 256 bytes
+    for (int i = 0; i < size_bytes; i++) {
+        buffer[i] = 'A' + (i % 16);
+    }
+
+    // Overwrite position markers every 256 bytes: "@XXX" (4 bytes)
+    // @ followed by 3-digit position (000-063)
+    for (int pos = 0; pos < size_bytes / 256 && pos < 64; pos++) {
+        int offset = pos * 256;
+        buffer[offset] = '@';
+        buffer[offset + 1] = '0' + (pos / 10);
+        buffer[offset + 2] = '0' + (pos % 10);
+        buffer[offset + 3] = ':';
+    }
+
+    httpd_resp_set_status(req, 200);
+    httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_header(req, "X-Expected-Length", size_str);
+
+    httpd_err_t err = httpd_resp_send(req, buffer, size_bytes);
+
+    free(buffer);
+
+    if (err != HTTPD_OK) {
+        ESP_LOGE(TAG, "Failed to send %d byte response: %d", size_bytes, err);
+        return err;
+    }
+
+    ESP_LOGI(TAG, "Sent %d byte response via httpd_resp_send", size_bytes);
+    return HTTPD_OK;
+}
+
+// GET /largefile/:size - generates a large response for testing
+// Pattern: /largefile/* where * is the size in KB (e.g., /largefile/100 for 100KB)
+static httpd_err_t handle_largefile(httpd_req_t* req) {
+    request_count++;
+
+    // Extract size from URL (after /largefile/)
+    const char* url = httpd_req_get_uri(req);
+    const char* size_str = url + 11;  // Skip "/largefile/"
+    int size_kb = atoi(size_str);
+
+    // Sanity check: limit to 1MB max
+    if (size_kb <= 0) size_kb = 100;  // Default 100KB
+    if (size_kb > 1024) size_kb = 1024;  // Max 1MB
+
+    size_t total_size = size_kb * 1024;
+
+    ESP_LOGI(TAG, "Generating %d KB response (%zu bytes)", size_kb, total_size);
+
+    // Generate a predictable pattern that can be verified
+    // Pattern: Each 1KB block contains "BLOCK_XXXX:" followed by repeating 'A'-'Z'
+    // where XXXX is the block number (0-padded)
+
+    // Pre-generate a 1KB block template (faster than generating each byte)
+    static char block_template[1024];
+    static bool template_init = false;
+    if (!template_init) {
+        // Fill with repeating pattern A-Z
+        for (int i = 0; i < 1024; i++) {
+            block_template[i] = 'A' + (i % 26);
+        }
+        template_init = true;
+    }
+
+    // Use chunked transfer encoding for streaming
+    // Note: Don't call httpd_resp_set_type() before httpd_resp_send_chunk()
+    // as it would send headers and break chunked encoding
+    httpd_resp_set_status(req, 200);
+
+    // Send in 1KB chunks
+    char chunk[1024];
+    size_t sent = 0;
+    int block_num = 0;
+
+    while (sent < total_size) {
+        // Create block with header "BLOCK_XXXX:" (11 bytes) + pattern (1013 bytes)
+        int header_len = snprintf(chunk, sizeof(chunk), "BLOCK_%04d:", block_num);
+
+        // Fill rest with pattern
+        size_t remaining = sizeof(chunk) - header_len;
+        memcpy(chunk + header_len, block_template, remaining);
+
+        // Send chunk
+        httpd_err_t err = httpd_resp_send_chunk(req, chunk, sizeof(chunk));
+        if (err != HTTPD_OK) {
+            ESP_LOGE(TAG, "Failed to send chunk at offset %zu", sent);
+            return err;
+        }
+
+        sent += sizeof(chunk);
+        block_num++;
+    }
+
+    // End chunked response
+    httpd_resp_send_chunk(req, NULL, 0);
+
+    ESP_LOGI(TAG, "Sent %zu bytes in %d blocks", sent, block_num);
+    return HTTPD_OK;
+}
+
+// GET /largefile-single/:size - generates a large response in a SINGLE send
+// This tests the httpd_resp_send() function with large bodies
+static httpd_err_t handle_largefile_single(httpd_req_t* req) {
+    request_count++;
+
+    // Extract size from URL (after /largefile-single/)
+    const char* url = httpd_req_get_uri(req);
+    const char* size_str = url + 18;  // Skip "/largefile-single/"
+    int size_kb = atoi(size_str);
+
+    // Sanity check: limit to 256KB for single send (memory constraints)
+    if (size_kb <= 0) size_kb = 100;  // Default 100KB
+    if (size_kb > 256) size_kb = 256;  // Max 256KB for single allocation
+
+    size_t total_size = size_kb * 1024;
+
+    ESP_LOGI(TAG, "Generating %d KB single-send response (%zu bytes)", size_kb, total_size);
+
+    // Allocate buffer for entire response
+    char* buffer = malloc(total_size);
+    if (!buffer) {
+        ESP_LOGE(TAG, "Failed to allocate %zu bytes", total_size);
+        httpd_resp_send_error(req, 500, "Out of memory");
+        return HTTPD_OK;
+    }
+
+    // Fill with predictable pattern
+    // Pattern: Each 1KB block contains "BLOCK_XXXX:" followed by repeating 'A'-'Z'
+    for (size_t offset = 0; offset < total_size; offset += 1024) {
+        int block_num = offset / 1024;
+        int header_len = snprintf(buffer + offset, 12, "BLOCK_%04d:", block_num);
+
+        // Fill rest of block with pattern
+        for (size_t i = header_len; i < 1024 && (offset + i) < total_size; i++) {
+            buffer[offset + i] = 'A' + ((offset + i) % 26);
+        }
+    }
+
+    // Send entire buffer at once
+    httpd_resp_set_status(req, 200);
+    httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_header(req, "Connection", "close");
+
+    httpd_err_t err = httpd_resp_send(req, buffer, total_size);
+
+    free(buffer);
+
+    if (err != HTTPD_OK) {
+        ESP_LOGE(TAG, "Failed to send %zu bytes", total_size);
+    } else {
+        ESP_LOGI(TAG, "Sent %zu bytes in single send", total_size);
+    }
+
+    return HTTPD_OK;
+}
+
+// ============================================================================
+// Data Provider API Test - /largefile-provider/:size
+// Tests the new httpd_resp_send_provider() API for streaming responses
+// ============================================================================
+
+// State for the data provider (stored in request's user_data)
+typedef struct {
+    size_t total_size;      // Total bytes to send
+    size_t bytes_sent;      // Bytes sent so far
+    int block_num;          // Current block number
+    int64_t start_time;     // Start time for perf measurement
+} largefile_provider_state_t;
+
+// Pre-generated block template (shared with handle_largefile)
+static char provider_block_template[1024];
+static bool provider_template_init = false;
+
+// Data provider callback - called by event loop when buffer has space
+static ssize_t largefile_data_provider(httpd_req_t* req, uint8_t* buf, size_t max_len) {
+    largefile_provider_state_t* state = (largefile_provider_state_t*)httpd_req_get_user_data(req);
+    if (!state) {
+        ESP_LOGE(TAG, "Provider state is NULL");
+        return -1;
+    }
+
+    size_t remaining = state->total_size - state->bytes_sent;
+    if (remaining == 0) {
+        // EOF - all data sent
+        return 0;
+    }
+
+    // Calculate how much we can write
+    size_t to_write = (remaining < max_len) ? remaining : max_len;
+
+    // Generate data in 1KB blocks with headers
+    size_t written = 0;
+    while (written < to_write) {
+        size_t block_offset = state->bytes_sent % 1024;
+        size_t bytes_in_block = 1024 - block_offset;
+        size_t chunk_size = (to_write - written < bytes_in_block) ?
+                            (to_write - written) : bytes_in_block;
+
+        if (block_offset == 0 && chunk_size >= 11) {
+            // Start of new block - write header "BLOCK_XXXX:"
+            int header_len = snprintf((char*)(buf + written), 12, "BLOCK_%04d:", state->block_num);
+            memcpy(buf + written + header_len, provider_block_template + header_len, chunk_size - header_len);
+        } else if (block_offset < 11) {
+            // Partial header - complex case, just use pattern
+            for (size_t i = 0; i < chunk_size; i++) {
+                buf[written + i] = 'A' + ((state->bytes_sent + i) % 26);
+            }
+        } else {
+            // Mid-block - copy from template
+            memcpy(buf + written, provider_block_template + block_offset, chunk_size);
+        }
+
+        written += chunk_size;
+        state->bytes_sent += chunk_size;
+
+        // Check if we completed a block
+        if (state->bytes_sent % 1024 == 0) {
+            state->block_num++;
+        }
+    }
+
+    return (ssize_t)written;
+}
+
+// Completion callback for data provider
+static void largefile_provider_complete(httpd_req_t* req, httpd_err_t err) {
+    largefile_provider_state_t* state = (largefile_provider_state_t*)httpd_req_get_user_data(req);
+    if (state) {
+        int64_t elapsed = (esp_timer_get_time() - state->start_time) / 1000;
+        if (err == HTTPD_OK) {
+            ESP_LOGI(TAG, "Provider sent %zu bytes in %lldms", state->bytes_sent, (long long)elapsed);
+        } else {
+            ESP_LOGE(TAG, "Provider failed after %zu bytes: %d", state->bytes_sent, err);
+        }
+        free(state);
+        httpd_req_set_user_data(req, NULL);
+    }
+}
+
+// GET /largefile-provider/:size - generates response using data provider API
+static httpd_err_t handle_largefile_provider(httpd_req_t* req) {
+    request_count++;
+
+    // Extract size from URL (after /largefile-provider/)
+    const char* url = httpd_req_get_uri(req);
+    const char* size_str = url + 20;  // Skip "/largefile-provider/"
+    int size_kb = atoi(size_str);
+
+    // Sanity check: limit to 1MB max
+    if (size_kb <= 0) size_kb = 100;  // Default 100KB
+    if (size_kb > 1024) size_kb = 1024;  // Max 1MB
+
+    size_t total_size = size_kb * 1024;
+
+    ESP_LOGI(TAG, "Starting provider for %d KB response (%zu bytes)", size_kb, total_size);
+
+    // Initialize block template if needed
+    if (!provider_template_init) {
+        for (int i = 0; i < 1024; i++) {
+            provider_block_template[i] = 'A' + (i % 26);
+        }
+        provider_template_init = true;
+    }
+
+    // Allocate state (freed in completion callback)
+    largefile_provider_state_t* state = malloc(sizeof(largefile_provider_state_t));
+    if (!state) {
+        ESP_LOGE(TAG, "Failed to allocate provider state");
+        httpd_resp_send_error(req, 500, "Out of memory");
+        return HTTPD_OK;
+    }
+
+    state->total_size = total_size;
+    state->bytes_sent = 0;
+    state->block_num = 0;
+    state->start_time = esp_timer_get_time();
+
+    // Store state in request
+    httpd_req_set_user_data(req, state);
+
+    // Set response headers
+    httpd_resp_set_status(req, 200);
+    httpd_resp_set_type(req, "application/octet-stream");
+
+    // Start streaming with data provider (chunked encoding since size may vary)
+    // Pass total_size for Content-Length, or -1 for chunked
+    httpd_err_t err = httpd_resp_send_provider(req, (ssize_t)total_size,
+                                                largefile_data_provider,
+                                                largefile_provider_complete);
+    if (err != HTTPD_OK) {
+        ESP_LOGE(TAG, "Failed to start provider: %d", err);
+        free(state);
+        httpd_req_set_user_data(req, NULL);
+        httpd_resp_send_error(req, 500, "Failed to start provider");
+    }
+
+    return HTTPD_OK;
+}
+
+// GET /largefile-provider-chunked/:size - same but with chunked encoding
+static httpd_err_t handle_largefile_provider_chunked(httpd_req_t* req) {
+    request_count++;
+
+    // Extract size from URL (after /largefile-provider-chunked/)
+    const char* url = httpd_req_get_uri(req);
+    const char* size_str = url + 28;  // Skip "/largefile-provider-chunked/"
+    int size_kb = atoi(size_str);
+
+    // Sanity check: limit to 1MB max
+    if (size_kb <= 0) size_kb = 100;  // Default 100KB
+    if (size_kb > 1024) size_kb = 1024;  // Max 1MB
+
+    size_t total_size = size_kb * 1024;
+
+    ESP_LOGI(TAG, "Starting chunked provider for %d KB response (%zu bytes)", size_kb, total_size);
+
+    // Initialize block template if needed
+    if (!provider_template_init) {
+        for (int i = 0; i < 1024; i++) {
+            provider_block_template[i] = 'A' + (i % 26);
+        }
+        provider_template_init = true;
+    }
+
+    // Allocate state (freed in completion callback)
+    largefile_provider_state_t* state = malloc(sizeof(largefile_provider_state_t));
+    if (!state) {
+        ESP_LOGE(TAG, "Failed to allocate provider state");
+        httpd_resp_send_error(req, 500, "Out of memory");
+        return HTTPD_OK;
+    }
+
+    state->total_size = total_size;
+    state->bytes_sent = 0;
+    state->block_num = 0;
+    state->start_time = esp_timer_get_time();
+
+    // Store state in request
+    httpd_req_set_user_data(req, state);
+
+    // Set response headers
+    httpd_resp_set_status(req, 200);
+
+    // Start streaming with chunked encoding (-1 for content length)
+    httpd_err_t err = httpd_resp_send_provider(req, -1,
+                                                largefile_data_provider,
+                                                largefile_provider_complete);
+    if (err != HTTPD_OK) {
+        ESP_LOGE(TAG, "Failed to start chunked provider: %d", err);
+        free(state);
+        httpd_req_set_user_data(req, NULL);
+        httpd_resp_send_error(req, 500, "Failed to start provider");
+    }
+
+    return HTTPD_OK;
+}
+
 // 404 handler - custom format matching test expectations
 static httpd_err_t handle_404(httpd_req_t* req) {
     const char* url = httpd_req_get_uri(req);
@@ -1320,6 +1703,39 @@ void app_main(void) {
         .handler = handle_perf
     });
 
+    // Large body test route - tests httpd_resp_send with bodies > socket buffer
+    httpd_register_route(server, &(httpd_route_t){
+        .method = HTTP_GET,
+        .pattern = "/large-body/*",
+        .handler = handle_large_body
+    });
+
+    // Large file download test routes
+    httpd_register_route(server, &(httpd_route_t){
+        .method = HTTP_GET,
+        .pattern = "/largefile/*",
+        .handler = handle_largefile
+    });
+
+    httpd_register_route(server, &(httpd_route_t){
+        .method = HTTP_GET,
+        .pattern = "/largefile-single/*",
+        .handler = handle_largefile_single
+    });
+
+    // Data provider API test routes (new async streaming API)
+    httpd_register_route(server, &(httpd_route_t){
+        .method = HTTP_GET,
+        .pattern = "/largefile-provider/*",
+        .handler = handle_largefile_provider
+    });
+
+    httpd_register_route(server, &(httpd_route_t){
+        .method = HTTP_GET,
+        .pattern = "/largefile-provider-chunked/*",
+        .handler = handle_largefile_provider_chunked
+    });
+
     // WebSocket routes
     httpd_register_ws_route(server, &(httpd_ws_route_t){
         .pattern = "/ws/echo",
@@ -1364,7 +1780,8 @@ void app_main(void) {
     ESP_LOGI(TAG, "E2E Server ready on port 80!");
     ESP_LOGI(TAG, "Endpoints: /, /api/status, /api/data/*, /api/echo, /api/update, /headers, /cors, /template, /static/*");
     ESP_LOGI(TAG, "Upload endpoints: /upload, /upload/defer, /upload/defer/custom, /upload/sink");
-    ESP_LOGI(TAG, "Test endpoints: /hello, /perf");
+    ESP_LOGI(TAG, "Test endpoints: /hello, /perf, /largefile/*, /largefile-single/*");
+    ESP_LOGI(TAG, "Provider endpoints: /largefile-provider/*, /largefile-provider-chunked/*");
     ESP_LOGI(TAG, "WebSocket endpoints: /ws/echo, /ws/broadcast, /ws/channel");
 
     // Keep running

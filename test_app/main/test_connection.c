@@ -352,6 +352,283 @@ static void test_structure_sizes(void)
     TEST_ASSERT_LESS_OR_EQUAL(1536, pool_size); // 32 * ~36 + 8 bytes overhead
 }
 
+// ============================================================================
+// Security/Edge Case Tests
+// ============================================================================
+
+// Test NULL pool handling in pool_init
+static void test_pool_init_null(void)
+{
+    // Should not crash
+    connection_pool_init(NULL);
+    // No assertion needed - just verify no crash
+    TEST_PASS();
+}
+
+// Test NULL pool handling in count_active
+static void test_count_active_null(void)
+{
+    int count = connection_count_active(NULL);
+    TEST_ASSERT_EQUAL(0, count);
+}
+
+// Test NULL pool handling in connection_get
+static void test_connection_get_null_pool(void)
+{
+    connection_t* conn = connection_get(NULL, 0);
+    TEST_ASSERT_NULL(conn);
+}
+
+// Test NULL pool handling in connection_find
+static void test_connection_find_null_pool(void)
+{
+    connection_t* conn = connection_find(NULL, 100);
+    TEST_ASSERT_NULL(conn);
+}
+
+// Test NULL pool handling in connection_get_index
+static void test_connection_get_index_null_pool(void)
+{
+    connection_t dummy = {0};
+    int index = connection_get_index(NULL, &dummy);
+    TEST_ASSERT_EQUAL(-1, index);
+}
+
+// Test NULL conn handling in connection_get_index
+static void test_connection_get_index_null_conn(void)
+{
+    connection_pool_t pool;
+    connection_pool_init(&pool);
+    int index = connection_get_index(&pool, NULL);
+    TEST_ASSERT_EQUAL(-1, index);
+}
+
+// Test connection_close with NULL pool
+static void test_connection_close_null_pool(void)
+{
+    connection_t conn = {0};
+    // Should not crash
+    connection_close(NULL, &conn);
+    TEST_PASS();
+}
+
+// Test connection_close with NULL conn
+static void test_connection_close_null_conn(void)
+{
+    connection_pool_t pool;
+    connection_pool_init(&pool);
+    // Should not crash
+    connection_close(&pool, NULL);
+    TEST_PASS();
+}
+
+// Test connection_cleanup_closed with NULL pool
+static void test_cleanup_closed_null_pool(void)
+{
+    // Should not crash
+    connection_cleanup_closed(NULL);
+    TEST_PASS();
+}
+
+// Test connection_accept with NULL pool
+static void test_connection_accept_null_pool(void)
+{
+    connection_t* conn = connection_accept(NULL, 5);
+    TEST_ASSERT_NULL(conn);
+}
+
+// Test connection_close properly clears masks (except active - cleanup does that)
+static void test_connection_close_clears_masks(void)
+{
+    connection_pool_t pool;
+    connection_pool_init(&pool);
+
+    // Accept a connection at index 0
+    connection_t* conn = connection_accept(&pool, 5);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    int index = conn->pool_index;
+    TEST_ASSERT_TRUE(connection_is_active(&pool, index));
+
+    // Set write pending and ws active
+    connection_mark_write_pending(&pool, index, true);
+    connection_mark_ws_active(&pool, index);
+    TEST_ASSERT_TRUE(connection_has_write_pending(&pool, index));
+    TEST_ASSERT_TRUE(connection_is_ws_active(&pool, index));
+
+    // Close the connection
+    connection_close(&pool, conn);
+
+    // State should be CLOSED, but still active (so cleanup_closed can find it)
+    TEST_ASSERT_EQUAL(CONN_STATE_CLOSED, conn->state);
+    TEST_ASSERT_TRUE(connection_is_active(&pool, index)); // Still active until cleanup
+    // Write pending and WS active should be cleared
+    TEST_ASSERT_FALSE(connection_has_write_pending(&pool, index));
+    TEST_ASSERT_FALSE(connection_is_ws_active(&pool, index));
+
+    // After cleanup, active mask should be cleared
+    connection_cleanup_closed(&pool);
+    TEST_ASSERT_FALSE(connection_is_active(&pool, index));
+}
+
+// Test connection_cleanup_closed resets connections
+static void test_cleanup_closed_resets_connections(void)
+{
+    connection_pool_t pool;
+    connection_pool_init(&pool);
+
+    // Accept a connection
+    connection_t* conn = connection_accept(&pool, 5);
+    TEST_ASSERT_NOT_NULL(conn);
+    conn->fd = 123;
+
+    int index = conn->pool_index;
+    TEST_ASSERT_TRUE(connection_is_active(&pool, index));
+
+    // Close the connection
+    connection_close(&pool, conn);
+    TEST_ASSERT_EQUAL(CONN_STATE_CLOSED, conn->state);
+    TEST_ASSERT_TRUE(connection_is_active(&pool, index)); // Still active until cleanup
+
+    // Cleanup should reset the connection
+    connection_cleanup_closed(&pool);
+    TEST_ASSERT_EQUAL(CONN_STATE_FREE, conn->state);
+    TEST_ASSERT_EQUAL(-1, conn->fd);
+    TEST_ASSERT_FALSE(connection_is_active(&pool, index)); // Now inactive
+}
+
+// Test connection_accept when pool is full
+static void test_connection_accept_full_pool(void)
+{
+    connection_pool_t pool;
+    connection_pool_init(&pool);
+
+    // Fill the pool
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        connection_t* conn = connection_accept(&pool, 5);
+        TEST_ASSERT_NOT_NULL(conn);
+    }
+
+    TEST_ASSERT_EQUAL(MAX_CONNECTIONS, connection_count_active(&pool));
+
+    // Try to accept one more
+    connection_t* conn = connection_accept(&pool, 5);
+    TEST_ASSERT_NULL(conn);
+}
+
+// Test connection_accept reuses freed slots
+static void test_connection_accept_reuses_slots(void)
+{
+    connection_pool_t pool;
+    connection_pool_init(&pool);
+
+    // Accept some connections
+    connection_t* conn0 = connection_accept(&pool, 5);
+    connection_t* conn1 = connection_accept(&pool, 5);
+    connection_t* conn2 = connection_accept(&pool, 5);
+    TEST_ASSERT_NOT_NULL(conn0);
+    TEST_ASSERT_NOT_NULL(conn1);
+    TEST_ASSERT_NOT_NULL(conn2);
+
+    // Close and cleanup the middle one
+    connection_close(&pool, conn1);
+    connection_cleanup_closed(&pool);
+    TEST_ASSERT_EQUAL(CONN_STATE_FREE, conn1->state);
+
+    // Accept a new connection - should reuse the freed slot
+    connection_t* conn_new = connection_accept(&pool, 5);
+    TEST_ASSERT_NOT_NULL(conn_new);
+    TEST_ASSERT_EQUAL_PTR(conn1, conn_new); // Should be the same slot
+}
+
+// Test boundary index handling
+static void test_boundary_indices(void)
+{
+    connection_pool_t pool;
+    connection_pool_init(&pool);
+
+    // Test index at MAX_CONNECTIONS-1 (valid)
+    connection_mark_active(&pool, MAX_CONNECTIONS - 1);
+    TEST_ASSERT_TRUE(connection_is_active(&pool, MAX_CONNECTIONS - 1));
+
+    // connection_get with boundary indices
+    connection_t* conn = connection_get(&pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    conn = connection_get(&pool, MAX_CONNECTIONS - 1);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    // Out of bounds should return NULL
+    conn = connection_get(&pool, MAX_CONNECTIONS);
+    TEST_ASSERT_NULL(conn);
+}
+
+// Test WebSocket active mask handling
+static void test_ws_active_mask_handling(void)
+{
+    connection_pool_t pool;
+    connection_pool_init(&pool);
+
+    // Mark some connections as WS active
+    connection_mark_ws_active(&pool, 0);
+    connection_mark_ws_active(&pool, 15);
+    connection_mark_ws_active(&pool, 31);
+
+    TEST_ASSERT_TRUE(connection_is_ws_active(&pool, 0));
+    TEST_ASSERT_TRUE(connection_is_ws_active(&pool, 15));
+    TEST_ASSERT_TRUE(connection_is_ws_active(&pool, 31));
+    TEST_ASSERT_FALSE(connection_is_ws_active(&pool, 1));
+
+    // Mark inactive
+    connection_mark_ws_inactive(&pool, 15);
+    TEST_ASSERT_FALSE(connection_is_ws_active(&pool, 15));
+    TEST_ASSERT_TRUE(connection_is_ws_active(&pool, 0));
+    TEST_ASSERT_TRUE(connection_is_ws_active(&pool, 31));
+}
+
+// Test connection state preservation after close
+static void test_state_after_close(void)
+{
+    connection_pool_t pool;
+    connection_pool_init(&pool);
+
+    connection_t* conn = connection_accept(&pool, 5);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    // Set up some state
+    conn->fd = 42;
+    conn->method = HTTP_POST;
+    conn->is_websocket = 1;
+    conn->content_length = 1024;
+
+    // Close the connection
+    connection_close(&pool, conn);
+
+    // State should be CLOSED
+    TEST_ASSERT_EQUAL(CONN_STATE_CLOSED, conn->state);
+
+    // After cleanup, state should be FREE
+    connection_cleanup_closed(&pool);
+    TEST_ASSERT_EQUAL(CONN_STATE_FREE, conn->state);
+    TEST_ASSERT_EQUAL(-1, conn->fd);
+}
+
+// Test connection pool index caching
+static void test_pool_index_caching(void)
+{
+    connection_pool_t pool;
+    connection_pool_init(&pool);
+
+    // Accept connections and verify pool_index is set correctly
+    for (int i = 0; i < 5; i++) {
+        connection_t* conn = connection_accept(&pool, 5);
+        TEST_ASSERT_NOT_NULL(conn);
+        // pool_index should match the slot used
+        int expected_index = connection_get_index(&pool, conn);
+        TEST_ASSERT_EQUAL(expected_index, conn->pool_index);
+    }
+}
+
 void test_connection_run(void)
 {
     RUN_TEST(test_connection_pool_init);
@@ -366,6 +643,26 @@ void test_connection_run(void)
     RUN_TEST(test_connection_timing);
     RUN_TEST(test_full_connection_pool);
     RUN_TEST(test_structure_sizes);
+
+    // Security and edge case tests
+    RUN_TEST(test_pool_init_null);
+    RUN_TEST(test_count_active_null);
+    RUN_TEST(test_connection_get_null_pool);
+    RUN_TEST(test_connection_find_null_pool);
+    RUN_TEST(test_connection_get_index_null_pool);
+    RUN_TEST(test_connection_get_index_null_conn);
+    RUN_TEST(test_connection_close_null_pool);
+    RUN_TEST(test_connection_close_null_conn);
+    RUN_TEST(test_cleanup_closed_null_pool);
+    RUN_TEST(test_connection_accept_null_pool);
+    RUN_TEST(test_connection_close_clears_masks);
+    RUN_TEST(test_cleanup_closed_resets_connections);
+    RUN_TEST(test_connection_accept_full_pool);
+    RUN_TEST(test_connection_accept_reuses_slots);
+    RUN_TEST(test_boundary_indices);
+    RUN_TEST(test_ws_active_mask_handling);
+    RUN_TEST(test_state_after_close);
+    RUN_TEST(test_pool_index_caching);
 
     ESP_LOGI(TAG, "Connection tests completed");
 }

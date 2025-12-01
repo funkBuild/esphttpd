@@ -2,13 +2,38 @@
 #include <string.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <inttypes.h>
+#include <errno.h>
 #include "esp_log.h"
 #include "esp_littlefs.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char* TAG = "FILESYSTEM";
+
+// Helper to send all data, handling partial writes
+static ssize_t send_all(int fd, const void* data, size_t len) {
+    const uint8_t* ptr = (const uint8_t*)data;
+    size_t remaining = len;
+
+    while (remaining > 0) {
+        ssize_t sent = send(fd, ptr, remaining, 0);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                vTaskDelay(1);
+                continue;
+            }
+            ESP_LOGE(TAG, "send_all failed: %s", strerror(errno));
+            return -1;
+        }
+        ptr += sent;
+        remaining -= sent;
+    }
+    return (ssize_t)len;
+}
 
 // Default MIME type mappings - ordered by request frequency for early exit
 // ext_len is precomputed to avoid strlen() in hot path
@@ -206,6 +231,69 @@ const char* filesystem_get_mime_type(const char* path) {
     return mime ? mime->mime_type : "application/octet-stream";
 }
 
+bool filesystem_validate_path(const char* path) {
+    if (path == NULL || path[0] == '\0') {
+        return false;
+    }
+
+    // Check for literal ".." sequences
+    if (strstr(path, "..") != NULL) {
+        ESP_LOGW(TAG, "Directory traversal attempt (..): %s", path);
+        return false;
+    }
+
+    // Check for URL-encoded dangerous characters
+    // %2e = '.', %2f = '/', %5c = '\' (backslash)
+    const char* p = path;
+    while ((p = strchr(p, '%')) != NULL) {
+        if (p[1] != '\0' && p[2] != '\0') {
+            char c1 = p[1];
+            char c2 = p[2];
+
+            // Check for %2e or %2E (URL-encoded '.')
+            if ((c1 == '2' || c1 == '0') &&
+                (c2 == 'e' || c2 == 'E')) {
+                ESP_LOGW(TAG, "URL-encoded dot rejected: %s", path);
+                return false;
+            }
+
+            // Check for %2f or %2F (URL-encoded '/')
+            if ((c1 == '2' || c1 == '0') &&
+                (c2 == 'f' || c2 == 'F')) {
+                ESP_LOGW(TAG, "URL-encoded slash rejected: %s", path);
+                return false;
+            }
+
+            // Check for %5c or %5C (URL-encoded backslash)
+            if ((c1 == '5') && (c2 == 'c' || c2 == 'C')) {
+                ESP_LOGW(TAG, "URL-encoded backslash rejected: %s", path);
+                return false;
+            }
+
+            // Check for %00 (null byte)
+            if (c1 == '0' && c2 == '0') {
+                ESP_LOGW(TAG, "URL-encoded null byte rejected: %s", path);
+                return false;
+            }
+        }
+        p++;
+    }
+
+    // Reject double slashes (path confusion)
+    if (strstr(path, "//") != NULL) {
+        ESP_LOGW(TAG, "Double slash in path rejected: %s", path);
+        return false;
+    }
+
+    // Reject backslashes
+    if (strchr(path, '\\') != NULL) {
+        ESP_LOGW(TAG, "Backslash in path rejected: %s", path);
+        return false;
+    }
+
+    return true;
+}
+
 int filesystem_serve_file(filesystem_t* fs,
                          connection_t* conn,
                          const char* path,
@@ -214,9 +302,8 @@ int filesystem_serve_file(filesystem_t* fs,
         return -1;
     }
 
-    // Security: prevent directory traversal
-    if (strstr(path, "..") != NULL) {
-        ESP_LOGW(TAG, "Directory traversal attempt: %s", path);
+    // Security: validate path before processing
+    if (!filesystem_validate_path(path)) {
         return -1;
     }
 
@@ -293,7 +380,7 @@ int filesystem_send_file(filesystem_t* fs,
                           "\r\n");
 
     // Send headers
-    if (send(conn->fd, headers, header_len, 0) != header_len) {
+    if (send_all(conn->fd, headers, header_len) < 0) {
         close(file_fd);
         return -1;
     }
@@ -320,12 +407,23 @@ int filesystem_stream_file(int file_fd,
            (bytes_read = read(file_fd, buffer,
                              (file_size - total_sent > buffer_size) ?
                              buffer_size : (file_size - total_sent))) > 0) {
-        ssize_t bytes_sent = send(socket_fd, buffer, bytes_read, 0);
-        if (bytes_sent < 0) {
-            ESP_LOGE(TAG, "Failed to send file data");
-            return -1;
+        // Handle partial sends - loop until entire buffer is sent
+        size_t sent_from_buffer = 0;
+        while (sent_from_buffer < (size_t)bytes_read) {
+            ssize_t bytes_sent = send(socket_fd, buffer + sent_from_buffer,
+                                      bytes_read - sent_from_buffer, 0);
+            if (bytes_sent < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // Socket buffer full, yield briefly and retry
+                    vTaskDelay(1);
+                    continue;
+                }
+                ESP_LOGE(TAG, "Failed to send file data: %s", strerror(errno));
+                return -1;
+            }
+            sent_from_buffer += bytes_sent;
         }
-        total_sent += bytes_sent;
+        total_sent += sent_from_buffer;
     }
 
     return total_sent;

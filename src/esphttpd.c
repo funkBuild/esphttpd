@@ -11,6 +11,7 @@
 #include "private/radix_tree.h"
 #include "private/template.h"
 #include "private/filesystem.h"
+#include "private/send_buffer.h"
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -123,10 +124,16 @@ struct httpd_server {
     channel_hash_entry_t* channel_by_index[HTTPD_WS_MAX_CHANNELS];  // Index -> entry mapping
     uint8_t channel_count;                          // Next available channel index
 
+    // Send buffer pool for non-blocking sends
+    send_buffer_pool_t send_buffer_pool;
+
     // State
     bool initialized;
     bool running;
 };
+
+// Per-connection send buffers
+static send_buffer_t connection_send_buffers[MAX_CONNECTIONS];
 
 // Initialize channel hash table - O(1) memset instead of O(n) loop
 // Setting all bytes to 0xFF makes index = -1 (int8_t), marking slots as empty.
@@ -171,6 +178,19 @@ typedef struct {
         bool active;                      // Request is in deferred mode
         bool paused;                      // Flow control - receiving paused
     } defer;
+    // Async response sending
+    struct {
+        httpd_send_cb_t on_done;          // Completion callback
+        bool active;                      // Response send in progress
+    } async_send;
+    // Data provider for streaming responses
+    struct {
+        httpd_data_provider_t provider;   // Data provider callback
+        httpd_send_cb_t on_complete;      // Completion callback
+        bool active;                      // Provider mode active
+        bool eof_reached;                 // Provider returned 0 (EOF)
+        bool use_chunked;                 // Using chunked transfer encoding
+    } data_provider;
 } request_context_t;
 
 // Per-connection WebSocket context
@@ -215,11 +235,132 @@ static void on_ws_frame(connection_t* conn, uint8_t* buffer, size_t len);
 static void on_ws_connect(connection_t* conn);
 static void on_ws_disconnect(connection_t* conn);
 static void on_disconnect(connection_t* conn);
+static void on_write_ready(connection_t* conn);
 static void server_task(void* pvParameters);
+
+// Get send buffer for connection
+static inline send_buffer_t* get_send_buffer(connection_t* conn) {
+    return &connection_send_buffers[conn->pool_index];
+}
 
 // ============================================================================
 // Utility Functions
 // ============================================================================
+
+// Drain send buffer - sends as much buffered data as possible
+// Returns true if buffer is now empty, false if more data pending
+static bool drain_send_buffer(connection_t* conn) {
+    send_buffer_t* sb = get_send_buffer(conn);
+
+    while (send_buffer_has_data(sb)) {
+        const uint8_t* data;
+        size_t len = send_buffer_peek(sb, &data);
+        if (len == 0) break;
+
+        ssize_t sent = send(conn->fd, data, len, MSG_DONTWAIT);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return false;  // Socket buffer full, more data pending
+            }
+            ESP_LOGE(TAG, "drain_send_buffer failed: %s", strerror(errno));
+            return false;
+        }
+        send_buffer_consume(sb, sent);
+    }
+
+    return !send_buffer_has_data(sb);
+}
+
+// Non-blocking send - tries to send data, queues remainder if socket would block
+// Returns number of bytes sent/queued, or -1 on error
+static ssize_t send_nonblocking(connection_t* conn, const void* data, size_t len, int flags) {
+    if (!conn || !data || len == 0) {
+        return 0;
+    }
+
+    send_buffer_t* sb = get_send_buffer(conn);
+    const uint8_t* ptr = (const uint8_t*)data;
+    size_t remaining = len;
+
+    // If there's already queued data, we must queue to maintain order
+    // Only attempt drain for larger writes (>64 bytes) where making room is worthwhile
+    if (send_buffer_has_data(sb)) {
+        if (len > 64) {
+            drain_send_buffer(conn);
+        }
+        // Still have queued data - must queue this too to maintain order
+        if (send_buffer_has_data(sb)) {
+            goto queue_data;
+        }
+    }
+
+    // Try to send directly (fast path)
+    while (remaining > 0) {
+        ssize_t sent = send(conn->fd, ptr, remaining, flags | MSG_DONTWAIT);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Socket buffer full, queue remaining data
+                goto queue_data;
+            }
+            ESP_LOGE(TAG, "send_nonblocking failed: %s", strerror(errno));
+            return -1;
+        }
+        ptr += sent;
+        remaining -= sent;
+    }
+
+    // All data sent directly
+    return (ssize_t)len;
+
+queue_data:
+    // Ensure we have a buffer allocated
+    if (!sb->allocated) {
+        if (!send_buffer_alloc(sb, &g_server->send_buffer_pool)) {
+            ESP_LOGE(TAG, "Failed to allocate send buffer");
+            return -1;
+        }
+    }
+
+    // Try to queue data - if buffer full, attempt one drain and retry
+    if (send_buffer_queue(sb, ptr, remaining) < 0) {
+        // Buffer full - try draining once
+        drain_send_buffer(conn);
+        if (send_buffer_queue(sb, ptr, remaining) < 0) {
+            // Still can't fit - data is too large for buffer
+            ESP_LOGE(TAG, "Send buffer full, cannot queue %zu bytes", remaining);
+            return -1;
+        }
+    }
+
+    // Mark connection as having pending writes
+    connection_mark_write_pending(&g_server->connection_pool, conn->pool_index, true);
+
+    return (ssize_t)len;
+}
+
+// Legacy blocking send - for backwards compatibility during transition
+// TODO: Remove once all callers updated to non-blocking
+static ssize_t send_all(int fd, const void* data, size_t len, int flags) {
+    const uint8_t* ptr = (const uint8_t*)data;
+    size_t remaining = len;
+
+    while (remaining > 0) {
+        ssize_t sent = send(fd, ptr, remaining, flags);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Socket buffer full, yield briefly and retry
+                vTaskDelay(1);
+                continue;
+            }
+            ESP_LOGE(TAG, "send_all failed: %s", strerror(errno));
+            return -1;
+        }
+        ptr += sent;
+        remaining -= sent;
+    }
+
+    return (ssize_t)len;
+}
 
 const char* httpd_status_text(int status) {
     // Common case fast path (200, 404, 500 are most frequent)
@@ -549,6 +690,17 @@ static void init_request_context(request_context_t* ctx, connection_t* conn) {
     ctx->defer.file_ctx = NULL;
     ctx->defer.active = false;
     ctx->defer.paused = false;
+
+    // Reset async send state
+    ctx->async_send.on_done = NULL;
+    ctx->async_send.active = false;
+
+    // Reset data provider state
+    ctx->data_provider.provider = NULL;
+    ctx->data_provider.on_complete = NULL;
+    ctx->data_provider.active = false;
+    ctx->data_provider.eof_reached = false;
+    ctx->data_provider.use_chunked = false;
 }
 
 // Store header in request context
@@ -624,6 +776,12 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
     event_loop_init(&server->event_loop, &server->connection_pool, &el_config);
     connection_pool_init(&server->connection_pool);
 
+    // Initialize send buffer pool and per-connection buffers
+    send_buffer_pool_init(&server->send_buffer_pool);
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        send_buffer_init(&connection_send_buffers[i]);
+    }
+
     // Initialize channel hash table
     init_channel_hash(server);
 
@@ -641,6 +799,7 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
     server->handlers.on_ws_connect = on_ws_connect;
     server->handlers.on_ws_disconnect = on_ws_disconnect;
     server->handlers.on_disconnect = on_disconnect;
+    server->handlers.on_write_ready = on_write_ready;
 
     server->initialized = true;
     g_server = server;
@@ -998,13 +1157,17 @@ httpd_err_t httpd_resp_set_header(httpd_req_t* req, const char* key, const char*
         int len = snprintf(status_line, sizeof(status_line),
                           "HTTP/1.1 %d %s\r\n",
                           req->status_code, httpd_status_text(req->status_code));
-        send(conn->fd, status_line, len, MSG_MORE);
+        if (send_all(conn->fd, status_line, len, MSG_MORE) < 0) {
+            return HTTPD_ERR_IO;
+        }
         req->headers_sent = true;
     }
 
     char header[512];
     int len = snprintf(header, sizeof(header), "%s: %s\r\n", key, value);
-    send(conn->fd, header, len, MSG_MORE);
+    if (send_all(conn->fd, header, len, MSG_MORE) < 0) {
+        return HTTPD_ERR_IO;
+    }
 
     return HTTPD_OK;
 }
@@ -1030,7 +1193,9 @@ httpd_err_t httpd_resp_send(httpd_req_t* req, const char* body, ssize_t len) {
         int slen = snprintf(status_line, sizeof(status_line),
                            "HTTP/1.1 %d %s\r\n",
                            req->status_code, httpd_status_text(req->status_code));
-        send(conn->fd, status_line, slen, MSG_MORE);
+        if (send_nonblocking(conn, status_line, slen, MSG_MORE) < 0) {
+            return HTTPD_ERR_IO;
+        }
         req->headers_sent = true;
     }
 
@@ -1041,15 +1206,26 @@ httpd_err_t httpd_resp_send(httpd_req_t* req, const char* body, ssize_t len) {
     if (was_headers_fresh || body_len > 0) {
         char cl_header[64];
         int cl_len = snprintf(cl_header, sizeof(cl_header), "Content-Length: %zu\r\n", body_len);
-        send(conn->fd, cl_header, cl_len, MSG_MORE);
+        if (send_nonblocking(conn, cl_header, cl_len, MSG_MORE) < 0) {
+            return HTTPD_ERR_IO;
+        }
     }
 
     // End headers
-    send(conn->fd, "\r\n", 2, MSG_MORE);
+    if (send_nonblocking(conn, "\r\n", 2, MSG_MORE) < 0) {
+        return HTTPD_ERR_IO;
+    }
 
-    // Send body
+    // Send body - use blocking send to ensure complete delivery before handler returns.
+    // Non-blocking send would queue data to be drained by on_write_ready, but the
+    // connection state may change after the handler returns (e.g., ready for next
+    // request in keep-alive), causing the queued data to never be sent.
+    // For httpd_resp_send (Content-Length responses), blocking is the correct approach
+    // since we've already committed to sending exactly body_len bytes.
     if (body && body_len > 0) {
-        send(conn->fd, body, body_len, 0);
+        if (send_all(conn->fd, body, body_len, 0) < 0) {
+            return HTTPD_ERR_IO;
+        }
     }
 
     return HTTPD_OK;
@@ -1067,9 +1243,15 @@ httpd_err_t httpd_resp_send_chunk(httpd_req_t* req, const char* chunk, ssize_t l
         int slen = snprintf(status_line, sizeof(status_line),
                            "HTTP/1.1 %d %s\r\n",
                            req->status_code, httpd_status_text(req->status_code));
-        send(conn->fd, status_line, slen, MSG_MORE);
-        send(conn->fd, "Transfer-Encoding: chunked\r\n", 28, MSG_MORE);
-        send(conn->fd, "\r\n", 2, MSG_MORE);
+        if (send_nonblocking(conn, status_line, slen, MSG_MORE) < 0) {
+            return HTTPD_ERR_IO;
+        }
+        if (send_nonblocking(conn, "Transfer-Encoding: chunked\r\n", 28, MSG_MORE) < 0) {
+            return HTTPD_ERR_IO;
+        }
+        if (send_nonblocking(conn, "\r\n", 2, MSG_MORE) < 0) {
+            return HTTPD_ERR_IO;
+        }
         req->headers_sent = true;
     }
 
@@ -1077,14 +1259,23 @@ httpd_err_t httpd_resp_send_chunk(httpd_req_t* req, const char* chunk, ssize_t l
 
     if (chunk_len == 0) {
         // Final chunk
-        send(conn->fd, "0\r\n\r\n", 5, 0);
+        if (send_nonblocking(conn, "0\r\n\r\n", 5, 0) < 0) {
+            return HTTPD_ERR_IO;
+        }
     } else {
         // Send chunk size in hex
         char size_line[16];
         int size_len = snprintf(size_line, sizeof(size_line), "%zx\r\n", chunk_len);
-        send(conn->fd, size_line, size_len, MSG_MORE);
-        send(conn->fd, chunk, chunk_len, MSG_MORE);
-        send(conn->fd, "\r\n", 2, 0);
+        if (send_nonblocking(conn, size_line, size_len, MSG_MORE) < 0) {
+            return HTTPD_ERR_IO;
+        }
+        // Use non-blocking send for chunk data
+        if (send_nonblocking(conn, chunk, chunk_len, MSG_MORE) < 0) {
+            return HTTPD_ERR_IO;
+        }
+        if (send_nonblocking(conn, "\r\n", 2, 0) < 0) {
+            return HTTPD_ERR_IO;
+        }
     }
 
     return HTTPD_OK;
@@ -1118,6 +1309,162 @@ httpd_err_t httpd_resp_sendfile(httpd_req_t* req, const char* path) {
 httpd_err_t httpd_resp_send_json(httpd_req_t* req, const char* json) {
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, json, -1);
+}
+
+// ============================================================================
+// Asynchronous Response Sending
+// ============================================================================
+
+httpd_err_t httpd_resp_send_async(httpd_req_t* req, const char* body, ssize_t len,
+                                   httpd_send_cb_t on_done) {
+    if (!req) return HTTPD_ERR_INVALID_ARG;
+
+    connection_t* conn = (connection_t*)req->_internal;
+    if (!conn) return HTTPD_ERR_CONN_CLOSED;
+
+    request_context_t* ctx = get_request_context(conn);
+    if (!ctx) return HTTPD_ERR_INVALID_ARG;
+
+    size_t body_len = (len >= 0) ? (size_t)len : (body ? strlen(body) : 0);
+
+    // Build all headers in one buffer to minimize syscalls
+    if (!req->headers_sent) {
+        char header_buf[256];
+        int header_len = snprintf(header_buf, sizeof(header_buf),
+            "HTTP/1.1 %d %s\r\n"
+            "Content-Length: %zu\r\n"
+            "\r\n",
+            req->status_code, httpd_status_text(req->status_code),
+            body_len);
+
+        if (header_len < 0 || (size_t)header_len >= sizeof(header_buf)) {
+            return HTTPD_ERR_NO_MEM;
+        }
+
+        // Single syscall for all headers
+        if (send_nonblocking(conn, header_buf, header_len, body_len > 0 ? MSG_MORE : 0) < 0) {
+            return HTTPD_ERR_IO;
+        }
+        req->headers_sent = true;
+    } else {
+        // Headers already partially sent, just send Content-Length and terminator
+        char cl_buf[80];
+        int cl_len = snprintf(cl_buf, sizeof(cl_buf), "Content-Length: %zu\r\n\r\n", body_len);
+        if (send_nonblocking(conn, cl_buf, cl_len, body_len > 0 ? MSG_MORE : 0) < 0) {
+            return HTTPD_ERR_IO;
+        }
+    }
+
+    // Queue body
+    if (body && body_len > 0) {
+        if (send_nonblocking(conn, body, body_len, 0) < 0) {
+            return HTTPD_ERR_IO;
+        }
+    }
+
+    // Set up async completion tracking
+    ctx->async_send.on_done = on_done;
+    ctx->async_send.active = true;
+
+    return HTTPD_OK;
+}
+
+httpd_err_t httpd_resp_sendfile_async(httpd_req_t* req, const char* path,
+                                       httpd_send_cb_t on_done) {
+    if (!req || !path) return HTTPD_ERR_INVALID_ARG;
+
+    if (!g_server || !g_server->filesystem_enabled) {
+        if (on_done) on_done(req, HTTPD_ERR_NOT_FOUND);
+        return HTTPD_ERR_NOT_FOUND;
+    }
+
+    connection_t* conn = (connection_t*)req->_internal;
+    if (!conn) {
+        if (on_done) on_done(req, HTTPD_ERR_CONN_CLOSED);
+        return HTTPD_ERR_CONN_CLOSED;
+    }
+
+    // Note: filesystem_serve_file uses blocking I/O internally.
+    // The file is sent synchronously before this function returns.
+    int result = filesystem_serve_file(g_server->filesystem, conn, path, false);
+
+    httpd_err_t err = (result < 0) ? HTTPD_ERR_NOT_FOUND : HTTPD_OK;
+
+    // Invoke callback immediately since send completed synchronously
+    if (on_done) {
+        on_done(req, err);
+    }
+
+    return err;
+}
+
+// ============================================================================
+// Data Provider API
+// ============================================================================
+
+httpd_err_t httpd_resp_send_provider(httpd_req_t* req, ssize_t content_length,
+                                      httpd_data_provider_t provider,
+                                      httpd_send_cb_t on_complete) {
+    if (!req || !provider) return HTTPD_ERR_INVALID_ARG;
+
+    connection_t* conn = (connection_t*)req->_internal;
+    if (!conn) return HTTPD_ERR_CONN_CLOSED;
+
+    request_context_t* ctx = get_request_context(conn);
+    if (!ctx) return HTTPD_ERR_INVALID_ARG;
+
+    // Determine if using chunked encoding
+    bool use_chunked = (content_length < 0);
+
+    // Send headers - if headers not started yet, send status line first
+    if (!req->headers_sent) {
+        char status_line[64];
+        int slen = snprintf(status_line, sizeof(status_line),
+                           "HTTP/1.1 %d %s\r\n",
+                           req->status_code, httpd_status_text(req->status_code));
+        if (send_all(conn->fd, status_line, slen, MSG_MORE) < 0) {
+            return HTTPD_ERR_IO;
+        }
+        req->headers_sent = true;
+    }
+
+    // Send Content-Length or Transfer-Encoding header
+    char header_buf[64];
+    int header_len;
+    if (use_chunked) {
+        header_len = snprintf(header_buf, sizeof(header_buf), "Transfer-Encoding: chunked\r\n");
+    } else {
+        header_len = snprintf(header_buf, sizeof(header_buf), "Content-Length: %zd\r\n", content_length);
+    }
+    if (send_all(conn->fd, header_buf, header_len, MSG_MORE) < 0) {
+        return HTTPD_ERR_IO;
+    }
+
+    // End headers
+    if (send_all(conn->fd, "\r\n", 2, 0) < 0) {
+        return HTTPD_ERR_IO;
+    }
+
+    // Allocate send buffer for the data provider
+    send_buffer_t* sb = get_send_buffer(conn);
+    if (!send_buffer_alloc(sb, &g_server->send_buffer_pool)) {
+        ESP_LOGE(TAG, "Failed to allocate send buffer for provider");
+        return HTTPD_ERR_NO_MEM;
+    }
+
+    // Set up data provider state
+    ctx->data_provider.provider = provider;
+    ctx->data_provider.on_complete = on_complete;
+    ctx->data_provider.active = true;
+    ctx->data_provider.eof_reached = false;
+    ctx->data_provider.use_chunked = use_chunked;
+
+    // Mark connection as write-pending to trigger on_write_ready
+    connection_mark_write_pending(&g_server->connection_pool, conn->pool_index, true);
+
+    ESP_LOGD(TAG, "Data provider started for conn [%d], chunked=%d", conn->pool_index, use_chunked);
+
+    return HTTPD_OK;
 }
 
 // ============================================================================
@@ -1178,8 +1525,7 @@ httpd_err_t httpd_resp_send_continue(httpd_req_t* req) {
 
     // Use compile-time constant length instead of runtime strlen()
     static const char response[] = "HTTP/1.1 100 Continue\r\n\r\n";
-    ssize_t sent = send(conn->fd, response, sizeof(response) - 1, 0);
-    if (sent < 0) {
+    if (send_all(conn->fd, response, sizeof(response) - 1, 0) < 0) {
         return HTTPD_ERR_IO;
     }
 
@@ -1876,8 +2222,7 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
     ctx->req.is_websocket = conn->upgrade_ws;
     if (conn->upgrade_ws) {
         // Copy WebSocket key from global buffer (set by parser)
-        strncpy(ctx->req.ws_key, ws_client_key, sizeof(ctx->req.ws_key) - 1);
-        ctx->req.ws_key[sizeof(ctx->req.ws_key) - 1] = '\0';
+        snprintf(ctx->req.ws_key, sizeof(ctx->req.ws_key), "%s", ws_client_key);
     }
 
     // Store content length
@@ -2260,14 +2605,225 @@ static void on_ws_disconnect(connection_t* conn) {
 }
 
 static void on_disconnect(connection_t* conn) {
+    request_context_t* ctx = get_request_context(conn);
+
     // Handle disconnect for deferred requests
     if (conn->deferred) {
-        request_context_t* ctx = get_request_context(conn);
         if (ctx && ctx->defer.active && ctx->defer.on_done) {
             ESP_LOGW(TAG, "Connection closed during deferred request");
             ctx->defer.on_done(&ctx->req, HTTPD_ERR_CONN_CLOSED);
             ctx->defer.active = false;
             conn->deferred = 0;
+        }
+    }
+
+    // Handle disconnect for async send
+    if (ctx && ctx->async_send.active) {
+        httpd_send_cb_t callback = ctx->async_send.on_done;
+        ctx->async_send.active = false;
+        ctx->async_send.on_done = NULL;
+        if (callback) {
+            ESP_LOGW(TAG, "Connection closed during async send");
+            callback(&ctx->req, HTTPD_ERR_CONN_CLOSED);
+        }
+    }
+
+    // Handle disconnect for data provider
+    if (ctx && ctx->data_provider.active) {
+        httpd_send_cb_t callback = ctx->data_provider.on_complete;
+        ctx->data_provider.active = false;
+        ctx->data_provider.provider = NULL;
+        ctx->data_provider.on_complete = NULL;
+        ctx->data_provider.eof_reached = false;
+        ctx->data_provider.use_chunked = false;
+        if (callback) {
+            ESP_LOGW(TAG, "Connection closed during data provider send");
+            callback(&ctx->req, HTTPD_ERR_CONN_CLOSED);
+        }
+    }
+
+    // Clean up send buffer
+    send_buffer_t* sb = get_send_buffer(conn);
+    if (sb->allocated) {
+        send_buffer_free(sb, &g_server->send_buffer_pool);
+    }
+}
+
+// Called by event loop when socket is writable and has pending data
+static void on_write_ready(connection_t* conn) {
+    send_buffer_t* sb = get_send_buffer(conn);
+    request_context_t* ctx = get_request_context(conn);
+
+    // Main send loop - keep filling and sending until EAGAIN or complete
+    for (;;) {
+        // If streaming a file, refill the buffer first (zero-copy: read directly into ring buffer)
+    if (send_buffer_is_streaming(sb)) {
+        uint8_t* write_ptr;
+        size_t contiguous = send_buffer_write_ptr(sb, &write_ptr);
+
+        if (contiguous > 0 && sb->file_remaining > 0) {
+            size_t to_read = contiguous;
+            if (to_read > sb->file_remaining) {
+                to_read = sb->file_remaining;
+            }
+
+            // Read directly into ring buffer - no intermediate copy
+            ssize_t bytes_read = read(sb->file_fd, write_ptr, to_read);
+            if (bytes_read > 0) {
+                send_buffer_commit(sb, bytes_read);
+                sb->file_remaining -= bytes_read;
+
+                // Check if file is complete
+                if (sb->file_remaining == 0) {
+                    send_buffer_stop_file(sb);
+                    ESP_LOGD(TAG, "File streaming complete for conn [%d]", conn->pool_index);
+                }
+            } else if (bytes_read < 0 && errno != EAGAIN) {
+                ESP_LOGE(TAG, "File read error: %s", strerror(errno));
+                send_buffer_stop_file(sb);
+            }
+        }
+    }
+
+    // If data provider active and not EOF, refill buffer from provider
+    if (ctx && ctx->data_provider.active && !ctx->data_provider.eof_reached) {
+        uint8_t* write_ptr;
+        size_t contiguous = send_buffer_write_ptr(sb, &write_ptr);
+
+        if (contiguous > 0) {
+            // For chunked encoding, reserve space for chunk header (max "FFFF\r\n" = 8 bytes)
+            // and trailer ("\r\n" = 2 bytes)
+            size_t reserved = ctx->data_provider.use_chunked ? 10 : 0;
+            if (contiguous > reserved) {
+                size_t max_data = contiguous - reserved;
+                uint8_t* data_ptr = ctx->data_provider.use_chunked ? write_ptr + 8 : write_ptr;
+
+                // Call user's data provider
+                ssize_t bytes = ctx->data_provider.provider(&ctx->req, data_ptr, max_data);
+
+                if (bytes > 0) {
+                    if (ctx->data_provider.use_chunked) {
+                        // Format chunk: size\r\n data \r\n
+                        int header_len = snprintf((char*)write_ptr, 8, "%zx\r\n", bytes);
+                        // Move data if header is shorter than 8 bytes
+                        if (header_len < 8) {
+                            memmove(write_ptr + header_len, data_ptr, bytes);
+                        }
+                        // Add chunk trailer
+                        write_ptr[header_len + bytes] = '\r';
+                        write_ptr[header_len + bytes + 1] = '\n';
+                        send_buffer_commit(sb, header_len + bytes + 2);
+                    } else {
+                        send_buffer_commit(sb, bytes);
+                    }
+                } else if (bytes == 0) {
+                    // EOF - provider has no more data
+                    ctx->data_provider.eof_reached = true;
+                    ESP_LOGD(TAG, "Data provider EOF for conn [%d]", conn->pool_index);
+
+                    // For chunked encoding, queue the final chunk
+                    if (ctx->data_provider.use_chunked) {
+                        send_buffer_queue(sb, "0\r\n\r\n", 5);
+                    }
+                } else {
+                    // Error from provider
+                    ESP_LOGE(TAG, "Data provider error: %zd", bytes);
+                    httpd_send_cb_t callback = ctx->data_provider.on_complete;
+                    ctx->data_provider.active = false;
+                    ctx->data_provider.provider = NULL;
+                    ctx->data_provider.on_complete = NULL;
+                    if (callback) {
+                        callback(&ctx->req, (httpd_err_t)bytes);
+                    }
+                    conn->state = CONN_STATE_CLOSED;
+                    return;
+                }
+            }
+        }
+    }
+
+    // Try to send buffered data
+    while (send_buffer_has_data(sb)) {
+        const uint8_t* data;
+        size_t len = send_buffer_peek(sb, &data);
+        if (len == 0) break;
+
+        ssize_t sent = send(conn->fd, data, len, MSG_DONTWAIT);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Socket buffer full, will retry on next write-ready
+                return;
+            }
+            // Real error - invoke async callback with error and close connection
+            ESP_LOGE(TAG, "Send error on conn [%d]: %s", conn->pool_index, strerror(errno));
+            request_context_t* ctx = get_request_context(conn);
+            if (ctx && ctx->async_send.active) {
+                httpd_send_cb_t callback = ctx->async_send.on_done;
+                ctx->async_send.active = false;
+                ctx->async_send.on_done = NULL;
+                if (callback) {
+                    callback(&ctx->req, HTTPD_ERR_IO);
+                }
+            }
+            conn->state = CONN_STATE_CLOSED;
+            return;
+        }
+
+        send_buffer_consume(sb, sent);
+    }
+
+        // Check if data provider is still active and needs more calls
+        bool provider_needs_more = ctx && ctx->data_provider.active && !ctx->data_provider.eof_reached;
+
+        // If provider needs more data, continue the loop to refill and send
+        if (provider_needs_more) {
+            continue;
+        }
+
+        // If file streaming needs more data, continue the loop
+        if (send_buffer_is_streaming(sb)) {
+            continue;
+        }
+
+        // No more data to generate - exit the loop
+        break;
+    }  // End of for(;;) loop
+
+    // All data sent and no more file/provider data, clear write pending
+    if (!send_buffer_has_data(sb)) {
+        connection_mark_write_pending(&g_server->connection_pool, conn->pool_index, false);
+
+        // If buffer was allocated but now empty, we can free it
+        if (sb->allocated) {
+            send_buffer_free(sb, &g_server->send_buffer_pool);
+        }
+
+        // Check for async send completion
+        request_context_t* ctx = get_request_context(conn);
+        if (ctx && ctx->async_send.active) {
+            httpd_send_cb_t callback = ctx->async_send.on_done;
+            ctx->async_send.active = false;
+            ctx->async_send.on_done = NULL;
+
+            if (callback) {
+                callback(&ctx->req, HTTPD_OK);
+            }
+        }
+
+        // Check for data provider completion
+        if (ctx && ctx->data_provider.active && ctx->data_provider.eof_reached) {
+            httpd_send_cb_t callback = ctx->data_provider.on_complete;
+            ctx->data_provider.active = false;
+            ctx->data_provider.provider = NULL;
+            ctx->data_provider.on_complete = NULL;
+            ctx->data_provider.eof_reached = false;
+            ctx->data_provider.use_chunked = false;
+
+            ESP_LOGD(TAG, "Data provider complete for conn [%d]", conn->pool_index);
+
+            if (callback) {
+                callback(&ctx->req, HTTPD_OK);
+            }
         }
     }
 }

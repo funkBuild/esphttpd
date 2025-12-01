@@ -239,6 +239,126 @@ static void test_select_timeout(void) {
     TEST_ASSERT_EQUAL(250000, tv.tv_usec);
 }
 
+// Test default initialization
+static void test_event_loop_init_default(void) {
+    event_loop_t loop = {0};
+    connection_pool_t pool = {0};
+
+    event_loop_init_default(&loop, &pool);
+
+    // Verify defaults are set
+    TEST_ASSERT_EQUAL(&pool, loop.pool);
+    TEST_ASSERT_FALSE(loop.running);
+    TEST_ASSERT_EQUAL(-1, loop.listen_fd);
+    TEST_ASSERT_EQUAL(0, loop.total_connections);
+    TEST_ASSERT_EQUAL(0, loop.total_requests);
+}
+
+// Test event loop stop on already stopped loop
+static void test_event_loop_stop_idempotent(void) {
+    event_loop_t loop = {0};
+
+    loop.running = false;
+    event_loop_stop(&loop);
+    TEST_ASSERT_FALSE(loop.running);
+
+    // Stop multiple times should be safe
+    event_loop_stop(&loop);
+    event_loop_stop(&loop);
+    TEST_ASSERT_FALSE(loop.running);
+}
+
+// Test statistics tracking
+static void test_event_loop_statistics(void) {
+    event_loop_t loop = {0};
+    connection_pool_t pool = {0};
+
+    event_loop_init_default(&loop, &pool);
+
+    // Statistics should start at zero
+    TEST_ASSERT_EQUAL(0, loop.total_connections);
+    TEST_ASSERT_EQUAL(0, loop.total_requests);
+    TEST_ASSERT_EQUAL(0, loop.total_ws_frames);
+
+    // Simulate incrementing stats
+    loop.total_connections++;
+    loop.total_requests += 5;
+    loop.total_ws_frames += 10;
+
+    TEST_ASSERT_EQUAL(1, loop.total_connections);
+    TEST_ASSERT_EQUAL(5, loop.total_requests);
+    TEST_ASSERT_EQUAL(10, loop.total_ws_frames);
+}
+
+// Test NULL handler callbacks are safe to check
+static void test_handlers_null_safety(void) {
+    event_handlers_t handlers = {0};
+
+    // All should be NULL
+    TEST_ASSERT_NULL(handlers.on_http_request);
+    TEST_ASSERT_NULL(handlers.on_http_body);
+    TEST_ASSERT_NULL(handlers.on_ws_frame);
+    TEST_ASSERT_NULL(handlers.on_ws_connect);
+    TEST_ASSERT_NULL(handlers.on_ws_disconnect);
+    TEST_ASSERT_NULL(handlers.on_connect);
+    TEST_ASSERT_NULL(handlers.on_disconnect);
+    TEST_ASSERT_NULL(handlers.on_write_ready);
+
+    // Safe to check before calling
+    connection_t conn = {0};
+    uint8_t buffer[16] = {0};
+
+    if (handlers.on_http_request) {
+        handlers.on_http_request(&conn, buffer, sizeof(buffer));
+    }
+    // Test passes if we don't crash
+    TEST_PASS();
+}
+
+// Test timeout tick calculations
+static void test_timeout_ticks(void) {
+    event_loop_t loop = {0};
+    connection_pool_t pool = {0};
+
+    event_loop_config_t config = {
+        .timeout_ms = 30000,
+        .select_timeout_ms = 100
+    };
+
+    event_loop_init(&loop, &pool, &config);
+
+    // Tick count should start at zero
+    TEST_ASSERT_EQUAL(0, loop.tick_count);
+
+    // Simulate tick progression
+    loop.tick_count++;
+    TEST_ASSERT_EQUAL(1, loop.tick_count);
+}
+
+// Test WebSocket active state with FD management
+static void test_websocket_fd_set(void) {
+    connection_pool_t pool = {0};
+    connection_pool_init(&pool);
+
+    // Add a WebSocket connection
+    connection_t* ws_conn = &pool.connections[0];
+    ws_conn->fd = 20;
+    ws_conn->state = CONN_STATE_WEBSOCKET;
+    connection_mark_active(&pool, 0);
+    connection_mark_ws_active(&pool, 0);
+
+    // WebSocket should be in read set
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+
+    if (connection_is_active(&pool, 0)) {
+        FD_SET(ws_conn->fd, &read_fds);
+    }
+
+    TEST_ASSERT_TRUE(FD_ISSET(20, &read_fds));
+    TEST_ASSERT_TRUE(connection_is_ws_active(&pool, 0));
+}
+
 // ==================== TEST RUNNER ====================
 
 void test_event_loop_run(void) {
@@ -252,6 +372,14 @@ void test_event_loop_run(void) {
     RUN_TEST(test_max_connections);
     RUN_TEST(test_buffer_limits);
     RUN_TEST(test_select_timeout);
+
+    // Additional tests
+    RUN_TEST(test_event_loop_init_default);
+    RUN_TEST(test_event_loop_stop_idempotent);
+    RUN_TEST(test_event_loop_statistics);
+    RUN_TEST(test_handlers_null_safety);
+    RUN_TEST(test_timeout_ticks);
+    RUN_TEST(test_websocket_fd_set);
 
     ESP_LOGI(TAG, "Event Loop tests completed");
 }

@@ -18,6 +18,8 @@ void test_integration_run(void);
 void test_radix_tree_run(void);
 void test_defer_run(void);
 void test_performance_run(void);
+void test_send_buffer_run(void);
+void test_filesystem_run(void);
 
 void app_main(void)
 {
@@ -53,6 +55,12 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Running Defer (Async) tests...");
     test_defer_run();
+
+    ESP_LOGI(TAG, "Running Send Buffer tests...");
+    test_send_buffer_run();
+
+    ESP_LOGI(TAG, "Running Filesystem tests...");
+    test_filesystem_run();
 
     ESP_LOGI(TAG, "Running Performance benchmarks...");
     test_performance_run();

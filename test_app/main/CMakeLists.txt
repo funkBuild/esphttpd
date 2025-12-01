@@ -10,6 +10,8 @@ idf_component_register(
         "test_radix_tree.c"
         "test_defer.c"
         "test_performance.c"
+        "test_send_buffer.c"
+        "test_filesystem.c"
     INCLUDE_DIRS "."
     REQUIRES unity esphttpd
     PRIV_REQUIRES esp_timer

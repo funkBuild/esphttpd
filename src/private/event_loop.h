@@ -51,6 +51,9 @@ typedef struct {
     // Connection events
     void (*on_connect)(connection_t* conn);
     void (*on_disconnect)(connection_t* conn);
+
+    // Write-ready handler (for non-blocking sends)
+    void (*on_write_ready)(connection_t* conn);
 } event_handlers_t;
 
 // Initialize event loop with default configuration

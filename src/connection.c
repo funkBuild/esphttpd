@@ -12,9 +12,8 @@ void connection_close(connection_pool_t* pool, connection_t* conn)
     // Use cached pool_index for O(1) lookup
     int index = conn->pool_index;
 
-    // Mark as closed and inactive
+    // Mark as closed (keep active so cleanup_closed can find it)
     conn->state = CONN_STATE_CLOSED;
-    connection_mark_inactive(pool, index);
 
     // Clear write pending and WebSocket active if set
     connection_mark_write_pending(pool, index, false);
@@ -51,6 +50,8 @@ void connection_cleanup_closed(connection_pool_t* pool)
 
 connection_t* connection_accept(connection_pool_t* pool, int listen_fd)
 {
+    if (!pool) return NULL;
+
     // Find first free slot using O(1) bit manipulation
     uint32_t free_mask = ~pool->active_mask;
     if (free_mask == 0) {
@@ -70,6 +71,7 @@ connection_t* connection_accept(connection_pool_t* pool, int listen_fd)
     memset(conn, 0, sizeof(connection_t));
     conn->fd = -1;                  // Only non-zero initial value
     conn->state = CONN_STATE_NEW;   // CONN_STATE_NEW = 1
+    conn->pool_index = i;           // Cache index for O(1) lookup
 
     // Mark as active
     connection_mark_active(pool, i);

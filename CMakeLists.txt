@@ -23,6 +23,7 @@ idf_component_register(
         "src/radix_tree.c"
         "src/router_api.c"
         "src/template.c"
+        "src/send_buffer.c"
         ${FILESYSTEM_SOURCES}
     INCLUDE_DIRS
         "include"           # Public API

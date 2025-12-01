@@ -638,6 +638,155 @@ httpd_err_t httpd_resp_sendfile(httpd_req_t* req, const char* path);
 httpd_err_t httpd_resp_send_json(httpd_req_t* req, const char* json);
 
 // ============================================================================
+// Asynchronous Response Sending
+// ============================================================================
+
+/**
+ * @brief Callback invoked when async send completes
+ * @param req Request context
+ * @param err HTTPD_OK if sent successfully, error code otherwise
+ */
+typedef void (*httpd_send_cb_t)(httpd_req_t* req, httpd_err_t err);
+
+/**
+ * @brief Send response asynchronously (non-blocking)
+ *
+ * Queues the response for sending and returns immediately. The completion
+ * callback is invoked when all data has been sent or an error occurs.
+ * This allows the event loop to handle other connections while sending.
+ *
+ * The handler MUST return HTTPD_OK after calling this function successfully.
+ * The connection remains open until the callback is invoked.
+ *
+ * @param req Request context
+ * @param body Response body (can be NULL)
+ * @param len Body length (-1 to use strlen)
+ * @param on_done Callback when send completes (can be NULL)
+ * @return HTTPD_OK if queued successfully, error code otherwise
+ *
+ * Example:
+ * @code
+ * static void send_done(httpd_req_t* req, httpd_err_t err) {
+ *     if (err != HTTPD_OK) {
+ *         ESP_LOGE(TAG, "Send failed: %d", err);
+ *     }
+ *     // Connection will be recycled/closed automatically
+ * }
+ *
+ * static httpd_err_t handler(httpd_req_t* req) {
+ *     char* large_data = generate_large_response();
+ *     httpd_resp_set_status(req, 200);
+ *     httpd_resp_set_type(req, "application/octet-stream");
+ *     httpd_err_t err = httpd_resp_send_async(req, large_data, -1, send_done);
+ *     free(large_data);
+ *     return err;
+ * }
+ * @endcode
+ */
+httpd_err_t httpd_resp_send_async(httpd_req_t* req, const char* body, ssize_t len,
+                                   httpd_send_cb_t on_done);
+
+/**
+ * @brief Send file with completion callback
+ *
+ * Sends a file from the filesystem. The callback is invoked when
+ * the operation completes.
+ *
+ * @note Currently implemented using blocking I/O internally.
+ * The callback is invoked before this function returns.
+ * Future versions may implement true async streaming.
+ *
+ * @param req Request context
+ * @param path File path (relative to filesystem base)
+ * @param on_done Callback when send completes (can be NULL)
+ * @return HTTPD_OK if sent successfully, error code otherwise
+ */
+httpd_err_t httpd_resp_sendfile_async(httpd_req_t* req, const char* path,
+                                       httpd_send_cb_t on_done);
+
+// ============================================================================
+// Data Provider API (Streaming Response Generation)
+// ============================================================================
+
+/**
+ * @brief Data provider callback - called when send buffer needs more data
+ *
+ * The server calls this when the send buffer has space available.
+ * The callback writes data into the provided buffer and returns bytes written.
+ *
+ * @param req Request context (use httpd_req_get_user_data for state)
+ * @param buf Buffer to write data into
+ * @param max_len Maximum bytes to write
+ * @return Bytes written (>0), 0 for EOF, or negative httpd_err_t on error
+ *
+ * Important:
+ * - Must be non-blocking (no mutexes, no slow I/O)
+ * - Return 0 to signal end of data
+ * - Return negative error code to abort (connection will be closed)
+ */
+typedef ssize_t (*httpd_data_provider_t)(httpd_req_t* req, uint8_t* buf, size_t max_len);
+
+/**
+ * @brief Send response using a data provider callback
+ *
+ * Sets up streaming response where user code provides data on demand.
+ * The provider callback is called whenever the send buffer has space.
+ * This enables efficient streaming of large files, flash data, or
+ * dynamically generated content without buffering the entire response.
+ *
+ * Flow:
+ * 1. Handler calls httpd_resp_send_provider() with callbacks
+ * 2. Handler returns HTTPD_OK immediately
+ * 3. Event loop calls provider when socket writable and buffer has space
+ * 4. Provider writes data to buffer and returns bytes written
+ * 5. Server sends buffered data
+ * 6. Repeat 3-5 until provider returns 0 (EOF)
+ * 7. on_complete callback invoked when all data sent
+ *
+ * @param req Request context
+ * @param content_length Total response size, or -1 for chunked encoding
+ * @param provider Callback to provide data (required)
+ * @param on_complete Callback when send completes (can be NULL)
+ * @return HTTPD_OK if set up successfully
+ *
+ * Example - streaming from flash:
+ * @code
+ * typedef struct {
+ *     const esp_partition_t* part;
+ *     size_t offset;
+ *     size_t remaining;
+ * } flash_ctx_t;
+ *
+ * static ssize_t flash_provider(httpd_req_t* req, uint8_t* buf, size_t max_len) {
+ *     flash_ctx_t* ctx = httpd_req_get_user_data(req);
+ *     size_t to_read = (ctx->remaining < max_len) ? ctx->remaining : max_len;
+ *     if (to_read == 0) return 0;  // EOF
+ *     esp_partition_read(ctx->part, ctx->offset, buf, to_read);
+ *     ctx->offset += to_read;
+ *     ctx->remaining -= to_read;
+ *     return to_read;
+ * }
+ *
+ * static void flash_complete(httpd_req_t* req, httpd_err_t err) {
+ *     free(httpd_req_get_user_data(req));
+ * }
+ *
+ * static httpd_err_t handle_flash(httpd_req_t* req) {
+ *     flash_ctx_t* ctx = malloc(sizeof(flash_ctx_t));
+ *     ctx->part = esp_partition_find_first(...);
+ *     ctx->offset = 0;
+ *     ctx->remaining = ctx->part->size;
+ *     httpd_req_set_user_data(req, ctx);
+ *     httpd_resp_set_type(req, "application/octet-stream");
+ *     return httpd_resp_send_provider(req, ctx->remaining, flash_provider, flash_complete);
+ * }
+ * @endcode
+ */
+httpd_err_t httpd_resp_send_provider(httpd_req_t* req, ssize_t content_length,
+                                      httpd_data_provider_t provider,
+                                      httpd_send_cb_t on_complete);
+
+// ============================================================================
 // Request Body Handling
 // ============================================================================
 

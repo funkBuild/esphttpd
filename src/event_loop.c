@@ -109,7 +109,11 @@ static void handle_new_connection(event_loop_t* loop, const event_handlers_t* ha
     }
 
     // Set non-blocking (single syscall - we only need O_NONBLOCK)
-    fcntl(client_fd, F_SETFL, O_NONBLOCK);
+    if (fcntl(client_fd, F_SETFL, O_NONBLOCK) < 0) {
+        ESP_LOGE(TAG, "Failed to set client non-blocking: %s", strerror(errno));
+        close(client_fd);
+        return;
+    }
 
     // Set TCP_NODELAY if configured
     if (loop->config.nodelay) {
@@ -221,14 +225,18 @@ void event_loop_check_timeouts(event_loop_t* loop) {
 }
 
 int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, uint8_t* io_buffer) {
-    fd_set read_fds;
+    fd_set read_fds, write_fds;
     int max_fd = loop->listen_fd;
     int activity;
     const size_t buffer_size = loop->config.io_buffer_size;  // Cache config value
     connection_t* const base = loop->pool->connections;  // Cache base pointer for efficient indexing
+    bool has_write_pending = (loop->pool->write_pending_mask != 0);
 
-    // Initialize fd_set (only read_fds needed - write handling not implemented)
+    // Initialize fd_sets
     FD_ZERO(&read_fds);
+    if (has_write_pending) {
+        FD_ZERO(&write_fds);
+    }
 
     // Add listening socket
     FD_SET(loop->listen_fd, &read_fds);
@@ -248,11 +256,17 @@ int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, u
             }
             close(conn->fd);
             connection_mark_inactive(loop->pool, i);
+            connection_mark_write_pending(loop->pool, i, false);  // Clear write pending
             ESP_LOGD(TAG, "Connection [%d] closed", i);
             continue;
         }
 
         FD_SET(conn->fd, &read_fds);
+
+        // Monitor for write readiness if data pending
+        if (has_write_pending && connection_has_write_pending(loop->pool, i)) {
+            FD_SET(conn->fd, &write_fds);
+        }
 
         if (conn->fd > max_fd) {
             max_fd = conn->fd;
@@ -262,7 +276,9 @@ int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, u
     // Wait for activity (copy precomputed timeout - select may modify it)
     struct timeval timeout = loop->select_timeout;
 
-    activity = select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
+    activity = select(max_fd + 1, &read_fds,
+                     has_write_pending ? &write_fds : NULL,
+                     NULL, &timeout);
 
     if (activity < 0) {
         if (errno != EINTR) {
@@ -283,7 +299,21 @@ int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, u
         handle_new_connection(loop, handlers);
     }
 
-    // Handle existing connections using bitmask iteration
+    // Handle writable connections first (drain pending data before reading more)
+    if (has_write_pending && handlers->on_write_ready) {
+        mask = loop->pool->write_pending_mask;
+        while (mask) {
+            int i = __builtin_ctz(mask);
+            mask &= mask - 1;  // Clear lowest set bit
+
+            connection_t* conn = base + i;
+            if (FD_ISSET(conn->fd, &write_fds)) {
+                handlers->on_write_ready(conn);
+            }
+        }
+    }
+
+    // Handle readable connections using bitmask iteration
     mask = loop->pool->active_mask;
     while (mask) {
         int i = __builtin_ctz(mask);
