@@ -49,6 +49,13 @@ jobs:
               0x10000 esphttpd_e2e_test.bin \
               0x8000 partition_table/partition-table.bin
 
+      - name: Fix build permissions
+        run: |
+          # Docker creates files as root, fix ownership
+          sudo chown -R $(id -u):$(id -g) test_app/build test_e2e/build
+          ls -la test_app/build/
+          ls -la test_e2e/build/
+
       - name: Install QEMU for ESP32
         run: |
           # Install QEMU dependencies
