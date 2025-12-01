@@ -133,7 +133,7 @@ describe('Static File Serving', () => {
       ];
 
       const requests = files.map(file =>
-        axios.get(`/static/${file}`, { timeout: 15000 })
+        axios.get(`/static/${file}`, { timeout: 30000 })
       );
 
       const responses = await Promise.all(requests);
@@ -142,7 +142,7 @@ describe('Static File Serving', () => {
         expect(response.status).toBe(200);
         expect(response.data).toContain(`Mock static file: ${files[index]}`);
       });
-    }, 25000); // QEMU: Extended timeout for concurrent requests
+    }, 60000); // CI: Extended timeout for slow GitHub runners
   });
 
   describe('Directory Traversal Protection', () => {
