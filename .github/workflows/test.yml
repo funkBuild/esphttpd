@@ -60,7 +60,7 @@ jobs:
         run: |
           # Install QEMU dependencies
           sudo apt-get update
-          sudo apt-get install -y libglib2.0-0 libpixman-1-0 libslirp0
+          sudo apt-get install -y libglib2.0-0 libpixman-1-0 libslirp0 libsdl2-2.0-0
 
           # Download pre-built QEMU for ESP32 from Espressif
           wget -q https://github.com/espressif/qemu/releases/download/esp-develop-8.2.0-20240122/qemu-xtensa-softmmu-esp_develop_8.2.0_20240122-x86_64-linux-gnu.tar.xz
