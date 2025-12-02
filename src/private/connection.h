@@ -61,8 +61,8 @@ typedef struct __attribute__((packed)) {
     // Deferred request handling and pool index (1 byte)
     uint8_t deferred : 1;        // Body handling deferred to callbacks (1 bit)
     uint8_t defer_paused : 1;    // Deferred receiving paused (flow control) (1 bit)
+    uint8_t continuation : 1;    // Body handling via continuation callbacks (1 bit)
     uint8_t pool_index : 5;      // Index in connection pool (0-31) for O(1) context lookup
-    uint8_t _reserved : 1;       // Reserved for future use (1 bit)
 
     // Parsing state (2 bytes)
     uint16_t header_bytes;       // Bytes of headers received

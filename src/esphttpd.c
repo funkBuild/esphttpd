@@ -19,6 +19,8 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <errno.h>
+#include <sys/stat.h>
+#include <sys/select.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -225,6 +227,12 @@ typedef struct {
         bool eof_reached;                 // Provider returned 0 (EOF)
         bool use_chunked;                 // Using chunked transfer encoding
     } data_provider;
+    // Continuation-based body handling (non-blocking)
+    struct {
+        httpd_continuation_t handler;     // Continuation handler callback
+        httpd_req_continuation_t cont;    // Continuation state
+        bool active;                      // Continuation mode active
+    } continuation;
 } request_context_t;
 
 // Per-connection WebSocket context
@@ -726,6 +734,7 @@ static void init_request_context(request_context_t* ctx, connection_t* conn) {
 
     // Reset response state
     ctx->req.headers_sent = false;
+    ctx->req.body_started = false;
     ctx->req.user_data = NULL;
     ctx->req.is_websocket = false;
     ctx->req.ws_key[0] = '\0';
@@ -833,6 +842,9 @@ static void store_header_in_req(request_context_t* ctx, const uint8_t* key, uint
 // Server Lifecycle
 // ============================================================================
 
+// Forward declaration for built-in CORS middleware
+static httpd_err_t cors_middleware(httpd_req_t* req, httpd_next_t next);
+
 httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
     if (!handle) return HTTPD_ERR_INVALID_ARG;
 
@@ -889,6 +901,12 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
     server->initialized = true;
     g_server = server;
     *handle = server;
+
+    // Add built-in CORS middleware if enabled
+    if (cfg.enable_cors) {
+        httpd_use(server, cors_middleware);
+        ESP_LOGI(TAG, "CORS enabled (origin: %s)", cfg.cors_origin ? cfg.cors_origin : "*");
+    }
 
     ESP_LOGI(TAG, "Server initialized on port %d", cfg.port);
 
@@ -988,7 +1006,7 @@ httpd_err_t httpd_register_route(httpd_handle_t handle, const httpd_route_t* rou
         return err;
     }
 
-    ESP_LOGI(TAG, "Registered route: %s %s",
+    ESP_LOGD(TAG, "Registered route: %s %s",
              route->method == HTTP_GET ? "GET" :
              route->method == HTTP_POST ? "POST" :
              route->method == HTTP_PUT ? "PUT" :
@@ -1015,7 +1033,7 @@ httpd_err_t httpd_register_ws_route(httpd_handle_t handle, const httpd_ws_route_
     entry->user_ctx = route->user_ctx;
     entry->ping_interval_ms = route->ping_interval_ms;
 
-    ESP_LOGI(TAG, "Registered WebSocket route: %s", route->pattern);
+    ESP_LOGD(TAG, "Registered WebSocket route: %s", route->pattern);
 
     return HTTPD_OK;
 }
@@ -1087,6 +1105,30 @@ httpd_err_t httpd_on_error(httpd_handle_t handle, httpd_err_handler_t handler) {
     server->error_handler = handler;
     ESP_LOGI(TAG, "Set server error handler");
     return HTTPD_OK;
+}
+
+// Built-in CORS middleware
+static httpd_err_t cors_middleware(httpd_req_t* req, httpd_next_t next) {
+    connection_t* conn = (connection_t*)req->_internal;
+    if (!conn) return HTTPD_ERR_CONN_CLOSED;
+
+    // Get CORS origin from server config
+    const char* cors_origin = g_server->config.cors_origin ? g_server->config.cors_origin : "*";
+
+    // Handle OPTIONS preflight requests
+    if (req->method == HTTP_OPTIONS) {
+        httpd_resp_set_status(req, 204);
+        httpd_resp_set_header(req, "Access-Control-Allow-Origin", cors_origin);
+        httpd_resp_set_header(req, "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
+        httpd_resp_set_header(req, "Access-Control-Allow-Headers", "Content-Type, Authorization");
+        httpd_resp_set_header(req, "Access-Control-Max-Age", "86400");
+        return httpd_resp_send(req, NULL, 0);
+    }
+
+    // For all other requests, add CORS headers and continue
+    httpd_resp_set_header(req, "Access-Control-Allow-Origin", cors_origin);
+
+    return next(req);
 }
 
 httpd_err_t httpd_unregister_route(httpd_handle_t handle, http_method_t method, const char* pattern) {
@@ -1207,13 +1249,54 @@ int httpd_req_recv(httpd_req_t* req, void* buf, size_t len) {
     remaining = req->content_length - req->body_received;
     if (remaining > 0 && total_received < len) {
         size_t to_recv = (len - total_received) < remaining ? (len - total_received) : remaining;
-        ssize_t received = recv(conn->fd, (char*)buf + total_received, to_recv, 0);
 
-        if (received > 0) {
-            req->body_received += received;
-            total_received += received;
-        } else if (received < 0 && total_received == 0) {
-            return (int)received; // Return error only if we haven't returned anything
+        // Handle non-blocking socket - wait for data with select()
+        while (1) {
+            ssize_t received = recv(conn->fd, (char*)buf + total_received, to_recv, 0);
+
+            if (received > 0) {
+                req->body_received += received;
+                total_received += received;
+                break;
+            } else if (received == 0) {
+                // Connection closed
+                break;
+            } else {
+                // received < 0
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // Non-blocking socket has no data - wait with select()
+                    fd_set read_fds;
+                    struct timeval tv;
+                    FD_ZERO(&read_fds);
+                    FD_SET(conn->fd, &read_fds);
+                    tv.tv_sec = 30;  // 30 second timeout for body data
+                    tv.tv_usec = 0;
+
+                    int sel = select(conn->fd + 1, &read_fds, NULL, NULL, &tv);
+                    if (sel > 0) {
+                        // Data available, retry recv
+                        continue;
+                    } else if (sel == 0) {
+                        // Timeout
+                        ESP_LOGW(TAG, "recv timeout waiting for body data");
+                        break;
+                    } else {
+                        // select error
+                        ESP_LOGE(TAG, "select error: %s", strerror(errno));
+                        if (total_received == 0) {
+                            return -1;
+                        }
+                        break;
+                    }
+                } else {
+                    // Real error
+                    ESP_LOGE(TAG, "recv error: %s", strerror(errno));
+                    if (total_received == 0) {
+                        return (int)received;
+                    }
+                    break;
+                }
+            }
         }
     }
 
@@ -1308,6 +1391,7 @@ httpd_err_t httpd_resp_send(httpd_req_t* req, const char* body, ssize_t len) {
     if (send_nonblocking(conn, "\r\n", 2, MSG_MORE) < 0) {
         return HTTPD_ERR_IO;
     }
+    req->body_started = true;
 
     // Send body - use blocking send to ensure complete delivery before handler returns.
     // Non-blocking send would queue data to be drained by on_write_ready, but the
@@ -1330,44 +1414,121 @@ httpd_err_t httpd_resp_send_chunk(httpd_req_t* req, const char* chunk, ssize_t l
     connection_t* conn = (connection_t*)req->_internal;
     if (!conn) return HTTPD_ERR_CONN_CLOSED;
 
-    // First chunk - send headers with Transfer-Encoding
-    if (!req->headers_sent) {
-        char status_line[64];
-        int slen = snprintf(status_line, sizeof(status_line),
-                           "HTTP/1.1 %d %s\r\n",
-                           req->status_code, httpd_status_text(req->status_code));
-        if (send_nonblocking(conn, status_line, slen, MSG_MORE) < 0) {
+    send_buffer_t* sb = get_send_buffer(conn);
+    if (!sb) return HTTPD_ERR_NO_MEM;
+
+    // Finalize headers if body hasn't started yet
+    if (!req->body_started) {
+        // Build complete header block: status line + Transfer-Encoding + blank line
+        char header_block[256];
+        int header_len;
+        if (!req->headers_sent) {
+            header_len = snprintf(header_block, sizeof(header_block),
+                               "HTTP/1.1 %d %s\r\nTransfer-Encoding: chunked\r\n\r\n",
+                               req->status_code, httpd_status_text(req->status_code));
+            req->headers_sent = true;
+        } else {
+            header_len = snprintf(header_block, sizeof(header_block),
+                               "Transfer-Encoding: chunked\r\n\r\n");
+        }
+
+        // Queue headers atomically (small enough to always fit)
+        if (send_nonblocking(conn, header_block, header_len, MSG_MORE) < 0) {
             return HTTPD_ERR_IO;
         }
-        if (send_nonblocking(conn, "Transfer-Encoding: chunked\r\n", 28, MSG_MORE) < 0) {
-            return HTTPD_ERR_IO;
-        }
-        if (send_nonblocking(conn, "\r\n", 2, MSG_MORE) < 0) {
-            return HTTPD_ERR_IO;
-        }
-        req->headers_sent = true;
+        req->body_started = true;
+        sb->chunked = 1;
     }
 
     size_t chunk_len = (len >= 0) ? (size_t)len : (chunk ? strlen(chunk) : 0);
 
     if (chunk_len == 0) {
-        // Final chunk
+        // Final chunk "0\r\n\r\n" - always small, queue atomically
         if (send_nonblocking(conn, "0\r\n\r\n", 5, 0) < 0) {
             return HTTPD_ERR_IO;
         }
     } else {
-        // Send chunk size in hex
-        char size_line[16];
-        int size_len = snprintf(size_line, sizeof(size_line), "%zx\r\n", chunk_len);
-        if (send_nonblocking(conn, size_line, size_len, MSG_MORE) < 0) {
-            return HTTPD_ERR_IO;
-        }
-        // Use non-blocking send for chunk data
-        if (send_nonblocking(conn, chunk, chunk_len, MSG_MORE) < 0) {
-            return HTTPD_ERR_IO;
-        }
-        if (send_nonblocking(conn, "\r\n", 2, 0) < 0) {
-            return HTTPD_ERR_IO;
+        // Build complete chunk frame atomically: "size\r\ndata\r\n"
+        // For small chunks, use stack buffer. For large chunks, queue in parts
+        // but ensure each part is complete before moving to next.
+
+        // Build chunk header: "XXXX\r\n" (max 10 bytes for 32-bit size)
+        char size_header[16];
+        int header_len = snprintf(size_header, sizeof(size_header), "%zx\r\n", chunk_len);
+
+        // Calculate total frame size
+        size_t frame_size = header_len + chunk_len + 2;  // +2 for trailing \r\n
+
+        // For small chunks (<=512 bytes total), build complete frame in stack buffer
+        // This ensures atomic queuing for typical use cases
+        if (frame_size <= 512) {
+            uint8_t frame_buf[512];
+            memcpy(frame_buf, size_header, header_len);
+            memcpy(frame_buf + header_len, chunk, chunk_len);
+            memcpy(frame_buf + header_len + chunk_len, "\r\n", 2);
+
+            // Queue entire frame atomically
+            if (send_nonblocking(conn, frame_buf, frame_size, 0) < 0) {
+                return HTTPD_ERR_IO;
+            }
+        } else {
+            // Large chunk: ensure send buffer can accommodate at minimum
+            // the chunk header before proceeding
+
+            // Ensure buffer is allocated
+            if (!sb->allocated && !send_buffer_alloc(sb)) {
+                return HTTPD_ERR_NO_MEM;
+            }
+
+            // First drain any pending data to maximize available space
+            drain_send_buffer(conn);
+
+            // Check if we have enough contiguous space for header + data + trailer
+            size_t space = send_buffer_space(sb);
+            if (space < frame_size) {
+                // Not enough space - try to send header+data in parts
+                // but each syscall must be complete before proceeding
+
+                // Send header first
+                if (send_nonblocking(conn, size_header, header_len, MSG_MORE) < 0) {
+                    return HTTPD_ERR_IO;
+                }
+
+                // Send data
+                if (send_nonblocking(conn, chunk, chunk_len, MSG_MORE) < 0) {
+                    return HTTPD_ERR_IO;
+                }
+
+                // Send terminator
+                if (send_nonblocking(conn, "\r\n", 2, 0) < 0) {
+                    return HTTPD_ERR_IO;
+                }
+            } else {
+                // Enough space - queue atomically using zero-copy write
+                uint8_t* write_ptr;
+                size_t avail = send_buffer_write_ptr(sb, &write_ptr);
+
+                if (avail >= frame_size) {
+                    // Build frame directly in buffer
+                    memcpy(write_ptr, size_header, header_len);
+                    memcpy(write_ptr + header_len, chunk, chunk_len);
+                    memcpy(write_ptr + header_len + chunk_len, "\r\n", 2);
+                    send_buffer_commit(sb, frame_size);
+
+                    // Mark for write
+                    connection_mark_write_pending(&g_server->connection_pool,
+                                                  conn->pool_index, true);
+                } else {
+                    // Contiguous space not enough (wrap-around) - use queue
+                    if (send_buffer_queue(sb, size_header, header_len) < 0 ||
+                        send_buffer_queue(sb, chunk, chunk_len) < 0 ||
+                        send_buffer_queue(sb, "\r\n", 2) < 0) {
+                        return HTTPD_ERR_IO;
+                    }
+                    connection_mark_write_pending(&g_server->connection_pool,
+                                                  conn->pool_index, true);
+                }
+            }
         }
     }
 
@@ -1387,16 +1548,41 @@ httpd_err_t httpd_resp_send_error(httpd_req_t* req, int status, const char* mess
 httpd_err_t httpd_resp_sendfile(httpd_req_t* req, const char* path) {
     if (!req || !path) return HTTPD_ERR_INVALID_ARG;
 
-    if (!g_server || !g_server->filesystem_enabled) {
+    // Validate path for security (no directory traversal)
+    if (strstr(path, "..") != NULL) {
+        return httpd_resp_send_error(req, 403, "Forbidden");
+    }
+
+    // Get file info
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
         return httpd_resp_send_error(req, 404, "File not found");
     }
 
-    connection_t* conn = (connection_t*)req->_internal;
-    if (filesystem_serve_file(g_server->filesystem, conn, path, false) < 0) {
+    // Open file
+    FILE* f = fopen(path, "rb");
+    if (!f) {
         return httpd_resp_send_error(req, 404, "File not found");
     }
 
-    return HTTPD_OK;
+    // Set content type based on extension
+    const char* mime_type = filesystem_get_mime_type(path);
+    httpd_resp_set_type(req, mime_type);
+
+    // Send file using chunked transfer
+    char chunk[512];
+    size_t bytes_read;
+    while ((bytes_read = fread(chunk, 1, sizeof(chunk), f)) > 0) {
+        if (httpd_resp_send_chunk(req, chunk, bytes_read) != HTTPD_OK) {
+            fclose(f);
+            return HTTPD_ERR_IO;
+        }
+    }
+
+    fclose(f);
+
+    // Send final empty chunk
+    return httpd_resp_send_chunk(req, NULL, 0);
 }
 
 httpd_err_t httpd_resp_send_json(httpd_req_t* req, const char* json) {
@@ -1807,6 +1993,97 @@ httpd_err_t httpd_req_defer_to_file(httpd_req_t* req, const char* path, httpd_do
     ESP_LOGI(TAG, "Deferring body to file: %s (content_length=%zu)", path, req->content_length);
 
     return httpd_req_defer(req, defer_file_body_cb, defer_file_done_cb);
+}
+
+// ============================================================================
+// Continuation-Based Body Reception (Non-Blocking)
+// ============================================================================
+
+httpd_err_t httpd_req_continue(httpd_req_t* req, httpd_continuation_t handler,
+                               void* handler_state) {
+    if (!req || !handler) {
+        return HTTPD_ERR_INVALID_ARG;
+    }
+
+    connection_t* conn = (connection_t*)req->_internal;
+    if (!conn) {
+        return HTTPD_ERR_CONN_CLOSED;
+    }
+
+    // Can't use both deferred and continuation
+    if (conn->deferred) {
+        ESP_LOGE(TAG, "Cannot use continuation mode - already in deferred mode");
+        return HTTPD_ERR_INVALID_ARG;
+    }
+
+    request_context_t* ctx = (request_context_t*)((char*)req - offsetof(request_context_t, req));
+
+    // Set up continuation state
+    ctx->continuation.handler = handler;
+    ctx->continuation.cont.state = handler_state;
+    ctx->continuation.cont.phase = 0;
+    ctx->continuation.cont.expected_bytes = 0;
+    ctx->continuation.cont.received_bytes = 0;
+    ctx->continuation.active = true;
+    conn->continuation = 1;
+
+    // Transition to body state
+    conn->state = CONN_STATE_HTTP_BODY;
+
+    ESP_LOGD(TAG, "Request using continuation mode, content_length=%zu, already_received=%zu",
+             req->content_length, req->body_received);
+
+    // Call handler for initial setup (data=NULL, len=0)
+    httpd_err_t err = handler(req, NULL, 0, &ctx->continuation.cont);
+
+    // Deliver any pre-received body data that came with headers
+    if (err == HTTPD_ERR_WOULD_BLOCK && ctx->body_buf && ctx->body_buf_len > ctx->body_buf_pos) {
+        size_t pre_data_len = ctx->body_buf_len - ctx->body_buf_pos;
+        err = handler(req, &ctx->body_buf[ctx->body_buf_pos], pre_data_len, &ctx->continuation.cont);
+        req->body_received += pre_data_len;
+        ctx->continuation.cont.received_bytes += pre_data_len;
+
+        // Free body buffer after consuming
+        free(ctx->body_buf);
+        ctx->body_buf = NULL;
+        ctx->body_buf_len = 0;
+        ctx->body_buf_pos = 0;
+    }
+
+    // Check result
+    if (err == HTTPD_ERR_WOULD_BLOCK) {
+        // Handler wants to wait for more data - this is expected
+        // Check if body is already complete
+        if (req->content_length > 0 && req->body_received >= req->content_length) {
+            ESP_LOGD(TAG, "Body already complete, calling handler with completion");
+            // Call handler one more time to signal completion
+            err = handler(req, NULL, 0, &ctx->continuation.cont);
+        }
+    }
+
+    if (err != HTTPD_OK && err != HTTPD_ERR_WOULD_BLOCK) {
+        // Handler returned error - clean up
+        ctx->continuation.active = false;
+        conn->continuation = 0;
+        return err;
+    }
+
+    if (err == HTTPD_OK) {
+        // Handler finished immediately
+        ctx->continuation.active = false;
+        conn->continuation = 0;
+    }
+
+    return HTTPD_OK;
+}
+
+bool httpd_req_is_continuation(httpd_req_t* req) {
+    if (!req) {
+        return false;
+    }
+
+    request_context_t* ctx = (request_context_t*)((char*)req - offsetof(request_context_t, req));
+    return ctx->continuation.active;
 }
 
 // ============================================================================
@@ -2359,6 +2636,19 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
     ctx->req.base_url = NULL;
     ctx->req.base_url_len = 0;
 
+    // Handle CORS preflight requests before route matching
+    // This allows OPTIONS requests to succeed even without explicit OPTIONS routes
+    if (g_server->config.enable_cors && ctx->req.method == HTTP_OPTIONS) {
+        const char* cors_origin = g_server->config.cors_origin ? g_server->config.cors_origin : "*";
+        httpd_resp_set_status(&ctx->req, 204);
+        httpd_resp_set_header(&ctx->req, "Access-Control-Allow-Origin", cors_origin);
+        httpd_resp_set_header(&ctx->req, "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
+        httpd_resp_set_header(&ctx->req, "Access-Control-Allow-Headers", "Content-Type, Authorization");
+        httpd_resp_set_header(&ctx->req, "Access-Control-Max-Age", "86400");
+        httpd_resp_send(&ctx->req, NULL, 0);
+        return;
+    }
+
     // Check WebSocket routes first (before HTTP routes which may have catch-all patterns)
     if (ctx->req.is_websocket) {
         for (int i = 0; i < g_server->ws_route_count; i++) {
@@ -2584,15 +2874,59 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
 }
 
 static void on_http_body(connection_t* conn, uint8_t* buffer, size_t len) {
-    // Quick check using connection bitfield - avoids context lookup for non-deferred
-    // This is the hot path optimization: conn->deferred is O(1) vs get_request_context
-    if (!conn->deferred) {
-        // Non-deferred: body is received via blocking httpd_req_recv()
+    // Quick check using connection bitfields - avoids context lookup for sync handlers
+    // This is the hot path optimization: bitfields are O(1) vs get_request_context
+    if (!conn->deferred && !conn->continuation) {
+        // Non-deferred/non-continuation: body is received via blocking httpd_req_recv()
         return;
     }
 
     request_context_t* ctx = get_request_context(conn);
-    if (!ctx || !ctx->defer.active) return;
+    if (!ctx) return;
+
+    // Handle continuation-based body reception (non-blocking)
+    if (conn->continuation && ctx->continuation.active) {
+        ESP_LOGD(TAG, "Continuation body: received %zu bytes", len);
+
+        // Call continuation handler
+        httpd_err_t err = ctx->continuation.handler(&ctx->req, buffer, len,
+                                                     &ctx->continuation.cont);
+
+        // Track received bytes
+        ctx->req.body_received += len;
+        ctx->continuation.cont.received_bytes += len;
+
+        ESP_LOGD(TAG, "Continuation body: total %zu/%zu, handler returned %d",
+                 ctx->req.body_received, ctx->req.content_length, err);
+
+        if (err == HTTPD_ERR_WOULD_BLOCK) {
+            // Handler wants more data - check if body is complete
+            if (ctx->req.content_length > 0 &&
+                ctx->req.body_received >= ctx->req.content_length) {
+                ESP_LOGD(TAG, "Continuation body complete, calling handler");
+                // Call handler one more time to signal completion
+                err = ctx->continuation.handler(&ctx->req, NULL, 0,
+                                                 &ctx->continuation.cont);
+            }
+        }
+
+        if (err != HTTPD_OK && err != HTTPD_ERR_WOULD_BLOCK) {
+            // Handler returned error - clean up
+            ESP_LOGW(TAG, "Continuation handler returned error: %d", err);
+            ctx->continuation.active = false;
+            conn->continuation = 0;
+            conn->state = CONN_STATE_CLOSING;
+        } else if (err == HTTPD_OK) {
+            // Handler finished successfully
+            ctx->continuation.active = false;
+            conn->continuation = 0;
+            // Connection stays open for the response to be sent
+        }
+        return;
+    }
+
+    // Handle deferred body reception
+    if (!ctx->defer.active) return;
 
     // Skip if paused (flow control)
     if (ctx->defer.paused) {

@@ -12,6 +12,7 @@ idf_component_register(
         "test_performance.c"
         "test_send_buffer.c"
         "test_filesystem.c"
+        "test_nonblocking.c"
     INCLUDE_DIRS "."
     REQUIRES unity esphttpd
     PRIV_REQUIRES esp_timer

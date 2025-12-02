@@ -35,6 +35,7 @@ typedef enum {
     HTTPD_ERR_PARSE = -10,           ///< Parse error
     HTTPD_ERR_WS_REJECTED = -11,     ///< WebSocket rejected
     HTTPD_ERR_MIDDLEWARE = -12,      ///< Middleware error
+    HTTPD_ERR_WOULD_BLOCK = -13,     ///< Operation would block (non-blocking mode)
 } httpd_err_t;
 
 // ============================================================================
@@ -242,7 +243,8 @@ struct httpd_request {
     size_t body_received;            ///< Bytes of body received
 
     // Response state
-    bool headers_sent;               ///< Response headers already sent
+    bool headers_sent;               ///< Response status line sent
+    bool body_started;               ///< Body transmission started (headers finalized)
     int status_code;                 ///< Response status code
 
     // User data
@@ -945,6 +947,109 @@ bool httpd_req_is_deferred(httpd_req_t* req);
  * @endcode
  */
 httpd_err_t httpd_req_defer_to_file(httpd_req_t* req, const char* path, httpd_done_cb_t on_done);
+
+// ============================================================================
+// Continuation-Based Body Reception (Non-Blocking)
+// ============================================================================
+
+/**
+ * @brief Continuation state for tracking handler progress
+ *
+ * This structure is passed to continuation handlers to track state
+ * across multiple invocations as body data arrives.
+ */
+typedef struct {
+    void* state;                     ///< Handler-specific state (user-provided)
+    uint8_t phase;                   ///< Handler phase (user-defined)
+    size_t expected_bytes;           ///< Bytes expected in current phase
+    size_t received_bytes;           ///< Bytes received in current phase
+} httpd_req_continuation_t;
+
+/**
+ * @brief Continuation handler callback
+ *
+ * Called when body data arrives or when handler should continue processing.
+ * This callback MUST NOT block - it should process available data and return.
+ *
+ * @param req Request context
+ * @param data Received body data (NULL on initial call or phase transition)
+ * @param len Length of data (0 if no data)
+ * @param cont Continuation state for tracking progress
+ * @return HTTPD_OK when done, HTTPD_ERR_WOULD_BLOCK to wait for more data,
+ *         or other error code to abort
+ *
+ * Return value meanings:
+ * - HTTPD_OK: Handler finished successfully, response should be sent
+ * - HTTPD_ERR_WOULD_BLOCK: Waiting for more body data
+ * - Other error: Abort the request with error response
+ */
+typedef httpd_err_t (*httpd_continuation_t)(httpd_req_t* req, const void* data,
+                                            size_t len, httpd_req_continuation_t* cont);
+
+/**
+ * @brief Set up continuation-based body handling (non-blocking)
+ *
+ * This is the non-blocking alternative to httpd_req_recv(). Instead of
+ * blocking to wait for body data, the handler returns immediately and
+ * gets called back when data arrives.
+ *
+ * Flow:
+ * 1. Handler calls httpd_req_continue() to set up continuation
+ * 2. Handler returns HTTPD_OK
+ * 3. Continuation is called with data=NULL for initial setup
+ * 4. As body data arrives, continuation is called with data
+ * 5. Continuation returns HTTPD_ERR_WOULD_BLOCK to wait for more
+ * 6. When done, continuation sends response and returns HTTPD_OK
+ *
+ * @param req Request context
+ * @param handler Continuation handler (must not block)
+ * @param handler_state User-defined state passed to handler
+ * @return HTTPD_OK on success
+ *
+ * Example (OTA upload):
+ * @code
+ * typedef struct {
+ *     esp_ota_handle_t handle;
+ *     size_t received;
+ * } ota_state_t;
+ *
+ * static httpd_err_t ota_continuation(httpd_req_t* req, const void* data,
+ *                                     size_t len, httpd_req_continuation_t* cont) {
+ *     ota_state_t* state = cont->state;
+ *
+ *     if (data && len > 0) {
+ *         esp_ota_write(state->handle, data, len);
+ *         state->received += len;
+ *         cont->received_bytes += len;
+ *
+ *         if (state->received >= req->content_length) {
+ *             esp_ota_end(state->handle);
+ *             httpd_resp_send_json(req, "{\"status\":\"ok\"}");
+ *             free(state);
+ *             return HTTPD_OK;
+ *         }
+ *     }
+ *     return HTTPD_ERR_WOULD_BLOCK;  // Wait for more data
+ * }
+ *
+ * static httpd_err_t handle_ota(httpd_req_t* req) {
+ *     ota_state_t* state = malloc(sizeof(ota_state_t));
+ *     esp_ota_begin(&state->handle);
+ *     state->received = 0;
+ *     return httpd_req_continue(req, ota_continuation, state);
+ * }
+ * @endcode
+ */
+httpd_err_t httpd_req_continue(httpd_req_t* req, httpd_continuation_t handler,
+                               void* handler_state);
+
+/**
+ * @brief Check if request is using continuation-based body handling
+ *
+ * @param req Request context
+ * @return true if httpd_req_continue() was called
+ */
+bool httpd_req_is_continuation(httpd_req_t* req);
 
 // ============================================================================
 // Authentication

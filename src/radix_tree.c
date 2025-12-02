@@ -240,7 +240,7 @@ httpd_err_t radix_insert(radix_tree_t* tree, const char* pattern,
                          uint8_t middleware_count) {
     if (!tree || !pattern || !handler) return HTTPD_ERR_INVALID_ARG;
 
-    ESP_LOGI(TAG, "Inserting route: pattern='%s', method=%d", pattern, method);
+    ESP_LOGD(TAG, "Inserting route: pattern='%s', method=%d", pattern, method);
 
     // Check if pattern has trailing slash (for strict mode)
     size_t pattern_len = strlen(pattern);
@@ -372,7 +372,7 @@ httpd_err_t radix_insert(radix_tree_t* tree, const char* pattern,
     }
 
     tree->route_count++;
-    ESP_LOGI(TAG, "Route inserted successfully (total routes=%d, nodes=%d)",
+    ESP_LOGD(TAG, "Route inserted successfully (total routes=%d, nodes=%d)",
              tree->route_count, tree->node_count);
     return HTTPD_OK;
 }
@@ -384,7 +384,7 @@ httpd_err_t radix_insert_ws(radix_tree_t* tree, const char* pattern,
                             uint8_t middleware_count) {
     if (!tree || !pattern || !handler) return HTTPD_ERR_INVALID_ARG;
 
-    ESP_LOGI(TAG, "Inserting WebSocket route: pattern='%s'", pattern);
+    ESP_LOGD(TAG, "Inserting WebSocket route: pattern='%s'", pattern);
 
     radix_node_t* node = tree->root;
     const char* p = pattern;
@@ -472,7 +472,7 @@ httpd_err_t radix_insert_ws(radix_tree_t* tree, const char* pattern,
     }
 
     tree->route_count++;
-    ESP_LOGI(TAG, "WebSocket route inserted successfully");
+    ESP_LOGD(TAG, "WebSocket route inserted successfully");
     return HTTPD_OK;
 }
 
