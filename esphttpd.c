@@ -8,6 +8,7 @@
 #include "sha/sha_parallel_engine.h"
 #include <errno.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -960,7 +961,13 @@ static void webserver_ws_task(void* pvParameter) {
         for (int i = 0; i < 8; i++) {
           extended_payload_length = (extended_payload_length << 8) | ptr[i];
         }
-        event.len = extended_payload_length;
+        // Reject payload lengths that would overflow 32-bit unsigned int
+        if (extended_payload_length > UINT32_MAX) {
+          ESP_LOGE(TAG, "WebSocket payload length exceeds maximum supported size");
+          free(data);
+          continue;
+        }
+        event.len = (unsigned int)extended_payload_length;
         ptr += 8;
       }
 
