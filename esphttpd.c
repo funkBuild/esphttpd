@@ -7,6 +7,7 @@
 #include "mbedtls/base64.h"
 #include "sha/sha_parallel_engine.h"
 #include <errno.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -31,6 +32,7 @@
 
 #define SEND_BUFFER_SIZE 1024
 #define RCV_BUFFER_SIZE 1024
+#define WS_MAX_PAYLOAD_LEN 1024
 
 static TaskHandle_t esphttpd_task_handle = NULL;
 static EventGroupHandle_t esphttpd_event_group = NULL;
@@ -968,6 +970,12 @@ static void webserver_ws_task(void* pvParameter) {
         }
         event.len = (unsigned int)extended_payload_length;
         ptr += 8;
+      }
+
+      if (event.len > WS_MAX_PAYLOAD_LEN) {
+        ESP_LOGE(TAG, "WebSocket payload too large: %" PRIu32 " bytes (max %d)", (uint32_t)event.len, WS_MAX_PAYLOAD_LEN);
+        free(data);
+        break;
       }
 
       // Read the masking key if present
