@@ -838,8 +838,7 @@ void webserver_accept_ws(ws_ctx* ctx) {
     return;
   }
 
-  strcpy(ws_concat_keys, ws_client_key);
-  strcat(ws_concat_keys, ws_sec_key);
+  snprintf(ws_concat_keys, ws_concat_keys_length, "%s%s", ws_client_key, ws_sec_key);
 
   unsigned char sha1_result[20];
   esp_sha(SHA1, (unsigned char*)ws_concat_keys, strlen(ws_concat_keys), sha1_result);
@@ -1437,6 +1436,7 @@ void webserver_stop() {
   }
 
   vEventGroupDelete(esphttpd_event_group);
+  esphttpd_event_group = NULL;
 
   vSemaphoreDelete(ws_connection_semaphore);
   vSemaphoreDelete(ws_task_count_semaphore);
