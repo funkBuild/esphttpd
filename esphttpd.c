@@ -117,7 +117,7 @@ void webserver_send_body(http_req* req, const char* body, unsigned int body_len)
     unsigned int len = 512;
     if (offset + len > body_len) len = body_len - offset;
 
-    err = netconn_write(req->conn, body + offset, len, NETCONN_NOCOPY);
+    err = netconn_write(req->conn, body + offset, len, NETCONN_COPY);
     if (err != ERR_OK) {
       ESP_LOGE(TAG, "Error occurred during sending: %d", err);
       break;
@@ -1279,16 +1279,14 @@ static void webserver_serve(struct netconn* conn) {
 
   dispatch_request(req);
 
-  // Cleanup (only if not WebSocket - WS takes ownership)
-  if (req->method != WS) {
-    webserver_free_request_headers(req);
-    if (req->url) {
-      free(req->url);
-      req->url = NULL;
-    }
-    webserver_free_params(req);
-    free(req);
+  // Cleanup request memory (WS task takes ownership of the connection only)
+  webserver_free_request_headers(req);
+  if (req->url) {
+    free(req->url);
+    req->url = NULL;
   }
+  webserver_free_params(req);
+  free(req);
 }
 
 void webserver_add_route(http_route new_route) {
