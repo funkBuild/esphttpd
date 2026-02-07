@@ -1428,17 +1428,18 @@ void webserver_stop() {
   // Request shutdown
   xEventGroupSetBits(esphttpd_event_group, TASK_REQUEST_SHUTDOWN_BIT);
 
-  // Wait for shutdown
-  xEventGroupWaitBits(esphttpd_event_group, TASK_SHUTDOWN_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+  // Wait for shutdown (bounded — avoid infinite hang if webserver task is stuck)
+  xEventGroupWaitBits(esphttpd_event_group, TASK_SHUTDOWN_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(30000));
 
-  while (true) {
-    xSemaphoreTake(ws_task_count_semaphore, portMAX_DELAY);
+  // Wait for WebSocket tasks to finish (bounded to 10s)
+  for (int i = 0; i < 100; i++) {
+    xSemaphoreTake(ws_task_count_semaphore, pdMS_TO_TICKS(1000));
     if (active_ws_task_count == 0) {
       xSemaphoreGive(ws_task_count_semaphore);
       break;
     }
     xSemaphoreGive(ws_task_count_semaphore);
-    vTaskDelay(100 / portTICK_PERIOD_MS);  // Wait before checking again
+    vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 
   vEventGroupDelete(esphttpd_event_group);
