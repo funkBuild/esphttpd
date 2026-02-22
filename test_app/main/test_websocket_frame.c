@@ -631,6 +631,28 @@ static void test_compute_accept_key_another_key(void)
     TEST_ASSERT_EQUAL('=', accept_key[27]);
 }
 
+// Test accept key output is always base64 format
+static void test_ws_accept_key_format(void)
+{
+    char accept_key[64] = {0};
+    const char* client_key = "dGhlIHNhbXBsZSBub25jZQ==";
+
+    ws_compute_accept_key(client_key, accept_key, sizeof(accept_key));
+
+    // Base64 encoded strings only contain: A-Z, a-z, 0-9, +, /, =
+    for (size_t i = 0; i < strlen(accept_key); i++) {
+        char c = accept_key[i];
+        bool valid = (c >= 'A' && c <= 'Z') ||
+                    (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9') ||
+                    c == '+' || c == '/' || c == '=';
+        TEST_ASSERT_TRUE_MESSAGE(valid, "Accept key contains invalid base64 character");
+    }
+
+    // Should end with = padding (SHA1 is 20 bytes, base64 is 28 chars with 1 pad)
+    TEST_ASSERT_EQUAL('=', accept_key[strlen(accept_key) - 1]);
+}
+
 // Test accept key is deterministic
 static void test_compute_accept_key_deterministic(void)
 {
@@ -682,6 +704,23 @@ static void test_compute_accept_key_empty(void)
     TEST_ASSERT_TRUE(strlen(accept_key) > 0);
 }
 
+// Test different client keys produce different accept keys
+static void test_ws_accept_key_uniqueness(void)
+{
+    char accept1[64] = {0};
+    char accept2[64] = {0};
+    char accept3[64] = {0};
+
+    ws_compute_accept_key("key1AAAAAAAAAAAAAAAAaa==", accept1, sizeof(accept1));
+    ws_compute_accept_key("key2BBBBBBBBBBBBBBBBBB==", accept2, sizeof(accept2));
+    ws_compute_accept_key("key3CCCCCCCCCCCCCCCCCC==", accept3, sizeof(accept3));
+
+    // All should be different
+    TEST_ASSERT_NOT_EQUAL_MESSAGE(0, strcmp(accept1, accept2), "accept1 and accept2 should differ");
+    TEST_ASSERT_NOT_EQUAL_MESSAGE(0, strcmp(accept2, accept3), "accept2 and accept3 should differ");
+    TEST_ASSERT_NOT_EQUAL_MESSAGE(0, strcmp(accept1, accept3), "accept1 and accept3 should differ");
+}
+
 void test_websocket_frame_run(void)
 {
     // Core functionality tests
@@ -725,10 +764,12 @@ void test_websocket_frame_run(void)
     // WebSocket handshake tests
     RUN_TEST(test_compute_accept_key_rfc6455);
     RUN_TEST(test_compute_accept_key_another_key);
+    RUN_TEST(test_ws_accept_key_format);
     RUN_TEST(test_compute_accept_key_deterministic);
     RUN_TEST(test_compute_accept_key_short_key);
     RUN_TEST(test_compute_accept_key_small_buffer);
     RUN_TEST(test_compute_accept_key_empty);
+    RUN_TEST(test_ws_accept_key_uniqueness);
 
     ESP_LOGI(TAG, "WebSocket frame tests completed");
 }

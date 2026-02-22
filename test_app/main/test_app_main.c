@@ -21,6 +21,10 @@ void test_performance_run(void);
 void test_send_buffer_run(void);
 void test_filesystem_run(void);
 void test_nonblocking_run(void);
+void test_http_api_run(void);
+void test_router_api_run(void);
+void test_websocket_api_run(void);
+void test_middleware_run(void);
 
 void app_main(void)
 {
@@ -65,6 +69,18 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Running Non-blocking I/O tests...");
     test_nonblocking_run();
+
+    ESP_LOGI(TAG, "Running HTTP API tests...");
+    test_http_api_run();
+
+    ESP_LOGI(TAG, "Running Router API tests...");
+    test_router_api_run();
+
+    ESP_LOGI(TAG, "Running WebSocket API tests...");
+    test_websocket_api_run();
+
+    ESP_LOGI(TAG, "Running Middleware tests...");
+    test_middleware_run();
 
     ESP_LOGI(TAG, "Running Performance benchmarks...");
     test_performance_run();

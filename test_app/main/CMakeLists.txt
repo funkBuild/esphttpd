@@ -13,6 +13,10 @@ idf_component_register(
         "test_send_buffer.c"
         "test_filesystem.c"
         "test_nonblocking.c"
+        "test_http_api.c"
+        "test_router_api.c"
+        "test_websocket_api.c"
+        "test_middleware.c"
     INCLUDE_DIRS "."
     REQUIRES unity esphttpd
     PRIV_REQUIRES esp_timer

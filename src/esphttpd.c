@@ -260,6 +260,16 @@ static filesystem_t fs_instance;
 // WebSocket client key buffer (used by http_parser)
 char ws_client_key[32] = {0};
 
+// Per-connection contexts
+static request_context_t request_contexts[MAX_CONNECTIONS];
+static ws_context_t ws_contexts[MAX_CONNECTIONS];
+
+#ifdef CONFIG_ESPHTTPD_TEST_MODE
+// Export request_contexts for test access (via void* cast for type safety)
+void* g_test_request_contexts = (void*)request_contexts;
+#endif
+
+
 // Track current connection being parsed (for header storage callback)
 static connection_t* g_parsing_connection = NULL;
 
@@ -2202,13 +2212,14 @@ httpd_err_t httpd_ws_send(httpd_ws_t* ws, const void* data, size_t len, ws_type_
 }
 
 httpd_err_t httpd_ws_send_text(httpd_ws_t* ws, const char* text) {
+    if (!text) return HTTPD_ERR_INVALID_ARG;
     return httpd_ws_send(ws, text, strlen(text), WS_TYPE_TEXT);
 }
 
 int httpd_ws_broadcast(httpd_handle_t handle, const char* pattern,
                        const void* data, size_t len, ws_type_t type) {
     struct httpd_server* server = handle;
-    if (!server) return -1;
+    if (!server || !pattern || !data) return -1;
 
     ws_opcode_internal_t opcode = (type == WS_TYPE_BINARY) ? WS_OPCODE_BINARY : WS_OPCODE_TEXT;
     int sent = 0;
@@ -2339,7 +2350,7 @@ static int find_or_create_channel(const char* channel) {
 }
 
 httpd_err_t httpd_ws_join(httpd_ws_t* ws, const char* channel) {
-    if (!ws || !channel) return HTTPD_ERR_INVALID_ARG;
+    if (!ws || !channel || channel[0] == '\0') return HTTPD_ERR_INVALID_ARG;
 
     ws_context_t* ctx = get_ws_context_from_ws(ws);
     if (!ctx) return HTTPD_ERR_INVALID_ARG;
@@ -2392,7 +2403,7 @@ bool httpd_ws_in_channel(httpd_ws_t* ws, const char* channel) {
 int httpd_ws_publish(httpd_handle_t handle, const char* channel,
                      const void* data, size_t len, ws_type_t type) {
     struct httpd_server* server = (struct httpd_server*)handle;
-    if (!server || !channel || !data) return 0;
+    if (!server || !channel || !data) return -1;
 
     int idx = find_channel(channel);
     if (idx < 0) return 0;
@@ -2498,6 +2509,13 @@ static httpd_err_t _middleware_next(httpd_req_t* req) {
 
     return HTTPD_OK;
 }
+
+#ifdef CONFIG_ESPHTTPD_TEST_MODE
+// Export _middleware_next for test access
+httpd_err_t _middleware_next_test(httpd_req_t* req) {
+    return _middleware_next(req);
+}
+#endif
 
 static httpd_err_t handle_error(httpd_err_t err, httpd_req_t* req) {
     // Check router's error handler first

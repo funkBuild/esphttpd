@@ -90,6 +90,58 @@ typedef struct {
 // Global server instance accessible to tests
 extern esphttpd_server_t* g_server;
 
+// Export _middleware_next for testing
+httpd_err_t _middleware_next_test(httpd_req_t* req);
+
+// Query parameter cache entry (must match esphttpd.c)
+typedef struct {
+    const char* key;
+    const char* value;
+    uint8_t key_len;
+    uint8_t value_len;
+} test_query_param_entry_t;
+
+#define MAX_QUERY_PARAMS 8
+#define REQ_HEADER_BUF_SIZE 2048
+#define MAX_REQ_HEADERS 32  // Must match esphttpd.c
+
+// Request header entry (must match esphttpd.c)
+typedef struct {
+    uint16_t key_offset;
+    uint16_t value_offset;
+    uint8_t key_len;
+    uint8_t value_len;
+} test_req_header_entry_t;
+
+// Per-connection request context (must match esphttpd.c)
+typedef struct {
+    httpd_req_t req;                      // Public request struct
+    test_req_header_entry_t headers[MAX_REQ_HEADERS];  // Header index
+    char header_buf[REQ_HEADER_BUF_SIZE]; // Header storage
+    char uri_buf[256];                    // URI storage
+    struct httpd_server* server;          // Back pointer to server
+    void* matched_route;                  // Matched route
+    // Pre-received body data (received with headers)
+    uint8_t body_buf[1024];               // Buffer for body data received with headers
+    size_t body_buf_len;                  // Amount of data in body_buf
+    size_t body_buf_pos;                  // Current read position in body_buf
+    // Query parameter cache (lazy parsing)
+    test_query_param_entry_t query_params[MAX_QUERY_PARAMS];
+    uint8_t query_param_count;
+    bool query_parsed;
+    // Deferred (async) body handling
+    struct {
+        httpd_body_cb_t on_body;          // Body data callback
+        httpd_done_cb_t on_done;          // Completion callback
+        void* file_ctx;                   // Internal context for defer_to_file
+        bool active;                      // Request is in deferred mode
+        bool paused;                      // Flow control - receiving paused
+    } defer;
+} test_request_context_t;
+
+// Global request_contexts array accessible to tests (via void* for type safety)
+extern void* g_test_request_contexts;
+
 #endif // CONFIG_ESPHTTPD_TEST_MODE
 
 #endif // _TEST_EXPORTS_H_

@@ -659,13 +659,8 @@ radix_match_t radix_lookup(radix_tree_t* tree, const char* path,
             }
         }
 
-        // Only collect terminal middleware if we matched (using memcpy)
-        if (result.matched && node->middleware_count > 0) {
-            uint8_t avail = CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE - mw_count;
-            uint8_t to_copy = node->middleware_count < avail ? node->middleware_count : avail;
-            memcpy(&mw_stack[mw_count], node->middlewares, to_copy * sizeof(httpd_middleware_t));
-            mw_count += to_copy;
-        }
+        // Note: Terminal middleware is already collected during traversal at collect_middleware label
+        // so we don't collect it again here to avoid duplicates
 
         // Allocate and copy middleware if matched
         if (result.matched && mw_count > 0) {

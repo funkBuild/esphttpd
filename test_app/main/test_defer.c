@@ -5,6 +5,7 @@
 #include "esp_log.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stddef.h>
 
 static const char* TAG = "TEST_DEFER";
 
@@ -14,6 +15,8 @@ static size_t body_callback_count = 0;
 static bool done_callback_called = false;
 static httpd_err_t done_callback_error = HTTPD_OK;
 static httpd_handle_t test_handle = NULL;
+static const uint8_t* last_body_data = NULL;
+static size_t last_body_len = 0;
 
 // Reset test state
 static void reset_test_state(void) {
@@ -21,6 +24,8 @@ static void reset_test_state(void) {
     body_callback_count = 0;
     done_callback_called = false;
     done_callback_error = HTTPD_OK;
+    last_body_data = NULL;
+    last_body_len = 0;
 }
 
 // Helper to start server for tests
@@ -42,7 +47,8 @@ static void stop_test_server(void) {
 
 static httpd_err_t test_body_callback(httpd_req_t* req, const void* data, size_t len) {
     (void)req;
-    (void)data;
+    last_body_data = (const uint8_t*)data;
+    last_body_len = len;
     body_bytes_received += len;
     body_callback_count++;
     ESP_LOGD(TAG, "Body callback: received %zu bytes (total: %zu)", len, body_bytes_received);
@@ -229,21 +235,570 @@ static void test_callback_type_compatibility(void) {
     TEST_ASSERT_NOT_NULL(error_cb);
 }
 
+// Helper to get request context by index
+static test_request_context_t* get_test_ctx(int idx) {
+    if (!g_test_request_contexts) return NULL;
+    return &((test_request_context_t*)g_test_request_contexts)[idx];
+}
+
+// Test httpd_req_defer with full request context
+static void test_defer_with_request_context(void) {
+    start_test_server();
+    reset_test_state();
+
+    TEST_ASSERT_NOT_NULL(g_server);
+    TEST_ASSERT_NOT_NULL(g_test_request_contexts);
+
+    connection_pool_t* pool = &g_server->connection_pool;
+    int idx = 0;
+    connection_t* conn = connection_get(pool, idx);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    // Set up connection
+    conn->fd = 999;  // Fake fd
+    conn->state = CONN_STATE_HTTP_HEADERS;
+    conn->deferred = 0;
+    conn->defer_paused = 0;
+    conn->pool_index = idx;
+    conn->content_length = 100;
+    conn->bytes_received = 0;
+
+    // Set up request context
+    test_request_context_t* ctx = get_test_ctx(idx);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->req._internal = conn;
+    ctx->req.content_length = 100;
+    ctx->req.body_received = 0;
+    ctx->body_buf_len = 0;
+    ctx->body_buf_pos = 0;
+    ctx->defer.active = false;
+    ctx->defer.paused = false;
+
+    // Call httpd_req_defer
+    httpd_err_t err = httpd_req_defer(&ctx->req, test_body_callback, test_done_callback);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
+
+    // Verify deferred state
+    TEST_ASSERT_TRUE(ctx->defer.active);
+    TEST_ASSERT_FALSE(ctx->defer.paused);
+    TEST_ASSERT_EQUAL(1, conn->deferred);
+    TEST_ASSERT_EQUAL(0, conn->defer_paused);
+    TEST_ASSERT_EQUAL(CONN_STATE_HTTP_BODY, conn->state);
+
+    // Body not complete yet, done_callback should not be called
+    TEST_ASSERT_FALSE(done_callback_called);
+
+    stop_test_server();
+}
+
+// Test httpd_req_defer delivers pre-received body data
+static void test_defer_pre_received_body(void) {
+    start_test_server();
+    reset_test_state();
+
+    TEST_ASSERT_NOT_NULL(g_server);
+    TEST_ASSERT_NOT_NULL(g_test_request_contexts);
+
+    connection_pool_t* pool = &g_server->connection_pool;
+    int idx = 0;
+    connection_t* conn = connection_get(pool, idx);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    // Set up connection
+    conn->fd = 999;
+    conn->state = CONN_STATE_HTTP_HEADERS;
+    conn->deferred = 0;
+    conn->defer_paused = 0;
+    conn->pool_index = idx;
+    conn->content_length = 50;
+    conn->bytes_received = 0;
+
+    // Set up request context with pre-received body data
+    test_request_context_t* ctx = get_test_ctx(idx);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->req._internal = conn;
+    ctx->req.content_length = 50;
+    ctx->req.body_received = 0;
+
+    // Put some data in the body buffer (simulating data received with headers)
+    const uint8_t test_data[] = "Hello, World!";
+    memcpy(ctx->body_buf, test_data, sizeof(test_data));
+    ctx->body_buf_len = sizeof(test_data);
+    ctx->body_buf_pos = 0;
+    ctx->defer.active = false;
+    ctx->defer.paused = false;
+
+    // Call httpd_req_defer
+    httpd_err_t err = httpd_req_defer(&ctx->req, test_body_callback, test_done_callback);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
+
+    // Verify body callback was called with pre-received data
+    TEST_ASSERT_EQUAL(1, body_callback_count);
+    TEST_ASSERT_EQUAL(sizeof(test_data), body_bytes_received);
+    TEST_ASSERT_EQUAL(sizeof(test_data), ctx->req.body_received);
+
+    // body_buf_pos should be updated
+    TEST_ASSERT_EQUAL(ctx->body_buf_len, ctx->body_buf_pos);
+
+    // Body not yet complete (50 bytes expected, only 14 received)
+    TEST_ASSERT_FALSE(done_callback_called);
+
+    stop_test_server();
+}
+
+// Test httpd_req_defer with body already complete
+static void test_defer_body_already_complete(void) {
+    start_test_server();
+    reset_test_state();
+
+    TEST_ASSERT_NOT_NULL(g_server);
+    TEST_ASSERT_NOT_NULL(g_test_request_contexts);
+
+    connection_pool_t* pool = &g_server->connection_pool;
+    int idx = 0;
+    connection_t* conn = connection_get(pool, idx);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    // Set up connection
+    conn->fd = 999;
+    conn->state = CONN_STATE_HTTP_HEADERS;
+    conn->deferred = 0;
+    conn->defer_paused = 0;
+    conn->pool_index = idx;
+    conn->content_length = 10;  // Small body
+    conn->bytes_received = 0;
+
+    // Set up request context
+    test_request_context_t* ctx = get_test_ctx(idx);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->req._internal = conn;
+    ctx->req.content_length = 10;
+    ctx->req.body_received = 0;
+
+    // Put complete body in buffer
+    const uint8_t test_data[] = "0123456789";  // 10 bytes
+    memcpy(ctx->body_buf, test_data, 10);
+    ctx->body_buf_len = 10;
+    ctx->body_buf_pos = 0;
+    ctx->defer.active = false;
+    ctx->defer.paused = false;
+
+    // Call httpd_req_defer
+    httpd_err_t err = httpd_req_defer(&ctx->req, test_body_callback, test_done_callback);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
+
+    // Verify body callback was called
+    TEST_ASSERT_EQUAL(1, body_callback_count);
+    TEST_ASSERT_EQUAL(10, body_bytes_received);
+
+    // Body complete, done_callback should be called
+    TEST_ASSERT_TRUE(done_callback_called);
+    TEST_ASSERT_EQUAL(HTTPD_OK, done_callback_error);
+
+    // Defer should be deactivated
+    TEST_ASSERT_FALSE(ctx->defer.active);
+    TEST_ASSERT_EQUAL(0, conn->deferred);
+
+    stop_test_server();
+}
+
+// Test httpd_req_defer_pause and resume
+static void test_defer_pause_resume(void) {
+    start_test_server();
+    reset_test_state();
+
+    TEST_ASSERT_NOT_NULL(g_server);
+    TEST_ASSERT_NOT_NULL(g_test_request_contexts);
+
+    connection_pool_t* pool = &g_server->connection_pool;
+    int idx = 0;
+    connection_t* conn = connection_get(pool, idx);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    // Set up connection
+    conn->fd = 999;
+    conn->state = CONN_STATE_HTTP_BODY;
+    conn->deferred = 1;
+    conn->defer_paused = 0;
+    conn->pool_index = idx;
+    conn->content_length = 1000;
+    conn->bytes_received = 0;
+
+    // Set up request context in deferred mode
+    test_request_context_t* ctx = get_test_ctx(idx);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->req._internal = conn;
+    ctx->req.content_length = 1000;
+    ctx->defer.active = true;
+    ctx->defer.paused = false;
+    ctx->defer.on_body = test_body_callback;
+    ctx->defer.on_done = test_done_callback;
+
+    // Pause
+    httpd_err_t err = httpd_req_defer_pause(&ctx->req);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
+    TEST_ASSERT_TRUE(ctx->defer.paused);
+    TEST_ASSERT_EQUAL(1, conn->defer_paused);
+
+    // Resume
+    err = httpd_req_defer_resume(&ctx->req);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
+    TEST_ASSERT_FALSE(ctx->defer.paused);
+    TEST_ASSERT_EQUAL(0, conn->defer_paused);
+
+    stop_test_server();
+}
+
+// Test httpd_req_defer_pause fails when not in deferred mode
+static void test_defer_pause_not_deferred(void) {
+    start_test_server();
+    reset_test_state();
+
+    TEST_ASSERT_NOT_NULL(g_server);
+    TEST_ASSERT_NOT_NULL(g_test_request_contexts);
+
+    connection_pool_t* pool = &g_server->connection_pool;
+    int idx = 0;
+    connection_t* conn = connection_get(pool, idx);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    // Set up connection - not in deferred mode
+    conn->fd = 999;
+    conn->state = CONN_STATE_HTTP_BODY;
+    conn->deferred = 0;
+    conn->defer_paused = 0;
+    conn->pool_index = idx;
+
+    // Set up request context - not in deferred mode
+    test_request_context_t* ctx = get_test_ctx(idx);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->req._internal = conn;
+    ctx->defer.active = false;
+
+    // Pause should fail
+    httpd_err_t err = httpd_req_defer_pause(&ctx->req);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, err);
+
+    stop_test_server();
+}
+
+// Test httpd_req_defer_resume fails when not in deferred mode
+static void test_defer_resume_not_deferred(void) {
+    start_test_server();
+    reset_test_state();
+
+    TEST_ASSERT_NOT_NULL(g_server);
+    TEST_ASSERT_NOT_NULL(g_test_request_contexts);
+
+    connection_pool_t* pool = &g_server->connection_pool;
+    int idx = 0;
+    connection_t* conn = connection_get(pool, idx);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    // Set up connection - not in deferred mode
+    conn->fd = 999;
+    conn->state = CONN_STATE_HTTP_BODY;
+    conn->deferred = 0;
+    conn->pool_index = idx;
+
+    // Set up request context - not in deferred mode
+    test_request_context_t* ctx = get_test_ctx(idx);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->req._internal = conn;
+    ctx->defer.active = false;
+
+    // Resume should fail
+    httpd_err_t err = httpd_req_defer_resume(&ctx->req);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, err);
+
+    stop_test_server();
+}
+
+// Test httpd_req_is_deferred returns correct state
+static void test_is_deferred_with_context(void) {
+    start_test_server();
+    reset_test_state();
+
+    TEST_ASSERT_NOT_NULL(g_server);
+    TEST_ASSERT_NOT_NULL(g_test_request_contexts);
+
+    connection_pool_t* pool = &g_server->connection_pool;
+    int idx = 0;
+    connection_t* conn = connection_get(pool, idx);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    conn->fd = 999;
+    conn->pool_index = idx;
+
+    test_request_context_t* ctx = get_test_ctx(idx);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->req._internal = conn;
+
+    // Not deferred
+    ctx->defer.active = false;
+    TEST_ASSERT_FALSE(httpd_req_is_deferred(&ctx->req));
+
+    // Deferred
+    ctx->defer.active = true;
+    TEST_ASSERT_TRUE(httpd_req_is_deferred(&ctx->req));
+
+    stop_test_server();
+}
+
+// Test body callback error stops defer and calls done with error
+static void test_defer_body_callback_error(void) {
+    start_test_server();
+    reset_test_state();
+
+    TEST_ASSERT_NOT_NULL(g_server);
+    TEST_ASSERT_NOT_NULL(g_test_request_contexts);
+
+    connection_pool_t* pool = &g_server->connection_pool;
+    int idx = 0;
+    connection_t* conn = connection_get(pool, idx);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    // Set up connection
+    conn->fd = 999;
+    conn->state = CONN_STATE_HTTP_HEADERS;
+    conn->deferred = 0;
+    conn->defer_paused = 0;
+    conn->pool_index = idx;
+    conn->content_length = 100;
+    conn->bytes_received = 0;
+
+    // Set up request context with body data
+    test_request_context_t* ctx = get_test_ctx(idx);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->req._internal = conn;
+    ctx->req.content_length = 100;
+    ctx->req.body_received = 0;
+
+    const uint8_t test_data[] = "test";
+    memcpy(ctx->body_buf, test_data, sizeof(test_data));
+    ctx->body_buf_len = sizeof(test_data);
+    ctx->body_buf_pos = 0;
+    ctx->defer.active = false;
+
+    // Call httpd_req_defer with error callback
+    httpd_err_t err = httpd_req_defer(&ctx->req, test_body_callback_error, test_done_callback);
+
+    // Should fail because body callback returns error
+    TEST_ASSERT_EQUAL(HTTPD_ERR_IO, err);
+
+    // Done callback should be called with error
+    TEST_ASSERT_TRUE(done_callback_called);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_IO, done_callback_error);
+
+    // Defer should be deactivated
+    TEST_ASSERT_FALSE(ctx->defer.active);
+    TEST_ASSERT_EQUAL(0, conn->deferred);
+
+    stop_test_server();
+}
+
+// Test httpd_req_defer with NULL body callback (valid case - no body data expected)
+static void test_defer_null_body_callback(void) {
+    start_test_server();
+    reset_test_state();
+
+    TEST_ASSERT_NOT_NULL(g_server);
+    TEST_ASSERT_NOT_NULL(g_test_request_contexts);
+
+    connection_pool_t* pool = &g_server->connection_pool;
+    int idx = 0;
+    connection_t* conn = connection_get(pool, idx);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    // Set up connection
+    conn->fd = 999;
+    conn->state = CONN_STATE_HTTP_HEADERS;
+    conn->deferred = 0;
+    conn->defer_paused = 0;
+    conn->pool_index = idx;
+    conn->content_length = 100;
+    conn->bytes_received = 0;
+
+    // Set up request context - no pre-received body
+    test_request_context_t* ctx = get_test_ctx(idx);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->req._internal = conn;
+    ctx->req.content_length = 100;
+    ctx->req.body_received = 0;
+    ctx->body_buf_len = 0;
+    ctx->body_buf_pos = 0;
+    ctx->defer.active = false;
+
+    // Call httpd_req_defer with NULL body callback
+    httpd_err_t err = httpd_req_defer(&ctx->req, NULL, test_done_callback);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
+
+    // Should still enter deferred mode
+    TEST_ASSERT_TRUE(ctx->defer.active);
+    TEST_ASSERT_EQUAL(1, conn->deferred);
+
+    stop_test_server();
+}
+
+// Test httpd_req_defer with zero content length
+static void test_defer_zero_content_length(void) {
+    start_test_server();
+    reset_test_state();
+
+    TEST_ASSERT_NOT_NULL(g_server);
+    TEST_ASSERT_NOT_NULL(g_test_request_contexts);
+
+    connection_pool_t* pool = &g_server->connection_pool;
+    int idx = 0;
+    connection_t* conn = connection_get(pool, idx);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    // Set up connection
+    conn->fd = 999;
+    conn->state = CONN_STATE_HTTP_HEADERS;
+    conn->deferred = 0;
+    conn->defer_paused = 0;
+    conn->pool_index = idx;
+    conn->content_length = 0;
+    conn->bytes_received = 0;
+
+    // Set up request context
+    test_request_context_t* ctx = get_test_ctx(idx);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->req._internal = conn;
+    ctx->req.content_length = 0;
+    ctx->req.body_received = 0;
+    ctx->body_buf_len = 0;
+    ctx->body_buf_pos = 0;
+    ctx->defer.active = false;
+
+    // Call httpd_req_defer
+    httpd_err_t err = httpd_req_defer(&ctx->req, test_body_callback, test_done_callback);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
+
+    // With zero content length, body is "complete" but condition checks content_length > 0
+    // So done callback should NOT be called immediately
+    TEST_ASSERT_FALSE(done_callback_called);
+
+    // Should still be in deferred mode (waiting for end of stream)
+    TEST_ASSERT_TRUE(ctx->defer.active);
+
+    stop_test_server();
+}
+
+// Test httpd_req_defer connection not available (NULL _internal)
+static void test_defer_no_connection(void) {
+    start_test_server();
+    reset_test_state();
+
+    TEST_ASSERT_NOT_NULL(g_test_request_contexts);
+
+    int idx = 0;
+    test_request_context_t* ctx = get_test_ctx(idx);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->req._internal = NULL;  // No connection
+
+    httpd_err_t err = httpd_req_defer(&ctx->req, test_body_callback, test_done_callback);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_CONN_CLOSED, err);
+
+    stop_test_server();
+}
+
+// Test httpd_req_defer_pause with no connection
+static void test_defer_pause_no_connection(void) {
+    start_test_server();
+    reset_test_state();
+
+    TEST_ASSERT_NOT_NULL(g_test_request_contexts);
+
+    int idx = 0;
+    test_request_context_t* ctx = get_test_ctx(idx);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->req._internal = NULL;
+
+    httpd_err_t err = httpd_req_defer_pause(&ctx->req);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_CONN_CLOSED, err);
+
+    stop_test_server();
+}
+
+// Test httpd_req_defer_resume with no connection
+static void test_defer_resume_no_connection(void) {
+    start_test_server();
+    reset_test_state();
+
+    TEST_ASSERT_NOT_NULL(g_test_request_contexts);
+
+    int idx = 0;
+    test_request_context_t* ctx = get_test_ctx(idx);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->req._internal = NULL;
+
+    httpd_err_t err = httpd_req_defer_resume(&ctx->req);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_CONN_CLOSED, err);
+
+    stop_test_server();
+}
+
 // ==================== TEST RUNNER ====================
 
 void test_defer_run(void) {
     ESP_LOGI(TAG, "Running Defer (Async) tests");
 
+    // NULL parameter tests
     RUN_TEST(test_defer_basic_setup);
     RUN_TEST(test_defer_null_done_callback);
     RUN_TEST(test_is_deferred);
     RUN_TEST(test_defer_pause_null);
     RUN_TEST(test_defer_resume_null);
     RUN_TEST(test_defer_to_file_null_params);
+
+    // Connection flag tests
     RUN_TEST(test_connection_deferred_flag);
     RUN_TEST(test_defer_body_tracking);
     RUN_TEST(test_defer_immediate_completion);
     RUN_TEST(test_callback_type_compatibility);
+
+    // Full request context tests
+    RUN_TEST(test_defer_with_request_context);
+    RUN_TEST(test_defer_pre_received_body);
+    RUN_TEST(test_defer_body_already_complete);
+    RUN_TEST(test_defer_pause_resume);
+    RUN_TEST(test_defer_pause_not_deferred);
+    RUN_TEST(test_defer_resume_not_deferred);
+    RUN_TEST(test_is_deferred_with_context);
+    RUN_TEST(test_defer_body_callback_error);
+    RUN_TEST(test_defer_null_body_callback);
+    RUN_TEST(test_defer_zero_content_length);
+    RUN_TEST(test_defer_no_connection);
+    RUN_TEST(test_defer_pause_no_connection);
+    RUN_TEST(test_defer_resume_no_connection);
 
     ESP_LOGI(TAG, "Defer tests completed");
 }

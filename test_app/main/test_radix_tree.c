@@ -926,6 +926,195 @@ static void test_non_strict_mode_ignores_trailing_slash(void) {
 }
 
 // ============================================================================
+// Phase 8: Edge Cases
+// ============================================================================
+
+static void test_radix_param_special_characters(void) {
+    ESP_LOGI(TAG, "Test: Parameter with special characters");
+
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    radix_insert(tree, "/files/:filename", HTTP_GET, test_handler_1, (void*)1, NULL, 0);
+
+    // Test with hyphen and underscore
+    radix_match_t m1 = radix_lookup(tree, "/files/my-file_name", HTTP_GET, false);
+    TEST_ASSERT_TRUE(m1.matched);
+    TEST_ASSERT_EQUAL(1, m1.param_count);
+    TEST_ASSERT_EQUAL_STRING_LEN("my-file_name", m1.params[0].value, m1.params[0].value_len);
+    if (m1.middlewares) free(m1.middlewares);
+
+    // Test with dots
+    radix_match_t m2 = radix_lookup(tree, "/files/image.png", HTTP_GET, false);
+    TEST_ASSERT_TRUE(m2.matched);
+    TEST_ASSERT_EQUAL_STRING_LEN("image.png", m2.params[0].value, m2.params[0].value_len);
+    if (m2.middlewares) free(m2.middlewares);
+
+    // Test with URL-encoded characters (they should remain encoded)
+    radix_match_t m3 = radix_lookup(tree, "/files/hello%20world", HTTP_GET, false);
+    TEST_ASSERT_TRUE(m3.matched);
+    TEST_ASSERT_EQUAL_STRING_LEN("hello%20world", m3.params[0].value, m3.params[0].value_len);
+    if (m3.middlewares) free(m3.middlewares);
+
+    radix_tree_destroy(tree);
+}
+
+static void test_radix_wildcard_empty_value(void) {
+    ESP_LOGI(TAG, "Test: Wildcard with trailing slash only");
+
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    radix_insert(tree, "/static/*", HTTP_GET, test_handler_1, (void*)1, NULL, 0);
+
+    // Single file
+    radix_match_t m1 = radix_lookup(tree, "/static/file.js", HTTP_GET, false);
+    TEST_ASSERT_TRUE(m1.matched);
+    TEST_ASSERT_EQUAL(1, m1.param_count);
+    TEST_ASSERT_EQUAL_STRING_LEN("file.js", m1.params[0].value, m1.params[0].value_len);
+    if (m1.middlewares) free(m1.middlewares);
+
+    // Nested path
+    radix_match_t m2 = radix_lookup(tree, "/static/a/b/c/d.txt", HTTP_GET, false);
+    TEST_ASSERT_TRUE(m2.matched);
+    TEST_ASSERT_EQUAL_STRING_LEN("a/b/c/d.txt", m2.params[0].value, m2.params[0].value_len);
+    if (m2.middlewares) free(m2.middlewares);
+
+    radix_tree_destroy(tree);
+}
+
+static void test_radix_wildcard_deep_path(void) {
+    ESP_LOGI(TAG, "Test: Wildcard with very deep path");
+
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    radix_insert(tree, "/api/*", HTTP_GET, test_handler_1, (void*)1, NULL, 0);
+
+    // Very deep nested path
+    radix_match_t m = radix_lookup(tree, "/api/a/b/c/d/e/f/g/h/i/j", HTTP_GET, false);
+    TEST_ASSERT_TRUE(m.matched);
+    TEST_ASSERT_EQUAL(1, m.param_count);
+    TEST_ASSERT_EQUAL_STRING_LEN("a/b/c/d/e/f/g/h/i/j", m.params[0].value, m.params[0].value_len);
+    if (m.middlewares) free(m.middlewares);
+
+    radix_tree_destroy(tree);
+}
+
+static void test_radix_max_params(void) {
+    ESP_LOGI(TAG, "Test: Maximum number of parameters");
+
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    // Route with many parameters (CONFIG_HTTPD_MAX_ROUTE_PARAMS = 8)
+    radix_insert(tree, "/a/:p1/b/:p2/c/:p3/d/:p4/e/:p5/f/:p6/g/:p7/h/:p8", HTTP_GET,
+                 test_handler_1, (void*)1, NULL, 0);
+
+    radix_match_t m = radix_lookup(tree, "/a/1/b/2/c/3/d/4/e/5/f/6/g/7/h/8", HTTP_GET, false);
+    TEST_ASSERT_TRUE(m.matched);
+    TEST_ASSERT_EQUAL(8, m.param_count);
+
+    // Verify first and last params
+    TEST_ASSERT_EQUAL_STRING_LEN("p1", m.params[0].key, m.params[0].key_len);
+    TEST_ASSERT_EQUAL_STRING_LEN("1", m.params[0].value, m.params[0].value_len);
+    TEST_ASSERT_EQUAL_STRING_LEN("p8", m.params[7].key, m.params[7].key_len);
+    TEST_ASSERT_EQUAL_STRING_LEN("8", m.params[7].value, m.params[7].value_len);
+
+    if (m.middlewares) free(m.middlewares);
+    radix_tree_destroy(tree);
+}
+
+static void test_radix_null_inputs(void) {
+    ESP_LOGI(TAG, "Test: NULL input handling");
+
+    // radix_tree_destroy with NULL should not crash
+    radix_tree_destroy(NULL);
+
+    // Create tree for other tests
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    // radix_insert with NULL tree
+    httpd_err_t err1 = radix_insert(NULL, "/test", HTTP_GET, test_handler_1, NULL, NULL, 0);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, err1);
+
+    // radix_insert with NULL pattern
+    httpd_err_t err2 = radix_insert(tree, NULL, HTTP_GET, test_handler_1, NULL, NULL, 0);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, err2);
+
+    // radix_insert with NULL handler
+    httpd_err_t err3 = radix_insert(tree, "/test", HTTP_GET, NULL, NULL, NULL, 0);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, err3);
+
+    // radix_lookup with NULL tree
+    radix_match_t m1 = radix_lookup(NULL, "/test", HTTP_GET, false);
+    TEST_ASSERT_FALSE(m1.matched);
+
+    // radix_lookup with NULL path
+    radix_match_t m2 = radix_lookup(tree, NULL, HTTP_GET, false);
+    TEST_ASSERT_FALSE(m2.matched);
+
+    radix_tree_destroy(tree);
+}
+
+static void test_radix_param_with_static_suffix(void) {
+    ESP_LOGI(TAG, "Test: Parameter followed by static segment");
+
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    // Route: /users/:id/profile
+    radix_insert(tree, "/users/:id/profile", HTTP_GET, test_handler_1, (void*)1, NULL, 0);
+    radix_insert(tree, "/users/:id/settings", HTTP_GET, test_handler_2, (void*)2, NULL, 0);
+
+    // Should match profile
+    radix_match_t m1 = radix_lookup(tree, "/users/42/profile", HTTP_GET, false);
+    TEST_ASSERT_TRUE(m1.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_1, m1.handler);
+    TEST_ASSERT_EQUAL(1, m1.param_count);
+    TEST_ASSERT_EQUAL_STRING_LEN("42", m1.params[0].value, m1.params[0].value_len);
+    if (m1.middlewares) free(m1.middlewares);
+
+    // Should match settings
+    radix_match_t m2 = radix_lookup(tree, "/users/42/settings", HTTP_GET, false);
+    TEST_ASSERT_TRUE(m2.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_2, m2.handler);
+    if (m2.middlewares) free(m2.middlewares);
+
+    // Should not match other paths
+    radix_match_t m3 = radix_lookup(tree, "/users/42/other", HTTP_GET, false);
+    TEST_ASSERT_FALSE(m3.matched);
+
+    radix_tree_destroy(tree);
+}
+
+static void test_radix_mixed_param_wildcard(void) {
+    ESP_LOGI(TAG, "Test: Parameter and wildcard in same route");
+
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    // Route: /users/:id/files/*
+    radix_insert(tree, "/users/:id/files/*", HTTP_GET, test_handler_1, (void*)1, NULL, 0);
+
+    radix_match_t m = radix_lookup(tree, "/users/42/files/docs/report.pdf", HTTP_GET, false);
+    TEST_ASSERT_TRUE(m.matched);
+    TEST_ASSERT_EQUAL(2, m.param_count);
+
+    // First param should be id
+    TEST_ASSERT_EQUAL_STRING_LEN("id", m.params[0].key, m.params[0].key_len);
+    TEST_ASSERT_EQUAL_STRING_LEN("42", m.params[0].value, m.params[0].value_len);
+
+    // Second param should be wildcard
+    TEST_ASSERT_EQUAL_STRING_LEN("*", m.params[1].key, m.params[1].key_len);
+    TEST_ASSERT_EQUAL_STRING_LEN("docs/report.pdf", m.params[1].value, m.params[1].value_len);
+
+    if (m.middlewares) free(m.middlewares);
+    radix_tree_destroy(tree);
+}
+
+// ============================================================================
 // Test Runner
 // ============================================================================
 
@@ -975,4 +1164,13 @@ void test_radix_tree_run(void) {
     RUN_TEST(test_strict_mode_trailing_slash);
     RUN_TEST(test_strict_mode_with_trailing_slash_route);
     RUN_TEST(test_non_strict_mode_ignores_trailing_slash);
+
+    // Phase 8: Edge cases
+    RUN_TEST(test_radix_param_special_characters);
+    RUN_TEST(test_radix_wildcard_empty_value);
+    RUN_TEST(test_radix_wildcard_deep_path);
+    RUN_TEST(test_radix_max_params);
+    RUN_TEST(test_radix_null_inputs);
+    RUN_TEST(test_radix_param_with_static_suffix);
+    RUN_TEST(test_radix_mixed_param_wildcard);
 }

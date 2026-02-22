@@ -353,7 +353,7 @@ static void test_structure_sizes(void)
 }
 
 // ============================================================================
-// Security/Edge Case Tests
+// Security/Edge Case Tests (origin)
 // ============================================================================
 
 // Test NULL pool handling in pool_init

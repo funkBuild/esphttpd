@@ -235,33 +235,20 @@ When making changes:
 
 ### Unit Tests (QEMU)
 
-The test suite runs under QEMU emulation. From the `test_app` directory:
+The test suite runs under QEMU emulation. Use the test runner script:
 
 ```bash
-# Kill any existing QEMU processes first
-pkill -9 qemu-system-xtensa
-
-# Build and run tests
-cd test_app
-idf.py build
-
-# Create QEMU flash image
-cd build
-esptool.py --chip=esp32s3 merge_bin --output=qemu_flash.bin \
-    --fill-flash-size=2MB --flash_mode dio --flash_freq 80m --flash_size 2MB \
-    0x0 bootloader/bootloader.bin \
-    0x10000 esphttpd_test_app.bin \
-    0x8000 partition_table/partition-table.bin
-
-# Run QEMU (timeout after 3 minutes)
-timeout 180 qemu-system-xtensa -M esp32s3 \
-    -drive file=qemu_flash.bin,if=mtd,format=raw \
-    -drive file=qemu_efuse.bin,if=none,format=raw,id=efuse \
-    -global driver=nvram.esp32c3.efuse,property=drive,value=efuse \
-    -global driver=timer.esp32s3.timg,property=wdt_disable,value=true \
-    -nic user,model=open_eth \
-    -nographic 2>&1 | tee /tmp/qemu_out.txt
+./scripts/run_tests.sh
 ```
+
+The script will:
+1. Auto-detect ESP-IDF and QEMU locations
+2. Build the test application
+3. Create the QEMU flash image
+4. Run tests and monitor for completion
+5. Terminate QEMU immediately when tests finish
+6. Save logs to `/tmp/esphttpd_unit_tests_YYYYMMDD_HHMMSS.log`
+7. Exit with code 0 on success, 1 on failure
 
 Look for `QEMU_TEST_COMPLETE: PASS` in output.
 
@@ -270,8 +257,8 @@ Look for `QEMU_TEST_COMPLETE: PASS` in output.
 The test suite includes performance benchmarks that measure critical operations:
 
 ```bash
-# After running tests, extract performance results:
-strings /tmp/qemu_out.txt | grep "^PERF:"
+# After running tests, extract performance results from the log file:
+grep "^PERF:" /tmp/esphttpd_unit_tests_*.log | tail -20
 ```
 
 **Benchmark categories:**
@@ -339,6 +326,3 @@ strings /tmp/qemu_out.txt | grep "^PERF:"
 ### Authentication
 - `httpd_check_basic_auth(req, user, pass)` - Verify credentials
 - `httpd_resp_send_auth_challenge(req, realm)` - Send 401
-
-Kill any qemu-system-xtensa processes forcefully and check the port is open before running tests under QEMU.
-- Don't blame QEMU's networking for slow requests, it's never qemu
