@@ -2,13 +2,14 @@
 // This runs before all tests
 
 import axios from 'axios';
+import { TIMEOUTS } from './test-utils';
 
 // Base URL for the ESP32 server (QEMU)
 export const BASE_URL = process.env.SERVER_URL || 'http://127.0.0.1:9000';
 
 // Configure axios defaults
 axios.defaults.baseURL = BASE_URL;
-axios.defaults.timeout = 15000; // Increased for QEMU emulation
+axios.defaults.timeout = TIMEOUTS.HTTP;
 
 // Sanitize axios errors to remove circular references (socket objects)
 // This prevents "Converting circular structure to JSON" errors in Jest
@@ -54,4 +55,11 @@ export async function waitForServer(maxRetries = 10, delay = 1000): Promise<void
 beforeAll(async () => {
   console.log(`Testing against server at: ${BASE_URL}`);
   await waitForServer();
+});
+
+// Clean up after all tests to prevent "Jest did not exit" warning
+afterAll(() => {
+  // Clear axios interceptors to release references
+  axios.interceptors.request.clear();
+  axios.interceptors.response.clear();
 });

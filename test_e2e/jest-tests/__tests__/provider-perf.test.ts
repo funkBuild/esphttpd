@@ -9,21 +9,7 @@
 
 import axios from 'axios';
 import { BASE_URL } from '../jest.setup';
-
-// Helper to verify block pattern
-function verifyBlockPattern(data: Buffer, expectedBlocks: number): boolean {
-  for (let block = 0; block < expectedBlocks; block++) {
-    const offset = block * 1024;
-    const expectedHeader = `BLOCK_${block.toString().padStart(4, '0')}:`;
-    const actualHeader = data.slice(offset, offset + 11).toString();
-
-    if (actualHeader !== expectedHeader) {
-      console.error(`Block ${block}: expected "${expectedHeader}", got "${actualHeader}"`);
-      return false;
-    }
-  }
-  return true;
-}
+import { verifyBlockPattern, TIMEOUTS } from '../test-utils';
 
 interface PerfResult {
   endpoint: string;
@@ -43,7 +29,7 @@ async function measureDownload(endpoint: string, sizeKB: number): Promise<PerfRe
   try {
     const response = await axios.get(`${endpoint}/${sizeKB}`, {
       responseType: 'arraybuffer',
-      timeout: 120000
+      timeout: TIMEOUTS.PERF_CONCURRENT
     });
 
     durationMs = Date.now() - startTime;
@@ -76,7 +62,7 @@ describe('Data Provider API Performance', () => {
     it('provider with Content-Length should return correct data', async () => {
       const response = await axios.get('/largefile-provider/50', {
         responseType: 'arraybuffer',
-        timeout: 30000
+        timeout: TIMEOUTS.DOWNLOAD_SM
       });
 
       expect(response.status).toBe(200);
@@ -85,12 +71,12 @@ describe('Data Provider API Performance', () => {
       const data = Buffer.from(response.data);
       expect(data.length).toBe(50 * 1024);
       expect(verifyBlockPattern(data, 50)).toBe(true);
-    }, 35000);
+    }, TIMEOUTS.DOWNLOAD_SM + 5000);
 
     it('provider with chunked encoding should return correct data', async () => {
       const response = await axios.get('/largefile-provider-chunked/50', {
         responseType: 'arraybuffer',
-        timeout: 30000
+        timeout: TIMEOUTS.DOWNLOAD_SM
       });
 
       expect(response.status).toBe(200);
@@ -99,7 +85,7 @@ describe('Data Provider API Performance', () => {
       const data = Buffer.from(response.data);
       expect(data.length).toBe(50 * 1024);
       expect(verifyBlockPattern(data, 50)).toBe(true);
-    }, 35000);
+    }, TIMEOUTS.DOWNLOAD_SM + 5000);
   });
 
   describe('Performance Comparison: 100KB', () => {
@@ -112,9 +98,9 @@ describe('Data Provider API Performance', () => {
 
     beforeAll(async () => {
       // Warm up requests
-      await axios.get(`/largefile/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: 30000 });
-      await axios.get(`/largefile-provider/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: 30000 });
-      await axios.get(`/largefile-provider-chunked/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: 30000 });
+      await axios.get(`/largefile/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: TIMEOUTS.DOWNLOAD_SM });
+      await axios.get(`/largefile-provider/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: TIMEOUTS.DOWNLOAD_SM });
+      await axios.get(`/largefile-provider-chunked/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: TIMEOUTS.DOWNLOAD_SM });
 
       // Run multiple iterations
       for (let i = 0; i < ITERATIONS; i++) {
@@ -122,7 +108,7 @@ describe('Data Provider API Performance', () => {
         providerResults.push(await measureDownload('/largefile-provider', SIZE_KB));
         providerChunkedResults.push(await measureDownload('/largefile-provider-chunked', SIZE_KB));
       }
-    }, 180000);
+    }, TIMEOUTS.PERF_SETUP);
 
     it('old chunked API should work correctly', () => {
       oldApiResults.forEach(r => {
@@ -162,10 +148,13 @@ describe('Data Provider API Performance', () => {
       const improvementVsOld = ((avgProvider - avgOld) / avgOld * 100).toFixed(1);
       console.log(`\nProvider vs Old API: ${improvementVsOld}% ${parseFloat(improvementVsOld) >= 0 ? 'faster' : 'slower'}`);
 
-      // Just ensure all methods work - actual performance may vary
-      expect(avgOld).toBeGreaterThan(0);
-      expect(avgProvider).toBeGreaterThan(0);
-      expect(avgProviderChunked).toBeGreaterThan(0);
+      // Minimum throughput regression guard (conservative for QEMU)
+      expect(avgOld).toBeGreaterThan(500);           // 500 KB/s minimum
+      expect(avgProvider).toBeGreaterThan(500);
+      expect(avgProviderChunked).toBeGreaterThan(500);
+
+      // Provider API should not regress vs old API
+      expect(avgProvider).toBeGreaterThanOrEqual(avgOld * 0.5);
     });
   });
 
@@ -179,9 +168,9 @@ describe('Data Provider API Performance', () => {
 
     beforeAll(async () => {
       // Warm up requests
-      await axios.get(`/largefile/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: 60000 });
-      await axios.get(`/largefile-provider/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: 60000 });
-      await axios.get(`/largefile-provider-chunked/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: 60000 });
+      await axios.get(`/largefile/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: TIMEOUTS.DOWNLOAD_MD });
+      await axios.get(`/largefile-provider/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: TIMEOUTS.DOWNLOAD_MD });
+      await axios.get(`/largefile-provider-chunked/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: TIMEOUTS.DOWNLOAD_MD });
 
       // Run multiple iterations
       for (let i = 0; i < ITERATIONS; i++) {
@@ -189,7 +178,7 @@ describe('Data Provider API Performance', () => {
         providerResults.push(await measureDownload('/largefile-provider', SIZE_KB));
         providerChunkedResults.push(await measureDownload('/largefile-provider-chunked', SIZE_KB));
       }
-    }, 360000);
+    }, TIMEOUTS.PERF_SETUP_LARGE);
 
     it('old chunked API should work correctly', () => {
       oldApiResults.forEach(r => {
@@ -229,10 +218,13 @@ describe('Data Provider API Performance', () => {
       const improvementVsOld = ((avgProvider - avgOld) / avgOld * 100).toFixed(1);
       console.log(`\nProvider vs Old API: ${improvementVsOld}% ${parseFloat(improvementVsOld) >= 0 ? 'faster' : 'slower'}`);
 
-      // Just ensure all methods work
-      expect(avgOld).toBeGreaterThan(0);
-      expect(avgProvider).toBeGreaterThan(0);
-      expect(avgProviderChunked).toBeGreaterThan(0);
+      // Minimum throughput regression guard (conservative for QEMU)
+      expect(avgOld).toBeGreaterThan(500);           // 500 KB/s minimum
+      expect(avgProvider).toBeGreaterThan(500);
+      expect(avgProviderChunked).toBeGreaterThan(500);
+
+      // Provider API should not regress vs old API
+      expect(avgProvider).toBeGreaterThanOrEqual(avgOld * 0.5);
     });
   });
 
@@ -243,7 +235,7 @@ describe('Data Provider API Performance', () => {
       // Old API - 3 concurrent
       const oldStart = Date.now();
       const oldPromises = [1, 2, 3].map(() =>
-        axios.get(`/largefile/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: 60000 })
+        axios.get(`/largefile/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: TIMEOUTS.DOWNLOAD_MD })
       );
       await Promise.all(oldPromises);
       const oldDuration = Date.now() - oldStart;
@@ -251,7 +243,7 @@ describe('Data Provider API Performance', () => {
       // Provider API - 3 concurrent
       const providerStart = Date.now();
       const providerPromises = [1, 2, 3].map(() =>
-        axios.get(`/largefile-provider/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: 60000 })
+        axios.get(`/largefile-provider/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: TIMEOUTS.DOWNLOAD_MD })
       );
       await Promise.all(providerPromises);
       const providerDuration = Date.now() - providerStart;
@@ -263,10 +255,13 @@ describe('Data Provider API Performance', () => {
       const improvement = ((oldDuration - providerDuration) / oldDuration * 100).toFixed(1);
       console.log(`Improvement: ${improvement}%`);
 
-      // Both should complete successfully
-      expect(oldDuration).toBeGreaterThan(0);
-      expect(providerDuration).toBeGreaterThan(0);
-    }, 120000);
+      // Both should complete within a reasonable time (10s for QEMU)
+      expect(oldDuration).toBeLessThan(10000);
+      expect(providerDuration).toBeLessThan(10000);
+
+      // Provider should not be significantly slower than old API
+      expect(providerDuration).toBeLessThanOrEqual(oldDuration * 2);
+    }, TIMEOUTS.PERF_CONCURRENT);
   });
 
   describe('Large File Test (512KB)', () => {
@@ -274,7 +269,7 @@ describe('Data Provider API Performance', () => {
       const startTime = Date.now();
       const response = await axios.get('/largefile-provider/512', {
         responseType: 'arraybuffer',
-        timeout: 180000
+        timeout: TIMEOUTS.DOWNLOAD_XL
       });
       const elapsed = Date.now() - startTime;
 
@@ -293,13 +288,13 @@ describe('Data Provider API Performance', () => {
 
       const throughput = (512 / (elapsed / 1000)).toFixed(1);
       console.log(`\n512KB provider download: ${elapsed}ms, ${throughput} KB/s`);
-    }, 185000);
+    }, TIMEOUTS.DOWNLOAD_XL + 5000);
 
     it('provider chunked should handle 512KB download', async () => {
       const startTime = Date.now();
       const response = await axios.get('/largefile-provider-chunked/512', {
         responseType: 'arraybuffer',
-        timeout: 180000
+        timeout: TIMEOUTS.DOWNLOAD_XL
       });
       const elapsed = Date.now() - startTime;
 
@@ -319,6 +314,6 @@ describe('Data Provider API Performance', () => {
 
       const throughput = (512 / (elapsed / 1000)).toFixed(1);
       console.log(`\n512KB provider chunked download: ${elapsed}ms, ${throughput} KB/s`);
-    }, 185000);
+    }, TIMEOUTS.DOWNLOAD_XL + 5000);
   });
 });

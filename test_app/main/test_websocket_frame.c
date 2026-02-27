@@ -610,7 +610,7 @@ static void test_compute_accept_key_rfc6455(void)
     const char* client_key = "dGhlIHNhbXBsZSBub25jZQ==";
     char accept_key[64] = {0};
 
-    ws_compute_accept_key(client_key, accept_key, sizeof(accept_key));
+    TEST_ASSERT_EQUAL(0, ws_compute_accept_key(client_key, accept_key, sizeof(accept_key), NULL));
 
     TEST_ASSERT_EQUAL_STRING("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", accept_key);
 }
@@ -622,7 +622,7 @@ static void test_compute_accept_key_another_key(void)
     const char* client_key = "x3JJHMbDL1EzLkh9GBhXDw==";
     char accept_key[64] = {0};
 
-    ws_compute_accept_key(client_key, accept_key, sizeof(accept_key));
+    TEST_ASSERT_EQUAL(0, ws_compute_accept_key(client_key, accept_key, sizeof(accept_key), NULL));
 
     // The accept key should be consistently computed
     // We verify it's not empty and has the right length (28 chars for base64)
@@ -637,7 +637,7 @@ static void test_ws_accept_key_format(void)
     char accept_key[64] = {0};
     const char* client_key = "dGhlIHNhbXBsZSBub25jZQ==";
 
-    ws_compute_accept_key(client_key, accept_key, sizeof(accept_key));
+    TEST_ASSERT_EQUAL(0, ws_compute_accept_key(client_key, accept_key, sizeof(accept_key), NULL));
 
     // Base64 encoded strings only contain: A-Z, a-z, 0-9, +, /, =
     for (size_t i = 0; i < strlen(accept_key); i++) {
@@ -660,8 +660,8 @@ static void test_compute_accept_key_deterministic(void)
     char accept_key1[64] = {0};
     char accept_key2[64] = {0};
 
-    ws_compute_accept_key(client_key, accept_key1, sizeof(accept_key1));
-    ws_compute_accept_key(client_key, accept_key2, sizeof(accept_key2));
+    TEST_ASSERT_EQUAL(0, ws_compute_accept_key(client_key, accept_key1, sizeof(accept_key1), NULL));
+    TEST_ASSERT_EQUAL(0, ws_compute_accept_key(client_key, accept_key2, sizeof(accept_key2), NULL));
 
     // Same input should produce same output
     TEST_ASSERT_EQUAL_STRING(accept_key1, accept_key2);
@@ -673,7 +673,7 @@ static void test_compute_accept_key_short_key(void)
     const char* client_key = "AAAAAAAAAAAAAAAAAAAAAA==";
     char accept_key[64] = {0};
 
-    ws_compute_accept_key(client_key, accept_key, sizeof(accept_key));
+    TEST_ASSERT_EQUAL(0, ws_compute_accept_key(client_key, accept_key, sizeof(accept_key), NULL));
 
     // Should produce valid base64 output
     TEST_ASSERT_TRUE(strlen(accept_key) > 0);
@@ -686,7 +686,7 @@ static void test_compute_accept_key_small_buffer(void)
     const char* client_key = "dGhlIHNhbXBsZSBub25jZQ==";
     char accept_key[32] = {0};  // Just big enough for the output
 
-    ws_compute_accept_key(client_key, accept_key, sizeof(accept_key));
+    TEST_ASSERT_EQUAL(0, ws_compute_accept_key(client_key, accept_key, sizeof(accept_key), NULL));
 
     // Should still work with exact-size buffer
     TEST_ASSERT_EQUAL_STRING("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", accept_key);
@@ -698,7 +698,7 @@ static void test_compute_accept_key_empty(void)
     const char* client_key = "";
     char accept_key[64] = {0};
 
-    ws_compute_accept_key(client_key, accept_key, sizeof(accept_key));
+    TEST_ASSERT_EQUAL(0, ws_compute_accept_key(client_key, accept_key, sizeof(accept_key), NULL));
 
     // Should produce output (SHA1 of just the GUID)
     TEST_ASSERT_TRUE(strlen(accept_key) > 0);
@@ -711,9 +711,9 @@ static void test_ws_accept_key_uniqueness(void)
     char accept2[64] = {0};
     char accept3[64] = {0};
 
-    ws_compute_accept_key("key1AAAAAAAAAAAAAAAAaa==", accept1, sizeof(accept1));
-    ws_compute_accept_key("key2BBBBBBBBBBBBBBBBBB==", accept2, sizeof(accept2));
-    ws_compute_accept_key("key3CCCCCCCCCCCCCCCCCC==", accept3, sizeof(accept3));
+    TEST_ASSERT_EQUAL(0, ws_compute_accept_key("key1AAAAAAAAAAAAAAAAaa==", accept1, sizeof(accept1), NULL));
+    TEST_ASSERT_EQUAL(0, ws_compute_accept_key("key2BBBBBBBBBBBBBBBBBB==", accept2, sizeof(accept2), NULL));
+    TEST_ASSERT_EQUAL(0, ws_compute_accept_key("key3CCCCCCCCCCCCCCCCCC==", accept3, sizeof(accept3), NULL));
 
     // All should be different
     TEST_ASSERT_NOT_EQUAL_MESSAGE(0, strcmp(accept1, accept2), "accept1 and accept2 should differ");

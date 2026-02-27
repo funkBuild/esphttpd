@@ -2,13 +2,11 @@
 #include <string.h>
 #include "esp_log.h"
 
-static const char* TAG = "HTTP_PARSER";
-
-// External WebSocket key buffer defined in esphttpd.c
-extern char ws_client_key[32];
+static const char TAG[] = "HTTP_PARSER";
 
 // External function to store headers (defined in esphttpd.c)
-extern void esphttpd_store_header(const uint8_t* key, uint8_t key_len,
+extern void esphttpd_store_header(connection_t* conn,
+                                  const uint8_t* key, uint8_t key_len,
                                   const uint8_t* value, uint8_t value_len);
 
 http_method_t http_parse_method(const uint8_t* method, uint8_t len) {
@@ -183,9 +181,10 @@ bool http_parse_keep_alive(const uint8_t* value, uint8_t len) {
 
 void http_process_header(connection_t* conn,
                         const uint8_t* key, uint8_t key_len,
-                        const uint8_t* value, uint8_t value_len) {
-    // Store all headers for user access
-    esphttpd_store_header(key, key_len, value, value_len);
+                        const uint8_t* value, uint8_t value_len,
+                        http_parser_context_t* parser_ctx) {
+    // Store all headers for user access (pass connection for per-connection storage)
+    esphttpd_store_header(conn, key, key_len, value, value_len);
 
     header_type_t type = http_identify_header(key, key_len);
 
@@ -205,10 +204,10 @@ void http_process_header(connection_t* conn,
             break;
 
         case HEADER_SEC_WEBSOCKET_KEY:
-            // Store WebSocket key for handshake (always store, regardless of header order)
-            if (value_len < 32) {
-                memcpy(ws_client_key, value, value_len);
-                ws_client_key[value_len] = '\0';
+            // Store WebSocket key in parser context (per-parse, no global race)
+            if (value_len < sizeof(parser_ctx->ws_client_key)) {
+                memcpy(parser_ctx->ws_client_key, value, value_len);
+                parser_ctx->ws_client_key[value_len] = '\0';
                 conn->is_websocket = 1;
             }
             break;
@@ -264,13 +263,13 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                     }
                     // Store URL info in connection
                     // Note: In production, would copy URL to persistent storage
-                    conn->url_len = ctx->url_len; // Already limited to uint8_t max (255)
+                    conn->url_len = ctx->url_len;
                     ctx->state = PARSE_STATE_VERSION;
                 } else if (__builtin_expect(c == '\r' || c == '\n', 0)) {
                     return PARSE_ERROR; // Invalid request line
                 } else {
                     ctx->url_len++;
-                    if (__builtin_expect(ctx->url_len == 255, 0)) { // Max URL length for uint8_t
+                    if (__builtin_expect(ctx->url_len >= 2048, 0)) { // Max URL length
                         return PARSE_ERROR;
                     }
                 }
@@ -326,7 +325,8 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                     if (ctx->current_header_key && ctx->current_header_value) {
                         http_process_header(conn,
                                           ctx->current_header_key, ctx->header_key_len,
-                                          ctx->current_header_value, ctx->header_value_len);
+                                          ctx->current_header_value, ctx->header_value_len,
+                                          ctx);
                     }
                     ctx->header_count++;
                 } else if (__builtin_expect(c == '\n', 0)) {

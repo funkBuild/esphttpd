@@ -127,10 +127,9 @@ void connection_pool_init(connection_pool_t* pool)
     if (!pool) return;
 
     memset(pool, 0, sizeof(connection_pool_t));
-    // Initialize all connections as free
+    // Initialize fd to -1; state is already CONN_STATE_FREE (0) from memset
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         pool->connections[i].fd = -1;
-        pool->connections[i].state = CONN_STATE_FREE;
     }
 }
 

@@ -1,38 +1,48 @@
 #include "private/filesystem.h"
 #include <string.h>
-#include <stdio.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <inttypes.h>
 #include <errno.h>
 #include "esp_log.h"
 #include "esp_littlefs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-static const char* TAG = "FILESYSTEM";
+static const char TAG[] = "FILESYSTEM";
 
-// Helper to send all data, handling partial writes
-static ssize_t send_all(int fd, const void* data, size_t len) {
-    const uint8_t* ptr = (const uint8_t*)data;
-    size_t remaining = len;
+// Send function callback - set by server to route through send_nonblocking().
+// When NULL, falls back to blocking write() for backward compatibility (tests).
+static fs_send_func_t s_send_func = NULL;
 
-    while (remaining > 0) {
-        ssize_t sent = send(fd, ptr, remaining, 0);
-        if (sent < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                vTaskDelay(1);
-                continue;
-            }
-            ESP_LOGE(TAG, "send_all failed: %s", strerror(errno));
-            return -1;
-        }
-        ptr += sent;
-        remaining -= sent;
+// File stream function callback - set by server to route through send_buffer.
+// When NULL, falls back to blocking read/send loop (tests).
+static fs_start_file_stream_func_t s_file_stream_func = NULL;
+
+void fs_set_send_func(fs_send_func_t func) {
+    s_send_func = func;
+}
+
+void fs_set_file_stream_func(fs_start_file_stream_func_t func) {
+    s_file_stream_func = func;
+}
+
+// Send helper: uses non-blocking callback when available, falls back to blocking write
+static ssize_t fs_send(connection_t* conn, const void* data, size_t len) {
+    if (s_send_func) {
+        return s_send_func(conn, data, len);
     }
-    return (ssize_t)len;
+    // Fallback for tests: blocking write
+    return write(conn->fd, data, len);
+}
+
+// Format uint32_t as decimal digits. Returns number of digits written.
+static inline int format_uint(char* buf, uint32_t value) {
+    char tmp[10]; int n = 0;
+    do { tmp[n++] = '0' + (value % 10); value /= 10; } while (value);
+    for (int i = n - 1; i >= 0; i--) *buf++ = tmp[i];
+    return n;
 }
 
 // Default MIME type mappings - ordered by request frequency for early exit
@@ -110,6 +120,7 @@ int filesystem_init(filesystem_t* fs, const filesystem_config_t* config) {
 
     // Store configuration
     strncpy(fs->base_path, config->base_path, sizeof(fs->base_path) - 1);
+    fs->base_path_len = (uint8_t)strlen(fs->base_path);
     fs->mounted = true;
     fs->open_files = 0;
 
@@ -137,9 +148,13 @@ void filesystem_unmount(filesystem_t* fs) {
 bool filesystem_file_exists(filesystem_t* fs, const char* path) {
     if (!fs->mounted) return false;
 
-    char full_path[256];
-    // Build path once, then append .gz suffix instead of rebuilding
-    size_t path_len = snprintf(full_path, sizeof(full_path), "%s%s", fs->base_path, path);
+    char full_path[128];
+    // Build path with memcpy using cached base_path_len
+    size_t input_len = strlen(path);
+    size_t path_len = fs->base_path_len + input_len;
+    if (path_len >= sizeof(full_path)) return false;
+    memcpy(full_path, fs->base_path, fs->base_path_len);
+    memcpy(full_path + fs->base_path_len, path, input_len + 1);
 
     struct stat st;
     if (stat(full_path, &st) == 0) {
@@ -191,20 +206,23 @@ bool filesystem_get_metadata(filesystem_t* fs,
                             file_metadata_t* metadata) {
     if (!fs->mounted) return false;
 
-    char full_path[256];
     struct stat st;
     bool is_gzipped = false;
 
-    // Build path once, then append .gz suffix instead of rebuilding
-    size_t path_len = snprintf(full_path, sizeof(full_path), "%s%s", fs->base_path, path);
-    if (stat(full_path, &st) != 0) {
+    // Build path directly into metadata->full_path with memcpy (avoids rebuild in send_file)
+    size_t input_len = strlen(path);
+    size_t path_len = fs->base_path_len + input_len;
+    if (path_len >= sizeof(metadata->full_path)) return false;
+    memcpy(metadata->full_path, fs->base_path, fs->base_path_len);
+    memcpy(metadata->full_path + fs->base_path_len, path, input_len + 1);
+    if (stat(metadata->full_path, &st) != 0) {
         // Try gzipped version - append .gz to existing path
-        if (path_len + 3 < sizeof(full_path)) {
-            full_path[path_len] = '.';
-            full_path[path_len + 1] = 'g';
-            full_path[path_len + 2] = 'z';
-            full_path[path_len + 3] = '\0';
-            if (stat(full_path, &st) != 0) {
+        if (path_len + 3 < sizeof(metadata->full_path)) {
+            metadata->full_path[path_len] = '.';
+            metadata->full_path[path_len + 1] = 'g';
+            metadata->full_path[path_len + 2] = 'z';
+            metadata->full_path[path_len + 3] = '\0';
+            if (stat(metadata->full_path, &st) != 0) {
                 return false;
             }
             is_gzipped = true;
@@ -232,65 +250,24 @@ const char* filesystem_get_mime_type(const char* path) {
 }
 
 bool filesystem_validate_path(const char* path) {
-    if (path == NULL || path[0] == '\0') {
-        return false;
-    }
+    if (!path || !*path) return false;
 
-    // Check for literal ".." sequences
-    if (strstr(path, "..") != NULL) {
-        ESP_LOGW(TAG, "Directory traversal attempt (..): %s", path);
-        return false;
-    }
-
-    // Check for URL-encoded dangerous characters
-    // %2e = '.', %2f = '/', %5c = '\' (backslash)
-    const char* p = path;
-    while ((p = strchr(p, '%')) != NULL) {
-        if (p[1] != '\0' && p[2] != '\0') {
-            char c1 = p[1];
-            char c2 = p[2];
-
-            // Check for %2e or %2E (URL-encoded '.')
-            if ((c1 == '2' || c1 == '0') &&
-                (c2 == 'e' || c2 == 'E')) {
-                ESP_LOGW(TAG, "URL-encoded dot rejected: %s", path);
-                return false;
-            }
-
-            // Check for %2f or %2F (URL-encoded '/')
-            if ((c1 == '2' || c1 == '0') &&
-                (c2 == 'f' || c2 == 'F')) {
-                ESP_LOGW(TAG, "URL-encoded slash rejected: %s", path);
-                return false;
-            }
-
-            // Check for %5c or %5C (URL-encoded backslash)
-            if ((c1 == '5') && (c2 == 'c' || c2 == 'C')) {
-                ESP_LOGW(TAG, "URL-encoded backslash rejected: %s", path);
-                return false;
-            }
-
-            // Check for %00 (null byte)
-            if (c1 == '0' && c2 == '0') {
-                ESP_LOGW(TAG, "URL-encoded null byte rejected: %s", path);
-                return false;
-            }
+    // Single-pass validation: check all dangerous patterns in one scan
+    char prev = 0;
+    for (const char* p = path; *p; p++) {
+        char c = *p;
+        if (c == '\\') return false;
+        if (c == '.' && prev == '.') return false;
+        if (c == '/' && prev == '/') return false;
+        if (c == '%' && p[1] && p[2]) {
+            // Check percent-encoded dangerous chars
+            char c1 = p[1], c2 = p[2] | 0x20;  // lowercase the second hex digit
+            if ((c1 == '2' && (c2 == 'e' || c2 == 'f')) ||  // %2e=. %2f=/
+                (c1 == '5' && c2 == 'c') ||                  // %5c=backslash
+                (c1 == '0' && p[2] == '0')) return false;     // %00=null
         }
-        p++;
+        prev = c;
     }
-
-    // Reject double slashes (path confusion)
-    if (strstr(path, "//") != NULL) {
-        ESP_LOGW(TAG, "Double slash in path rejected: %s", path);
-        return false;
-    }
-
-    // Reject backslashes
-    if (strchr(path, '\\') != NULL) {
-        ESP_LOGW(TAG, "Backslash in path rejected: %s", path);
-        return false;
-    }
-
     return true;
 }
 
@@ -308,15 +285,19 @@ int filesystem_serve_file(filesystem_t* fs,
     }
 
     // Buffer for index path if needed
-    static char index_path[256];
+    char index_path[128];
     const char* actual_path = path;
+    size_t path_len = strlen(path);
 
     // Get file metadata
     file_metadata_t metadata;
     if (!filesystem_get_metadata(fs, actual_path, &metadata)) {
         // Try index.html for directories
-        if (path[strlen(path) - 1] == '/') {
-            snprintf(index_path, sizeof(index_path), "%sindex.html", path);
+        if (path_len > 0 && path[path_len - 1] == '/') {
+            static const char index_suffix[] = "index.html";
+            if (path_len + sizeof(index_suffix) > sizeof(index_path)) return -1;
+            memcpy(index_path, path, path_len);
+            memcpy(index_path + path_len, index_suffix, sizeof(index_suffix));
             if (!filesystem_get_metadata(fs, index_path, &metadata)) {
                 return -1;
             }
@@ -339,12 +320,9 @@ int filesystem_send_file(filesystem_t* fs,
                         connection_t* conn,
                         const char* path,
                         file_metadata_t* metadata) {
-    char full_path[256];
-    if (metadata->is_gzipped) {
-        snprintf(full_path, sizeof(full_path), "%s%s.gz", fs->base_path, path);
-    } else {
-        snprintf(full_path, sizeof(full_path), "%s%s", fs->base_path, path);
-    }
+    (void)fs;    // No longer needed: path is pre-built in metadata
+    (void)path;  // Path is now pre-built in metadata->full_path
+    const char* full_path = metadata->full_path;
 
     // Open file
     int file_fd = open(full_path, O_RDONLY);
@@ -353,39 +331,55 @@ int filesystem_send_file(filesystem_t* fs,
         return -1;
     }
 
-    // Send HTTP headers
+    // Send HTTP headers: memcpy static parts + dynamic mime_type and size
     char headers[512];
-    int header_len = snprintf(headers, sizeof(headers),
-                             "HTTP/1.1 200 OK\r\n"
-                             "Content-Type: %s\r\n"
-                             "Content-Length: %" PRIu32 "\r\n",
-                             metadata->mime_type,
-                             metadata->size);
+    static const char h1[] = "HTTP/1.1 200 OK\r\nContent-Type: ";
+    static const char h2[] = "\r\nContent-Length: ";
+    static const char h3[] = "\r\n";
+    char* p = headers;
+    memcpy(p, h1, sizeof(h1) - 1); p += sizeof(h1) - 1;
+    size_t mime_len = strlen(metadata->mime_type);
+    memcpy(p, metadata->mime_type, mime_len); p += mime_len;
+    memcpy(p, h2, sizeof(h2) - 1); p += sizeof(h2) - 1;
+    p += format_uint(p, metadata->size);
+    memcpy(p, h3, sizeof(h3) - 1); p += sizeof(h3) - 1;
+    int header_len = (int)(p - headers);
 
+    // Append conditional static headers with memcpy
     if (metadata->is_gzipped) {
-        header_len += snprintf(headers + header_len,
-                              sizeof(headers) - header_len,
-                              "Content-Encoding: gzip\r\n");
+        static const char ce_gzip[] = "Content-Encoding: gzip\r\n";
+        memcpy(headers + header_len, ce_gzip, sizeof(ce_gzip) - 1);
+        header_len += sizeof(ce_gzip) - 1;
     }
 
-    // Add cache headers using pre-computed flag (avoids duplicate MIME table lookup)
     if (metadata->cacheable) {
-        header_len += snprintf(headers + header_len,
-                             sizeof(headers) - header_len,
-                             "Cache-Control: public, max-age=86400\r\n");
+        static const char cc_cache[] = "Cache-Control: public, max-age=86400\r\n";
+        memcpy(headers + header_len, cc_cache, sizeof(cc_cache) - 1);
+        header_len += sizeof(cc_cache) - 1;
     }
 
-    header_len += snprintf(headers + header_len,
-                          sizeof(headers) - header_len,
-                          "\r\n");
+    // End headers
+    headers[header_len++] = '\r';
+    headers[header_len++] = '\n';
 
-    // Send headers
-    if (send_all(conn->fd, headers, header_len) < 0) {
+    // Send headers via non-blocking send
+    if (fs_send(conn, headers, header_len) < 0) {
         close(file_fd);
         return -1;
     }
 
-    // Stream file content
+    // Stream file content - use non-blocking file streaming when available
+    if (s_file_stream_func) {
+        // Non-blocking: hand off file to send_buffer infrastructure.
+        // Ownership of file_fd transfers to the stream function (it will close it).
+        if (s_file_stream_func(conn, file_fd, metadata->size) < 0) {
+            close(file_fd);
+            return -1;
+        }
+        return (int)metadata->size;
+    }
+
+    // Fallback: blocking read/send loop (for tests without server infrastructure)
     uint8_t buffer[1024];
     int total_sent = filesystem_stream_file(file_fd, conn->fd,
                                            metadata->size,
@@ -429,29 +423,3 @@ int filesystem_stream_file(int file_fd,
     return total_sent;
 }
 
-void filesystem_set_cache_headers(connection_t* conn,
-                                 bool cacheable,
-                                 uint32_t max_age) {
-    // This would be integrated with the response sending
-    // For now, just a placeholder
-    (void)conn;
-    (void)cacheable;
-    (void)max_age;
-}
-
-bool filesystem_check_etag(connection_t* conn,
-                          const char* etag) {
-    // Would check If-None-Match header
-    // Placeholder for now
-    (void)conn;
-    (void)etag;
-    return false;
-}
-
-void filesystem_set_etag(connection_t* conn,
-                        file_metadata_t* metadata) {
-    // Would generate and set ETag header
-    // Placeholder for now
-    (void)conn;
-    (void)metadata;
-}

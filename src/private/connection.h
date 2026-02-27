@@ -15,7 +15,11 @@ extern "C" {
 #endif
 #define MAX_CONNECTIONS CONFIG_HTTPD_MAX_CONNECTIONS
 
-// Connection states
+// Enforce limit: active_mask/write_pending_mask/ws_active_mask are uint32_t bitmasks
+_Static_assert(MAX_CONNECTIONS <= 32,
+    "MAX_CONNECTIONS exceeds uint32_t bitmask capacity");
+
+// Connection states (must fit in 3-bit bitfield, max value 7)
 typedef enum {
     CONN_STATE_FREE = 0,        // Connection slot is free
     CONN_STATE_NEW,             // New connection, reading request line
@@ -23,8 +27,13 @@ typedef enum {
     CONN_STATE_HTTP_BODY,       // Reading HTTP body
     CONN_STATE_WEBSOCKET,       // WebSocket connection
     CONN_STATE_CLOSING,         // Connection is closing
-    CONN_STATE_CLOSED           // Connection closed, pending cleanup
+    CONN_STATE_CLOSED,          // Connection closed, pending cleanup
+    CONN_STATE_WS_CLOSING       // WebSocket close sent, waiting for client ack (RFC 6455)
 } conn_state_t;
+
+// Ensure connection states fit in 3-bit bitfield
+_Static_assert(CONN_STATE_WS_CLOSING <= 7,
+    "Connection states exceed 3-bit bitfield capacity");
 
 // HTTP methods - use the public type from esphttpd.h
 // Note: The http_method_t enum is defined in esphttpd.h with values:
@@ -42,52 +51,47 @@ typedef enum {
     WS_OPCODE_PONG         = 0xA
 } ws_opcode_internal_t;
 
-// Packed connection structure - ~36 bytes per connection
-typedef struct __attribute__((packed)) {
-    int fd;                      // Socket file descriptor (4 bytes)
+// Connection structure - naturally aligned for zero-penalty access on Xtensa
+// Fields ordered by alignment: 32-bit, 16-bit, 8-bit, bitfields
+// ~40 bytes per connection (vs ~36 packed), eliminates unaligned access traps
+typedef struct {
+    // 32-bit aligned fields (24 bytes)
+    int fd;                      // Socket file descriptor
+    uint32_t content_length;     // Expected content length (supports up to 4GB)
+    uint32_t bytes_received;     // Bytes received for current message
+    uint32_t ws_mask_key;        // WebSocket masking key (when masked)
+    uint32_t last_activity;      // Last activity timestamp (tick count)
+    void* user_ctx;              // User-defined context
 
-    // State and flags (2 bytes total)
+    // 16-bit aligned fields (12 bytes)
+    uint16_t header_bytes;       // Bytes of headers received
+    uint16_t ws_payload_len;     // Current frame payload length
+    uint16_t ws_payload_read;    // Payload bytes already processed
+    uint16_t route_id;           // Current route ID
+    uint16_t url_offset;         // Offset in shared URL buffer
+    uint16_t url_len;            // URL length
+
+    // 8-bit fields (1 byte)
+    uint8_t pool_index;          // Index in connection pool (0-63) for O(1) context lookup
+                                 // Note: effective max is 32 due to uint32_t bitmasks (enforced by _Static_assert)
+
+    // State and flags bitfields (1 byte)
     uint8_t state : 3;           // Connection state (3 bits)
     uint8_t is_websocket : 1;    // Is this a WebSocket connection (1 bit)
     uint8_t keep_alive : 1;      // HTTP keep-alive (1 bit)
     uint8_t method : 3;          // HTTP method (3 bits)
 
-    uint8_t ws_fin : 1;          // WebSocket FIN flag (1 bit)
-    uint8_t ws_masked : 1;       // WebSocket frame is masked (1 bit)
-    uint8_t ws_opcode : 4;       // WebSocket opcode (4 bits)
-    uint8_t ws_fragment : 1;     // Currently processing fragment (1 bit)
-    uint8_t upgrade_ws : 1;      // Pending WebSocket upgrade (1 bit)
+    // WebSocket flags bitfield (1 byte)
+    uint8_t ws_fin : 1;         // WebSocket FIN flag (1 bit)
+    uint8_t ws_masked : 1;      // WebSocket frame is masked (1 bit)
+    uint8_t ws_opcode : 4;      // WebSocket opcode (4 bits)
+    uint8_t ws_fragment : 1;    // Currently processing fragment (1 bit)
+    uint8_t upgrade_ws : 1;     // Pending WebSocket upgrade (1 bit)
 
-    // Deferred request handling and pool index (1 byte)
-    uint8_t deferred : 1;        // Body handling deferred to callbacks (1 bit)
-    uint8_t defer_paused : 1;    // Deferred receiving paused (flow control) (1 bit)
-    uint8_t continuation : 1;    // Body handling via continuation callbacks (1 bit)
-    uint8_t pool_index : 5;      // Index in connection pool (0-31) for O(1) context lookup
-
-    // Parsing state (2 bytes)
-    uint16_t header_bytes;       // Bytes of headers received
-
-    // Content tracking (8 bytes) - supports uploads up to 4GB
-    uint32_t content_length;     // Expected content length
-    uint32_t bytes_received;     // Bytes received for current message
-
-    // WebSocket state (8 bytes)
-    uint16_t ws_payload_len;     // Current frame payload length
-    uint16_t ws_payload_read;    // Payload bytes already processed
-    uint32_t ws_mask_key;        // Masking key (when masked)
-
-    // Routing (2 bytes)
-    uint16_t route_id;           // Current route ID
-
-    // URL tracking (2 bytes)
-    uint16_t url_offset;         // Offset in shared URL buffer
-    uint8_t url_len;             // URL length
-
-    // Timing (4 bytes)
-    uint32_t last_activity;      // Last activity timestamp (tick count)
-
-    // Optional user context (4 bytes)
-    void* user_ctx;              // User-defined context
+    // Deferred handling flags bitfield (1 byte)
+    uint8_t deferred : 1;       // Body handling deferred to callbacks (1 bit)
+    uint8_t defer_paused : 1;   // Deferred receiving paused (flow control) (1 bit)
+    uint8_t continuation : 1;   // Body handling via continuation callbacks (1 bit)
 } connection_t;
 
 // Connection pool management

@@ -180,8 +180,7 @@ describe('CORS (Cross-Origin Resource Sharing)', () => {
   });
 
   describe('CORS on Other Endpoints', () => {
-    it('should check if CORS is endpoint-specific', async () => {
-      // Test a different endpoint to see if CORS is global or per-endpoint
+    it('should not include CORS headers on non-CORS endpoints', async () => {
       const response = await axios.get('/api/status', {
         headers: {
           'Origin': 'http://example.com'
@@ -189,10 +188,9 @@ describe('CORS (Cross-Origin Resource Sharing)', () => {
       });
 
       expect(response.status).toBe(200);
-      // CORS headers may or may not be present on other endpoints
-      // This test documents the actual behavior
-      const hasCorsHeaders = response.headers['access-control-allow-origin'] !== undefined;
-      console.log(`Other endpoints ${hasCorsHeaders ? 'have' : 'do not have'} CORS headers`);
+      // CORS is endpoint-specific - non-CORS endpoints should not have CORS headers
+      expect(response.headers['access-control-allow-origin']).toBeUndefined();
+      expect(response.headers['access-control-allow-methods']).toBeUndefined();
     });
   });
 

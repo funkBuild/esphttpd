@@ -3,7 +3,7 @@
 #include <unistd.h>
 #include "esp_log.h"
 
-static const char* TAG = "TEMPLATE";
+static const char TAG[] = "TEMPLATE";
 
 // Template parser states
 enum {
@@ -279,7 +279,7 @@ int template_escape_html(const uint8_t* input,
 int template_var_env(const char* var_name, uint8_t* output,
                     size_t output_size, void* user_data) {
     // Skip "env." prefix if present
-    if (strncmp(var_name, "env.", 4) == 0) {
+    if (memcmp(var_name, "env.", 4) == 0) {
         var_name += 4;
     }
 

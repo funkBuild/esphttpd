@@ -177,15 +177,16 @@ static void perf_radix_lookup_static(void) {
     radix_insert(tree, "/api/auth/login", HTTP_POST, dummy_handler, NULL, NULL, 0);
     radix_insert(tree, "/api/auth/logout", HTTP_POST, dummy_handler, NULL, NULL, 0);
 
+    radix_match_t m;
     PERF_WARMUP({
-        radix_match_t m = radix_lookup(tree, "/api/users", HTTP_GET, false);
-        if (m.middlewares) free(m.middlewares);
+        radix_lookup(tree, "/api/users", HTTP_GET, false, &m, NULL, NULL);
+
     });
 
     PERF_START();
     for (int i = 0; i < ITERS; i++) {
-        radix_match_t m = radix_lookup(tree, "/api/users", HTTP_GET, false);
-        if (m.middlewares) free(m.middlewares);
+        radix_lookup(tree, "/api/users", HTTP_GET, false, &m, NULL, NULL);
+
     }
     PERF_END("radix_lookup_static", ITERS);
 
@@ -201,15 +202,16 @@ static void perf_radix_lookup_param(void) {
     radix_insert(tree, "/users/:id", HTTP_GET, dummy_handler, NULL, NULL, 0);
     radix_insert(tree, "/users/:id/posts", HTTP_GET, dummy_handler, NULL, NULL, 0);
 
+    radix_match_t m;
     PERF_WARMUP({
-        radix_match_t m = radix_lookup(tree, "/users/12345", HTTP_GET, false);
-        if (m.middlewares) free(m.middlewares);
+        radix_lookup(tree, "/users/12345", HTTP_GET, false, &m, NULL, NULL);
+
     });
 
     PERF_START();
     for (int i = 0; i < ITERS; i++) {
-        radix_match_t m = radix_lookup(tree, "/users/12345", HTTP_GET, false);
-        if (m.middlewares) free(m.middlewares);
+        radix_lookup(tree, "/users/12345", HTTP_GET, false, &m, NULL, NULL);
+
     }
     PERF_END("radix_lookup_param", ITERS);
 
@@ -224,15 +226,16 @@ static void perf_radix_lookup_deep(void) {
 
     radix_insert(tree, "/api/v1/users/profile/settings", HTTP_GET, dummy_handler, NULL, NULL, 0);
 
+    radix_match_t m;
     PERF_WARMUP({
-        radix_match_t m = radix_lookup(tree, "/api/v1/users/profile/settings", HTTP_GET, false);
-        if (m.middlewares) free(m.middlewares);
+        radix_lookup(tree, "/api/v1/users/profile/settings", HTTP_GET, false, &m, NULL, NULL);
+
     });
 
     PERF_START();
     for (int i = 0; i < ITERS; i++) {
-        radix_match_t m = radix_lookup(tree, "/api/v1/users/profile/settings", HTTP_GET, false);
-        if (m.middlewares) free(m.middlewares);
+        radix_lookup(tree, "/api/v1/users/profile/settings", HTTP_GET, false, &m, NULL, NULL);
+
     }
     PERF_END("radix_lookup_deep", ITERS);
 
@@ -248,15 +251,16 @@ static void perf_radix_lookup_miss(void) {
     radix_insert(tree, "/api/users", HTTP_GET, dummy_handler, NULL, NULL, 0);
     radix_insert(tree, "/api/posts", HTTP_GET, dummy_handler, NULL, NULL, 0);
 
+    radix_match_t m;
     PERF_WARMUP({
-        radix_match_t m = radix_lookup(tree, "/api/nonexistent", HTTP_GET, false);
-        if (m.middlewares) free(m.middlewares);
+        radix_lookup(tree, "/api/nonexistent", HTTP_GET, false, &m, NULL, NULL);
+
     });
 
     PERF_START();
     for (int i = 0; i < ITERS; i++) {
-        radix_match_t m = radix_lookup(tree, "/api/nonexistent", HTTP_GET, false);
-        if (m.middlewares) free(m.middlewares);
+        radix_lookup(tree, "/api/nonexistent", HTTP_GET, false, &m, NULL, NULL);
+
     }
     PERF_END("radix_lookup_miss", ITERS);
 

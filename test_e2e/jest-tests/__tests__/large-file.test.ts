@@ -5,21 +5,7 @@
 
 import axios from 'axios';
 import { BASE_URL } from '../jest.setup';
-
-// Helper to verify block pattern
-function verifyBlockPattern(data: Buffer, expectedBlocks: number): boolean {
-  for (let block = 0; block < expectedBlocks; block++) {
-    const offset = block * 1024;
-    const expectedHeader = `BLOCK_${block.toString().padStart(4, '0')}:`;
-    const actualHeader = data.slice(offset, offset + 11).toString();
-
-    if (actualHeader !== expectedHeader) {
-      console.error(`Block ${block}: expected "${expectedHeader}", got "${actualHeader}"`);
-      return false;
-    }
-  }
-  return true;
-}
+import { verifyBlockPattern, TIMEOUTS } from '../test-utils';
 
 describe('Large File Downloads', () => {
 
@@ -28,7 +14,7 @@ describe('Large File Downloads', () => {
       const startTime = Date.now();
       const response = await axios.get('/largefile/100', {
         responseType: 'arraybuffer',
-        timeout: 30000  // 30 second timeout
+        timeout: TIMEOUTS.DOWNLOAD_SM
       });
       const elapsed = Date.now() - startTime;
 
@@ -42,13 +28,13 @@ describe('Large File Downloads', () => {
       expect(verifyBlockPattern(data, 100)).toBe(true);
 
       console.log(`100KB chunked download completed in ${elapsed}ms`);
-    }, 35000);
+    }, TIMEOUTS.DOWNLOAD_SM + 5000);
 
     it('should download 256KB file without stalling', async () => {
       const startTime = Date.now();
       const response = await axios.get('/largefile/256', {
         responseType: 'arraybuffer',
-        timeout: 60000
+        timeout: TIMEOUTS.DOWNLOAD_MD
       });
       const elapsed = Date.now() - startTime;
 
@@ -61,13 +47,13 @@ describe('Large File Downloads', () => {
       expect(verifyBlockPattern(data, 256)).toBe(true);
 
       console.log(`256KB chunked download completed in ${elapsed}ms`);
-    }, 65000);
+    }, TIMEOUTS.DOWNLOAD_MD + 5000);
 
     it('should download 512KB file without stalling', async () => {
       const startTime = Date.now();
       const response = await axios.get('/largefile/512', {
         responseType: 'arraybuffer',
-        timeout: 120000
+        timeout: TIMEOUTS.DOWNLOAD_LG
       });
       const elapsed = Date.now() - startTime;
 
@@ -85,7 +71,7 @@ describe('Large File Downloads', () => {
       expect(lastBlock).toBe('BLOCK_0511:');
 
       console.log(`512KB chunked download completed in ${elapsed}ms`);
-    }, 125000);
+    }, TIMEOUTS.DOWNLOAD_LG + 5000);
   });
 
   describe('GET /largefile-single/:size (single send)', () => {
@@ -97,7 +83,7 @@ describe('Large File Downloads', () => {
       try {
         const response = await axios.get('/largefile-single/100', {
           responseType: 'arraybuffer',
-          timeout: 30000
+          timeout: TIMEOUTS.DOWNLOAD_SM
         });
         const elapsed = Date.now() - startTime;
 
@@ -120,7 +106,7 @@ describe('Large File Downloads', () => {
           throw error;  // Re-throw unexpected errors
         }
       }
-    }, 35000);
+    }, TIMEOUTS.DOWNLOAD_SM + 5000);
 
     // Note: 256KB single-send may fail on memory-constrained devices (QEMU/ESP32)
     // The server correctly returns 500 when it can't allocate the buffer
@@ -129,7 +115,7 @@ describe('Large File Downloads', () => {
       try {
         const response = await axios.get('/largefile-single/256', {
           responseType: 'arraybuffer',
-          timeout: 60000
+          timeout: TIMEOUTS.DOWNLOAD_MD
         });
         const elapsed = Date.now() - startTime;
 
@@ -152,14 +138,14 @@ describe('Large File Downloads', () => {
           throw error;  // Re-throw unexpected errors
         }
       }
-    }, 65000);
+    }, TIMEOUTS.DOWNLOAD_MD + 5000);
   });
 
   describe('Data Integrity', () => {
     it('should have correct block headers throughout the file', async () => {
       const response = await axios.get('/largefile/50', {
         responseType: 'arraybuffer',
-        timeout: 30000
+        timeout: TIMEOUTS.DOWNLOAD_SM
       });
 
       const data = Buffer.from(response.data);
@@ -173,13 +159,13 @@ describe('Large File Downloads', () => {
 
         expect(actualHeader).toBe(expectedHeader);
       }
-    }, 35000);
+    }, TIMEOUTS.DOWNLOAD_SM + 5000);
 
     it('should receive complete data matching Content-Length', async () => {
       // Use chunked endpoint which doesn't require large malloc
       const response = await axios.get('/largefile/128', {
         responseType: 'arraybuffer',
-        timeout: 45000
+        timeout: TIMEOUTS.DOWNLOAD_MD
       });
 
       // For chunked encoding, verify we got all the data
@@ -189,7 +175,7 @@ describe('Large File Downloads', () => {
 
       // Verify data integrity
       expect(verifyBlockPattern(Buffer.from(response.data), 128)).toBe(true);
-    }, 50000);
+    }, TIMEOUTS.DOWNLOAD_MD + 5000);
   });
 
   describe('Concurrent Large Downloads', () => {
@@ -200,7 +186,7 @@ describe('Large File Downloads', () => {
       const requests = sizes.map(size =>
         axios.get(`/largefile/${size}`, {
           responseType: 'arraybuffer',
-          timeout: 60000
+          timeout: TIMEOUTS.DOWNLOAD_MD
         })
       );
 
@@ -218,32 +204,32 @@ describe('Large File Downloads', () => {
       });
 
       console.log(`${sizes.length} concurrent downloads completed in ${elapsed}ms`);
-    }, 65000);
+    }, TIMEOUTS.DOWNLOAD_MD + 5000);
   });
 
   describe('Edge Cases', () => {
     it('should handle default size when no size specified', async () => {
       const response = await axios.get('/largefile/', {
         responseType: 'arraybuffer',
-        timeout: 30000
+        timeout: TIMEOUTS.DOWNLOAD_SM
       });
 
       expect(response.status).toBe(200);
       // Should default to 100KB
       const data = Buffer.from(response.data);
       expect(data.length).toBe(100 * 1024);
-    }, 35000);
+    }, TIMEOUTS.DOWNLOAD_SM + 5000);
 
     it('should cap size at maximum (1MB for chunked)', async () => {
       const response = await axios.get('/largefile/2048', {  // Request 2MB
         responseType: 'arraybuffer',
-        timeout: 180000  // 3 minutes for large file
+        timeout: TIMEOUTS.DOWNLOAD_XL
       });
 
       expect(response.status).toBe(200);
       const data = Buffer.from(response.data);
       // Should be capped at 1MB
       expect(data.length).toBe(1024 * 1024);
-    }, 185000);
+    }, TIMEOUTS.DOWNLOAD_XL + 5000);
   });
 });

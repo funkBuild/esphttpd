@@ -444,15 +444,15 @@ static void test_radix_route_with_middleware(void) {
     TEST_ASSERT_EQUAL(HTTPD_OK, err);
 
     // Look up the route and verify middleware is attached
-    radix_match_t match = radix_lookup(tree, "/api/test", HTTP_GET, false);
+    radix_match_t match;
+    httpd_middleware_t mw_buf[CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE];
+    uint8_t mw_count = 0;
+    radix_lookup(tree, "/api/test", HTTP_GET, false, &match, mw_buf, &mw_count);
     TEST_ASSERT_TRUE(match.matched);
-    TEST_ASSERT_EQUAL(2, match.middleware_count);
-    TEST_ASSERT_NOT_NULL(match.middlewares);
-    TEST_ASSERT_EQUAL_PTR(middleware_1, match.middlewares[0]);
-    TEST_ASSERT_EQUAL_PTR(middleware_2, match.middlewares[1]);
+    TEST_ASSERT_EQUAL(2, mw_count);
+    TEST_ASSERT_EQUAL_PTR(middleware_1, mw_buf[0]);
+    TEST_ASSERT_EQUAL_PTR(middleware_2, mw_buf[1]);
 
-    // Clean up
-    free(match.middlewares);
     radix_tree_destroy(tree);
 }
 
@@ -473,16 +473,18 @@ static void test_radix_route_middleware_collected_during_traversal(void) {
     radix_insert(tree, "/api/posts", HTTP_GET, route_handler, NULL, mw2, 1);
 
     // Look up first route
-    radix_match_t match = radix_lookup(tree, "/api/users/123", HTTP_GET, false);
+    radix_match_t match;
+    httpd_middleware_t mw_buf[CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE];
+    uint8_t mw_count = 0;
+    radix_lookup(tree, "/api/users/123", HTTP_GET, false, &match, mw_buf, &mw_count);
     TEST_ASSERT_TRUE(match.matched);
-    TEST_ASSERT_EQUAL(1, match.middleware_count);
-    free(match.middlewares);
+    TEST_ASSERT_EQUAL(1, mw_count);
 
     // Look up second route
-    match = radix_lookup(tree, "/api/posts", HTTP_GET, false);
+    mw_count = 0;
+    radix_lookup(tree, "/api/posts", HTTP_GET, false, &match, mw_buf, &mw_count);
     TEST_ASSERT_TRUE(match.matched);
-    TEST_ASSERT_EQUAL(1, match.middleware_count);
-    free(match.middlewares);
+    TEST_ASSERT_EQUAL(1, mw_count);
 
     radix_tree_destroy(tree);
 }

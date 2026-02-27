@@ -3,10 +3,12 @@
 
 #ifdef CONFIG_ESPHTTPD_TEST_MODE
 
+#include <stdio.h>
 #include "event_loop.h"
 #include "connection.h"
 #include "filesystem.h"
 #include "radix_tree.h"
+#include "http_parser.h"
 
 // Configuration defaults - must match esphttpd.c
 #ifndef CONFIG_HTTPD_MAX_WS_ROUTES
@@ -27,7 +29,7 @@
 
 // WebSocket route entry (must match esphttpd.c)
 typedef struct {
-    char pattern[64];
+    const char* pattern;
     httpd_ws_handler_t handler;
     void* user_ctx;
     uint32_t ping_interval_ms;
@@ -35,14 +37,14 @@ typedef struct {
 
 // Mounted router entry (must match esphttpd.c)
 typedef struct {
-    char prefix[32];
+    const char* prefix;
     uint8_t prefix_len;
     httpd_router_t router;
 } test_mounted_router_t;
 
 // Channel hash entry (must match esphttpd.c)
 typedef struct {
-    char name[32];
+    char name[16];
     int8_t index;
 } test_channel_hash_entry_t;
 
@@ -103,7 +105,10 @@ typedef struct {
 
 #define MAX_QUERY_PARAMS 8
 #define REQ_HEADER_BUF_SIZE 2048
-#define MAX_REQ_HEADERS 32  // Must match esphttpd.c
+#ifndef CONFIG_HTTPD_MAX_REQ_HEADERS
+#define CONFIG_HTTPD_MAX_REQ_HEADERS 16
+#endif
+#define MAX_REQ_HEADERS CONFIG_HTTPD_MAX_REQ_HEADERS
 
 // Request header entry (must match esphttpd.c)
 typedef struct {
@@ -117,14 +122,25 @@ typedef struct {
 typedef struct {
     httpd_req_t req;                      // Public request struct
     test_req_header_entry_t headers[MAX_REQ_HEADERS];  // Header index
-    char header_buf[REQ_HEADER_BUF_SIZE]; // Header storage
-    char uri_buf[256];                    // URI storage
+    char* header_buf;                     // Header storage (dynamically allocated)
+    char* uri_buf;                        // URI storage (dynamically allocated)
     struct httpd_server* server;          // Back pointer to server
     void* matched_route;                  // Matched route
-    // Pre-received body data (received with headers)
-    uint8_t body_buf[1024];               // Buffer for body data received with headers
+    // Pre-received body data (received with headers) - dynamically allocated
+    uint8_t* body_buf;                    // Buffer for body data (NULL if not allocated)
     size_t body_buf_len;                  // Amount of data in body_buf
     size_t body_buf_pos;                  // Current read position in body_buf
+    // HTTP header accumulation buffer (for multi-recv parsing)
+    uint8_t* recv_buf;                    // Accumulated recv data (NULL if not parsing)
+    size_t recv_buf_len;                  // Amount of data accumulated
+    size_t recv_buf_capacity;             // Allocated capacity
+    http_parser_context_t parser_ctx;     // Persistent parser context across recv calls
+    bool parsing_in_progress;             // True while headers are being accumulated
+    bool recv_buf_is_heap;                // true if recv_buf was malloc'd (needs free)
+    bool uri_buf_is_heap;                 // true if uri_buf was malloc'd (needs free)
+    // Inline buffers to eliminate per-request malloc for common cases
+    uint8_t inline_recv_buf[512];         // Embedded buffer for single-packet requests
+    char inline_uri_buf[128];             // Embedded buffer for typical URI lengths
     // Query parameter cache (lazy parsing)
     test_query_param_entry_t query_params[MAX_QUERY_PARAMS];
     uint8_t query_param_count;
@@ -133,14 +149,41 @@ typedef struct {
     struct {
         httpd_body_cb_t on_body;          // Body data callback
         httpd_done_cb_t on_done;          // Completion callback
-        void* file_ctx;                   // Internal context for defer_to_file
+        FILE* file_fp;                    // File pointer for defer_to_file (inlined)
+        httpd_done_cb_t file_user_done_cb; // User's done callback for defer_to_file (inlined)
         bool active;                      // Request is in deferred mode
         bool paused;                      // Flow control - receiving paused
     } defer;
+    // Async response sending
+    struct {
+        httpd_send_cb_t on_done;          // Completion callback
+        bool active;                      // Response send in progress
+    } async_send;
+    // Data provider for streaming responses
+    struct {
+        httpd_data_provider_t provider;   // Data provider callback
+        httpd_send_cb_t on_complete;      // Completion callback
+        bool active;                      // Provider mode active
+        bool eof_reached;                 // Provider returned 0 (EOF)
+        bool use_chunked;                 // Using chunked transfer encoding
+    } data_provider;
+    // Continuation-based body handling (non-blocking)
+    struct {
+        httpd_continuation_t handler;     // Continuation handler callback
+        httpd_req_continuation_t cont;    // Continuation state
+        bool active;                      // Continuation mode active
+    } continuation;
+    // Middleware chain (persists for request lifetime, safe across deferred handlers)
+    httpd_middleware_t mw_chain[CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE];
 } test_request_context_t;
 
-// Global request_contexts array accessible to tests (via void* for type safety)
+// Global request_contexts pointer array accessible to tests (via void* for type safety)
+// Points to request_context_t*[MAX_CONNECTIONS] - pointers into pre-allocated backing storage
 extern void* g_test_request_contexts;
+
+// Global connection_send_buffers pointer array accessible to tests
+// Points to send_buffer_t*[MAX_CONNECTIONS] - pointers into pre-allocated backing storage
+extern void* g_test_send_buffers;
 
 #endif // CONFIG_ESPHTTPD_TEST_MODE
 

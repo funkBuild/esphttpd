@@ -6,9 +6,31 @@
 #include <stddef.h>
 #include "connection.h"
 
+#include "send_buffer.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// Send callback type: routes filesystem sends through the server's non-blocking
+// send infrastructure. Signature: (connection, data, len) -> bytes sent/queued, or -1 on error
+typedef ssize_t (*fs_send_func_t)(connection_t* conn, const void* data, size_t len);
+
+// File stream callback type: initiates non-blocking file streaming via send buffer.
+// Opens the file descriptor for streaming and marks the connection as write-pending.
+// Signature: (connection, file_fd, file_size) -> 0 on success, -1 on error
+// Note: ownership of file_fd transfers to the callback (it will be closed by send_buffer)
+typedef int (*fs_start_file_stream_func_t)(connection_t* conn, int file_fd, size_t file_size);
+
+// Set the send function used by filesystem operations.
+// Called by the server during init to route sends through send_nonblocking().
+// When NULL (default), falls back to blocking send() for backward compatibility.
+void fs_set_send_func(fs_send_func_t func);
+
+// Set the file stream function used by filesystem operations.
+// Called by the server during init to route file streaming through send_buffer.
+// When NULL (default), falls back to blocking read/send loop.
+void fs_set_file_stream_func(fs_start_file_stream_func_t func);
 
 // File system configuration for LittleFS
 typedef struct {
@@ -36,12 +58,14 @@ typedef struct {
     bool is_gzipped;
     bool cacheable;              // Whether to set cache headers (avoids duplicate MIME lookup)
     const char* mime_type;
+    char full_path[128];         // Pre-built full path (avoids rebuild in send_file)
 } file_metadata_t;
 
 // File system context
 typedef struct {
     bool mounted;
     char base_path[32];
+    uint8_t base_path_len;           // Cached strlen(base_path) for fast path building
     uint8_t open_files;
 } filesystem_t;
 
@@ -81,29 +105,12 @@ int filesystem_stream_file(int file_fd,
                           uint8_t* buffer,
                           size_t buffer_size);
 
-// Directory listing (optional, returns JSON)
-int filesystem_list_directory(filesystem_t* fs,
-                             connection_t* conn,
-                             const char* path);
-
 // Get MIME type from file extension
 const char* filesystem_get_mime_type(const char* path);
 
 // Default MIME types
 extern const mime_type_t default_mime_types[];
 extern const size_t default_mime_types_count;
-
-// Cache control helpers
-void filesystem_set_cache_headers(connection_t* conn,
-                                 bool cacheable,
-                                 uint32_t max_age);
-
-// ETags support
-bool filesystem_check_etag(connection_t* conn,
-                          const char* etag);
-
-void filesystem_set_etag(connection_t* conn,
-                        file_metadata_t* metadata);
 
 // Path security validation
 // Returns true if path is safe to use, false if it contains traversal attempts

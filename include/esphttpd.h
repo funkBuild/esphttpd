@@ -243,9 +243,11 @@ struct httpd_request {
     size_t body_received;            ///< Bytes of body received
 
     // Response state
-    bool headers_sent;               ///< Response status line sent
-    bool body_started;               ///< Body transmission started (headers finalized)
-    int status_code;                 ///< Response status code
+    uint16_t status_code;            ///< Response status code (100-599)
+    uint8_t headers_sent : 1;        ///< Response status line sent
+    uint8_t body_started : 1;        ///< Body transmission started (headers finalized)
+    uint8_t content_length_set : 1;  ///< Content-Length header manually set by user
+    uint8_t is_websocket : 1;        ///< WebSocket upgrade requested
 
     // User data
     void* user_data;                 ///< User-defined context
@@ -261,8 +263,7 @@ struct httpd_request {
     } _mw;
 
     // WebSocket upgrade
-    bool is_websocket;               ///< WebSocket upgrade requested
-    char ws_key[32];                 ///< WebSocket key for handshake
+    const char* ws_key;              ///< WebSocket key for handshake (points to parser ctx)
 };
 
 // ============================================================================
@@ -1164,7 +1165,7 @@ void httpd_ws_set_user_data(httpd_ws_t* ws, void* data);
  * case-sensitive and stored internally (no need to keep the string).
  *
  * @param ws WebSocket connection
- * @param channel Channel name (max 31 chars)
+ * @param channel Channel name (max 15 chars)
  * @return HTTPD_OK on success, error code on failure
  */
 httpd_err_t httpd_ws_join(httpd_ws_t* ws, const char* channel);

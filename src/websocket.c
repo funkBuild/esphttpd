@@ -2,13 +2,32 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <inttypes.h>
 #include <arpa/inet.h>
 #include "esp_log.h"
 #include "mbedtls/sha1.h"
 #include "mbedtls/base64.h"
 
-static const char* TAG = "WS_FRAME";
+static const char TAG[] = "WS_FRAME";
 static const char WS_GUID[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+// Send function callback - set by server to route through send_nonblocking().
+// When NULL, falls back to blocking write() (used in tests with mock fd=-1).
+static ws_send_func_t s_send_func = NULL;
+
+void ws_set_send_func(ws_send_func_t func) {
+    s_send_func = func;
+}
+
+// Internal helper: send data through the registered send function, or fall
+// back to write() when no send function is registered (test mode).
+static ssize_t ws_do_send(connection_t* conn, const void* data, size_t len) {
+    if (s_send_func) {
+        return s_send_func(conn, data, len);
+    }
+    // Fallback for tests and standalone usage
+    return write(conn->fd, data, len);
+}
 
 // Initialize frame context with pre-allocated buffer
 // Reuses existing buffer if already allocated and large enough
@@ -20,7 +39,7 @@ bool ws_frame_ctx_init(ws_frame_context_t* ctx) {
     ctx->header_bytes = 0;
     ctx->mask_bytes_read = 0;
     ctx->length_bytes_needed = 0;
-    ctx->payload_length_64 = 0;
+    ctx->payload_length = 0;
     ctx->payload_received = 0;
 
     // Pre-allocate buffer if not already present or too small
@@ -132,7 +151,7 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
                 } else { // payload_len == 127
                     ctx->state = WS_STATE_LENGTH_EXT_64;
                     ctx->length_bytes_needed = 8;
-                    ctx->payload_length_64 = 0;
+                    ctx->payload_length = 0;
                 }
                 i++;
                 break;
@@ -155,17 +174,26 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
             }
 
             case WS_STATE_LENGTH_EXT_64: {
-                ctx->payload_length_64 = (ctx->payload_length_64 << 8) | buffer[i];
+                // Reject early if any of the upper 4 bytes are non-zero
+                // (bytes_needed 8..5 are the upper 32 bits of the 64-bit length)
+                if (ctx->length_bytes_needed > 4 && buffer[i] != 0) {
+                    ESP_LOGE(TAG, "Payload too large (upper bits set)");
+                    return WS_FRAME_ERROR;
+                }
+                // Only accumulate the lower 4 bytes into payload_length
+                if (ctx->length_bytes_needed <= 4) {
+                    ctx->payload_length = (ctx->payload_length << 8) | buffer[i];
+                }
                 ctx->length_bytes_needed--;
                 i++;
 
                 if (ctx->length_bytes_needed == 0) {
                     // We only support up to 64KB payloads
-                    if (ctx->payload_length_64 > 65535) {
-                        ESP_LOGE(TAG, "Payload too large: %llu", ctx->payload_length_64);
+                    if (ctx->payload_length > 65535) {
+                        ESP_LOGE(TAG, "Payload too large: %" PRIu32, ctx->payload_length);
                         return WS_FRAME_ERROR;
                     }
-                    conn->ws_payload_len = (uint16_t)ctx->payload_length_64;
+                    conn->ws_payload_len = (uint16_t)ctx->payload_length;
                     ctx->state = conn->ws_masked ? WS_STATE_MASK : WS_STATE_PAYLOAD;
                 }
                 break;
@@ -315,8 +343,13 @@ size_t ws_build_frame_header(uint8_t* buffer, ws_opcode_internal_t opcode,
     return header_len;
 }
 
-int ws_send_frame(int fd, ws_opcode_internal_t opcode, const uint8_t* payload,
+int ws_send_frame(connection_t* conn, ws_opcode_internal_t opcode, const uint8_t* payload,
                  size_t payload_len, bool mask) {
+    if (!conn) return -1;
+
+    // Normalize: NULL payload means zero-length payload
+    if (!payload) payload_len = 0;
+
     uint8_t header[14]; // Max header size
     size_t header_len = ws_build_frame_header(header, opcode, payload_len, mask);
 
@@ -324,22 +357,37 @@ int ws_send_frame(int fd, ws_opcode_internal_t opcode, const uint8_t* payload,
         return -1;
     }
 
-    // Send header
-    if (write(fd, header, header_len) != header_len) {
-        return -1;
-    }
+    size_t total_len = header_len + payload_len;
 
-    // Send payload (would mask if needed in production)
-    if (payload_len > 0 && payload != NULL) {
-        if (write(fd, payload, payload_len) != payload_len) {
+    // Build complete frame into a single buffer to ensure atomic send.
+    // For small frames (<=256 bytes), use the stack. For larger frames,
+    // send header and payload as two separate calls - the send_buffer
+    // infrastructure ensures ordering.
+    if (total_len <= 256) {
+        uint8_t frame_buf[256];
+        memcpy(frame_buf, header, header_len);
+        if (payload_len > 0) {
+            memcpy(frame_buf + header_len, payload, payload_len);
+        }
+        if (ws_do_send(conn, frame_buf, total_len) < 0) {
             return -1;
+        }
+    } else {
+        // Larger frame: send header then payload (send_buffer preserves order)
+        if (ws_do_send(conn, header, header_len) < 0) {
+            return -1;
+        }
+        if (payload_len > 0) {
+            if (ws_do_send(conn, payload, payload_len) < 0) {
+                return -1;
+            }
         }
     }
 
-    return header_len + payload_len;
+    return (int)total_len;
 }
 
-int ws_send_close(int fd, uint16_t code, const char* reason) {
+int ws_send_close(connection_t* conn, uint16_t code, const char* reason) {
     uint8_t payload[125];
     size_t payload_len = 0;
 
@@ -361,17 +409,17 @@ int ws_send_close(int fd, uint16_t code, const char* reason) {
     }
 
     // Pass NULL when no payload to avoid uninitialized access warning
-    return ws_send_frame(fd, WS_OPCODE_CLOSE, payload_len > 0 ? payload : NULL, payload_len, false);
+    return ws_send_frame(conn, WS_OPCODE_CLOSE, payload_len > 0 ? payload : NULL, payload_len, false);
 }
 
-int ws_send_ping(int fd, const uint8_t* data, size_t len) {
+int ws_send_ping(connection_t* conn, const uint8_t* data, size_t len) {
     if (len > 125) len = 125; // Control frames limited to 125 bytes
-    return ws_send_frame(fd, WS_OPCODE_PING, data, len, false);
+    return ws_send_frame(conn, WS_OPCODE_PING, data, len, false);
 }
 
-int ws_send_pong(int fd, const uint8_t* data, size_t len) {
+int ws_send_pong(connection_t* conn, const uint8_t* data, size_t len) {
     if (len > 125) len = 125; // Control frames limited to 125 bytes
-    return ws_send_frame(fd, WS_OPCODE_PONG, data, len, false);
+    return ws_send_frame(conn, WS_OPCODE_PONG, data, len, false);
 }
 
 ws_frame_result_t ws_handle_control_frame(connection_t* conn,
@@ -383,13 +431,17 @@ ws_frame_result_t ws_handle_control_frame(connection_t* conn,
 
     switch (opcode) {
         case WS_OPCODE_CLOSE:
-            // Echo close frame back
-            ws_send_close(conn->fd, 0, NULL);
+            // Only echo close frame if this is a client-initiated close.
+            // If we're in WS_CLOSING state, the server already sent a close
+            // frame and this is the client's acknowledgment (RFC 6455 5.5.1).
+            if (conn->state != CONN_STATE_WS_CLOSING) {
+                ws_send_close(conn, 0, NULL);
+            }
             return WS_FRAME_CLOSE;
 
         case WS_OPCODE_PING:
             // Respond with pong
-            ws_send_pong(conn->fd, payload, payload_len);
+            ws_send_pong(conn, payload, payload_len);
             return WS_FRAME_OK;
 
         case WS_OPCODE_PONG:
@@ -401,34 +453,56 @@ ws_frame_result_t ws_handle_control_frame(connection_t* conn,
     }
 }
 
-void ws_compute_accept_key(const char* client_key, char* accept_key, size_t accept_key_size) {
-    // Concatenate client key with WebSocket GUID
-    char concat[256];
-    int concat_len = snprintf(concat, sizeof(concat), "%s%s", client_key, WS_GUID);
+int ws_compute_accept_key(const char* client_key, char* accept_key, size_t accept_key_size, size_t* out_len) {
+    // Streaming SHA1: feed client key and GUID separately to avoid concat buffer
+    size_t key_len = strlen(client_key);
 
-    // Compute SHA1 hash (use snprintf return value instead of redundant strlen)
+    mbedtls_sha1_context sha_ctx;
+    mbedtls_sha1_init(&sha_ctx);
+    mbedtls_sha1_starts(&sha_ctx);
+    mbedtls_sha1_update(&sha_ctx, (const unsigned char*)client_key, key_len);
+    mbedtls_sha1_update(&sha_ctx, (const unsigned char*)WS_GUID, sizeof(WS_GUID) - 1);
     unsigned char hash[20];
-    mbedtls_sha1((unsigned char*)concat, concat_len, hash);
+    mbedtls_sha1_finish(&sha_ctx, hash);
+    mbedtls_sha1_free(&sha_ctx);
 
     // Base64 encode the hash
-    size_t out_len;
-    mbedtls_base64_encode((unsigned char*)accept_key, accept_key_size,
-                         &out_len, hash, 20);
+    size_t olen;
+    int ret = mbedtls_base64_encode((unsigned char*)accept_key, accept_key_size,
+                                     &olen, hash, 20);
+    if (ret == 0 && out_len) {
+        *out_len = olen;
+    }
+    return ret;
 }
 
-int ws_send_handshake_response(int fd, const char* key) {
-    char accept_key[64];
-    ws_compute_accept_key(key, accept_key, sizeof(accept_key));
+int ws_send_handshake_response(connection_t* conn, const char* key) {
+    if (!conn) return -1;
 
-    // Build response
-    char response[512];
-    int len = snprintf(response, sizeof(response),
-                      "HTTP/1.1 101 Switching Protocols\r\n"
-                      "Upgrade: websocket\r\n"
-                      "Connection: Upgrade\r\n"
-                      "Sec-WebSocket-Accept: %s\r\n"
-                      "\r\n",
-                      accept_key);
+    char accept_key[32];
+    size_t accept_len;
+    int ret = ws_compute_accept_key(key, accept_key, sizeof(accept_key), &accept_len);
+    if (ret != 0) {
+        return -1;
+    }
 
-    return write(fd, response, len);
+    // Build response using memcpy of static prefix/suffix around the accept key
+    static const char ws_prefix[] =
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: ";
+    static const char ws_suffix[] = "\r\n\r\n";
+
+    char response[192];
+    size_t pos = 0;
+
+    memcpy(response, ws_prefix, sizeof(ws_prefix) - 1);
+    pos += sizeof(ws_prefix) - 1;
+    memcpy(response + pos, accept_key, accept_len);
+    pos += accept_len;
+    memcpy(response + pos, ws_suffix, sizeof(ws_suffix) - 1);
+    pos += sizeof(ws_suffix) - 1;
+
+    return (int)ws_do_send(conn, response, pos);
 }

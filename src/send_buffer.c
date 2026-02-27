@@ -4,7 +4,7 @@
 #include <unistd.h>
 #include "esp_log.h"
 
-static const char* TAG = "SEND_BUF";
+static const char TAG[] = "SEND_BUF";
 
 void send_buffer_init(send_buffer_t* sb) {
     memset(sb, 0, sizeof(send_buffer_t));
@@ -61,7 +61,7 @@ void send_buffer_reset(send_buffer_t* sb) {
     sb->headers_done = 0;
 }
 
-ssize_t send_buffer_queue(send_buffer_t* sb, const void* data, size_t len) {
+ssize_t send_buffer_queue(send_buffer_t* __restrict sb, const void* __restrict data, size_t len) {
     if (!sb->buffer || len == 0) {
         return -1;
     }
@@ -117,7 +117,7 @@ void send_buffer_consume(send_buffer_t* sb, size_t len) {
         len = pending;  // Don't consume more than available
     }
 
-    sb->tail = (sb->tail + len) % sb->size;
+    sb->tail = (sb->tail + len) & (sb->size - 1);
 
     // Reset head/tail when buffer becomes empty to maximize contiguous space
     // This is critical for chunked encoding which needs ~10 bytes overhead per chunk

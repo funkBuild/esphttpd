@@ -5,6 +5,7 @@
 
 import axios from 'axios';
 import { BASE_URL } from '../jest.setup';
+import { TIMEOUTS } from '../test-utils';
 
 describe('Template Engine', () => {
 
@@ -69,7 +70,7 @@ describe('Template Engine', () => {
     it('should handle multiple template requests concurrently', async () => {
       // Reduced count for QEMU emulation performance
       const requests = Array(3).fill(null).map(() =>
-        axios.get('/template', { timeout: 15000 })
+        axios.get('/template', { timeout: TIMEOUTS.HTTP })
       );
 
       const responses = await Promise.all(requests);
@@ -88,18 +89,21 @@ describe('Template Engine', () => {
       // Counts should be unique or at least increasing
       const uniqueCounts = new Set(counts);
       expect(uniqueCounts.size).toBeGreaterThan(1);
-    }, 25000); // QEMU: Extended timeout for concurrent requests
+    }, TIMEOUTS.CONCURRENT);
   });
 
   describe('Template Edge Cases', () => {
     it('should handle templates with special characters', async () => {
-      // The template engine should properly escape or handle special chars
       const response = await axios.get('/template');
 
-      // Basic validation - the response should be valid HTML
+      // The template always returns well-formed HTML with specific content
       expect(response.status).toBe(200);
-      expect(response.data).toBeTruthy();
-      expect(response.data.length).toBeGreaterThan(50);
+      expect(response.headers['content-type']).toContain('text/html');
+      expect(response.data).toContain('<html><body>');
+      expect(response.data).toContain('<h1>E2E Test Page</h1>');
+      expect(response.data).toContain('<p>Dynamic content here</p>');
+      expect(response.data).toMatch(/<p>Request count: \d+<\/p>/);
+      expect(response.data).toContain('</body></html>');
     });
 
     it('should maintain consistent output format', async () => {
@@ -136,16 +140,16 @@ describe('Template Engine', () => {
   });
 
   describe('Template Content Validation', () => {
-    it('should produce valid HTML output', async () => {
+    it('should produce valid HTML with balanced tags', async () => {
       const response = await axios.get('/template');
 
       // Check for balanced tags
       const openTags = (response.data.match(/<[^/][^>]*>/g) || []).length;
       const closeTags = (response.data.match(/<\/[^>]+>/g) || []).length;
 
-      // Should have roughly equal open and close tags
-      // (some tags like <br> or <img> are self-closing)
-      expect(Math.abs(openTags - closeTags)).toBeLessThan(5);
+      // Template has no void elements - tags should be exactly balanced
+      expect(openTags).toBe(closeTags);
+      expect(openTags).toBeGreaterThanOrEqual(5); // At least html, body, h1, 2x p
     });
 
     it('should not expose internal template variables', async () => {

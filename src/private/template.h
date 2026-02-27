@@ -35,7 +35,7 @@ typedef struct {
     uint8_t state;              // Parser state
     uint8_t var_name_len;       // Current variable name length
     uint8_t delim_pos;          // Position in delimiter matching
-    char var_name[64];          // Variable name buffer
+    char var_name[32];          // Variable name buffer
 } template_context_t;
 
 // Template processing results

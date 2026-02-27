@@ -4,7 +4,7 @@
 #include <string.h>
 #include "esp_log.h"
 
-static const char* TAG = "ROUTER_API";
+static const char TAG[] = "ROUTER_API";
 
 // Note: httpd_router_t is defined in esphttpd.h as "struct httpd_router*"
 // The struct httpd_router itself is defined in radix_tree.h

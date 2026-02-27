@@ -5,6 +5,7 @@
 
 import axios from 'axios';
 import { BASE_URL } from '../jest.setup';
+import { TIMEOUTS } from '../test-utils';
 
 describe('Static File Serving', () => {
 
@@ -73,14 +74,13 @@ describe('Static File Serving', () => {
   });
 
   describe('Binary File Handling', () => {
-    it('should serve binary files', async () => {
+    it('should serve binary files with correct MIME type', async () => {
       const response = await axios.get('/static/image.jpg', {
         responseType: 'arraybuffer'
       });
 
       expect(response.status).toBe(200);
-      // Binary files get application/octet-stream as fallback
-      expect(response.headers['content-type']).toBeDefined();
+      expect(response.headers['content-type']).toContain('image/jpeg');
     });
   });
 
@@ -108,9 +108,10 @@ describe('Static File Serving', () => {
     it('should handle empty filename gracefully', async () => {
       const response = await axios.get('/static/');
 
-      // Should either redirect, show index, or return an error
-      expect(response.status).toBeGreaterThanOrEqual(200);
-      expect(response.status).toBeLessThan(500);
+      // Server defaults empty filename to index.html
+      expect(response.status).toBe(200);
+      expect(response.headers['content-type']).toContain('text/html');
+      expect(response.data).toContain('Mock static file: index.html');
     });
   });
 
@@ -133,7 +134,7 @@ describe('Static File Serving', () => {
       ];
 
       const requests = files.map(file =>
-        axios.get(`/static/${file}`, { timeout: 30000 })
+        axios.get(`/static/${file}`, { timeout: TIMEOUTS.DOWNLOAD_SM })
       );
 
       const responses = await Promise.all(requests);
@@ -142,7 +143,7 @@ describe('Static File Serving', () => {
         expect(response.status).toBe(200);
         expect(response.data).toContain(`Mock static file: ${files[index]}`);
       });
-    }, 60000); // CI: Extended timeout for slow GitHub runners
+    }, TIMEOUTS.DOWNLOAD_MD);
   });
 
   describe('Directory Traversal Protection', () => {

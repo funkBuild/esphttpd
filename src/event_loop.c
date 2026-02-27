@@ -11,7 +11,7 @@
 #include <errno.h>
 #include "esp_log.h"
 
-static const char* TAG = "EVENT_LOOP";
+static const char TAG[] = "EVENT_LOOP";
 
 // Default configuration
 static const event_loop_config_t default_config = {
@@ -167,7 +167,8 @@ static void handle_connection_data(event_loop_t* loop, connection_t* conn,
         }
         // Connection closed or error
         // Call WebSocket disconnect handler if this was a WebSocket connection
-        if (conn->state == CONN_STATE_WEBSOCKET && handlers->on_ws_disconnect) {
+        if ((conn->state == CONN_STATE_WEBSOCKET || conn->state == CONN_STATE_WS_CLOSING)
+            && handlers->on_ws_disconnect) {
             handlers->on_ws_disconnect(conn);
         }
         conn->state = CONN_STATE_CLOSED;
@@ -199,10 +200,20 @@ static void handle_connection_data(event_loop_t* loop, connection_t* conn,
             loop->total_ws_frames++;
             break;
 
+        case CONN_STATE_WS_CLOSING:
+            // Still reading frames while waiting for client's close ack
+            if (handlers->on_ws_frame) {
+                handlers->on_ws_frame(conn, buffer, bytes);
+            }
+            break;
+
         default:
             break;
     }
 }
+
+// WebSocket close handshake timeout: 5 ticks (~5 seconds with default 1s select timeout)
+#define WS_CLOSE_TIMEOUT_TICKS 5
 
 void event_loop_check_timeouts(event_loop_t* loop) {
     // Use precomputed timeout_ticks (avoid division in hot path)
@@ -210,6 +221,8 @@ void event_loop_check_timeouts(event_loop_t* loop) {
 
     // Only check non-WebSocket connections (bitmask arithmetic to skip WS)
     // This eliminates per-iteration branch for WebSocket check
+    // Note: CONN_STATE_WS_CLOSING connections are removed from ws_active_mask
+    // so they are included here and get a shorter timeout below.
     uint32_t mask = loop->pool->active_mask & ~loop->pool->ws_active_mask;
     while (mask) {
         int i = __builtin_ctz(mask);
@@ -217,9 +230,13 @@ void event_loop_check_timeouts(event_loop_t* loop) {
 
         connection_t* conn = &loop->pool->connections[i];
 
-        // Check for timeout (WebSockets already excluded by bitmask)
-        if (loop->tick_count - conn->last_activity > timeout_ticks) {
-            ESP_LOGD(TAG, "Connection [%d] timed out", i);
+        // Use shorter timeout for WebSocket close handshake (RFC 6455)
+        uint32_t effective_timeout = (conn->state == CONN_STATE_WS_CLOSING)
+            ? WS_CLOSE_TIMEOUT_TICKS : timeout_ticks;
+
+        if (loop->tick_count - conn->last_activity > effective_timeout) {
+            ESP_LOGD(TAG, "Connection [%d] timed out%s", i,
+                     conn->state == CONN_STATE_WS_CLOSING ? " (ws close handshake)" : "");
             conn->state = CONN_STATE_CLOSED;
         }
     }

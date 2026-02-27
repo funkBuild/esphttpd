@@ -198,6 +198,69 @@ static httpd_err_t handle_api_update(httpd_req_t* req) {
     return HTTPD_OK;
 }
 
+// GET /api/query - exercise query string parsing APIs
+static httpd_err_t handle_api_query(httpd_req_t* req) {
+    request_count++;
+
+    char json[512];
+    int pos = 0;
+
+    // Get raw query string (everything after '?')
+    const char* raw = httpd_req_get_query_string(req);
+
+    pos += snprintf(json + pos, sizeof(json) - pos, "{\"raw\":");
+    if (raw) {
+        // JSON-escape the raw query string (simple: just quote it)
+        pos += snprintf(json + pos, sizeof(json) - pos, "\"%s\"", raw);
+    } else {
+        pos += snprintf(json + pos, sizeof(json) - pos, "null");
+    }
+
+    // Extract specific named parameters
+    char name_val[64];
+    char value_val[64];
+    char format_val[64];
+
+    int name_len = httpd_req_get_query(req, "name", name_val, sizeof(name_val));
+    int value_len = httpd_req_get_query(req, "value", value_val, sizeof(value_val));
+    int format_len = httpd_req_get_query(req, "format", format_val, sizeof(format_val));
+
+    pos += snprintf(json + pos, sizeof(json) - pos, ",\"params\":{");
+
+    // name
+    pos += snprintf(json + pos, sizeof(json) - pos, "\"name\":");
+    if (name_len >= 0) {
+        pos += snprintf(json + pos, sizeof(json) - pos, "\"%s\"", name_val);
+    } else {
+        pos += snprintf(json + pos, sizeof(json) - pos, "null");
+    }
+
+    // value
+    pos += snprintf(json + pos, sizeof(json) - pos, ",\"value\":");
+    if (value_len >= 0) {
+        pos += snprintf(json + pos, sizeof(json) - pos, "\"%s\"", value_val);
+    } else {
+        pos += snprintf(json + pos, sizeof(json) - pos, "null");
+    }
+
+    // format
+    pos += snprintf(json + pos, sizeof(json) - pos, ",\"format\":");
+    if (format_len >= 0) {
+        pos += snprintf(json + pos, sizeof(json) - pos, "\"%s\"", format_val);
+    } else {
+        pos += snprintf(json + pos, sizeof(json) - pos, "null");
+    }
+
+    pos += snprintf(json + pos, sizeof(json) - pos, "}}");
+
+    httpd_resp_set_status(req, 200);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_header(req, "Connection", "close");
+    httpd_resp_send(req, json, pos);
+
+    return HTTPD_OK;
+}
+
 // HEAD / - responds with headers only, no body
 static httpd_err_t handle_head_root(httpd_req_t* req) {
     request_count++;
@@ -1592,6 +1655,12 @@ void app_main(void) {
 
     httpd_register_route(server, &(httpd_route_t){
         .method = HTTP_GET,
+        .pattern = "/api/query",
+        .handler = handle_api_query
+    });
+
+    httpd_register_route(server, &(httpd_route_t){
+        .method = HTTP_GET,
         .pattern = "/headers",
         .handler = handle_headers
     });
@@ -1778,7 +1847,7 @@ void app_main(void) {
     });
 
     ESP_LOGI(TAG, "E2E Server ready on port 80!");
-    ESP_LOGI(TAG, "Endpoints: /, /api/status, /api/data/*, /api/echo, /api/update, /headers, /cors, /template, /static/*");
+    ESP_LOGI(TAG, "Endpoints: /, /api/status, /api/data/*, /api/echo, /api/update, /api/query, /headers, /cors, /template, /static/*");
     ESP_LOGI(TAG, "Upload endpoints: /upload, /upload/defer, /upload/defer/custom, /upload/sink");
     ESP_LOGI(TAG, "Test endpoints: /hello, /perf, /largefile/*, /largefile-single/*");
     ESP_LOGI(TAG, "Provider endpoints: /largefile-provider/*, /largefile-provider-chunked/*");

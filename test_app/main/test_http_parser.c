@@ -555,8 +555,8 @@ static void test_parse_header_empty_key(void) {
                                               strlen(request),
                                               &ctx);
 
-    // Empty header value should be allowed
-    TEST_ASSERT_EQUAL(PARSE_COMPLETE, result);
+    // Empty header key is rejected per RFC 7230 Section 3.2
+    TEST_ASSERT_EQUAL(PARSE_ERROR, result);
 }
 
 // Test request with only LF (no CR) line endings
@@ -928,7 +928,7 @@ static void test_url_boundary_254(void)
     TEST_ASSERT_EQUAL(254, conn.url_len);
 }
 
-// Test URL at exactly 255 chars (at limit - triggers PARSE_ERROR)
+// Test URL at 255 chars (within 2048 limit - should parse OK)
 static void test_url_boundary_255(void)
 {
     connection_t conn = {0};
@@ -946,29 +946,30 @@ static void test_url_boundary_255(void)
     parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
                                               strlen(request), &ctx);
 
-    // Parser returns PARSE_ERROR when url_len reaches 255
-    TEST_ASSERT_EQUAL(PARSE_ERROR, result);
+    // 255-char URL is within the 2048 limit, should parse OK
+    TEST_ASSERT_EQUAL(PARSE_COMPLETE, result);
+    TEST_ASSERT_EQUAL(255, conn.url_len);
 }
 
-// Test URL exceeding 255 chars (triggers PARSE_ERROR)
+// Test URL exceeding 2048 chars (triggers PARSE_ERROR)
 static void test_url_boundary_overflow(void)
 {
     connection_t conn = {0};
     http_parser_context_t ctx = {0};
 
-    // Build a request with a 300-char URL
-    char request[512];
-    char url[302];
-    memset(url, 'a', 300);
+    // Build a request with a 2049-char URL (exceeds limit)
+    char request[2200];
+    char url[2050];
+    memset(url, 'a', 2048);
     url[0] = '/';  // Start with /
-    url[300] = '\0';
+    url[2048] = '\0';
 
     snprintf(request, sizeof(request), "GET %s HTTP/1.1\r\nHost: test\r\n\r\n", url);
 
     parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
                                               strlen(request), &ctx);
 
-    // Parser returns PARSE_ERROR when url_len reaches 255
+    // Parser returns PARSE_ERROR when url_len reaches 2048
     TEST_ASSERT_EQUAL(PARSE_ERROR, result);
 }
 
@@ -1082,6 +1083,22 @@ static void test_parse_headers_too_large(void) {
                                               &ctx);
     TEST_ASSERT_EQUAL(PARSE_ERROR, result);
 }
+
+// Test empty header value
+static void test_parse_empty_header_value(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "GET /test HTTP/1.1\r\n"
+                         "X-Empty:\r\n"
+                         "Content-Length: 0\r\n"
+                         "\r\n";
+
+    parse_result_t result = http_parse_request(&conn,
+                                              (const uint8_t*)request,
+                                              strlen(request),
+                                              &ctx);
+    TEST_ASSERT_EQUAL(PARSE_COMPLETE, result);
 }
 
 void test_http_parser_run(void)

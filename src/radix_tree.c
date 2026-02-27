@@ -4,7 +4,7 @@
 #include <strings.h>  // For strncasecmp
 #include "esp_log.h"
 
-static const char* TAG = "RADIX_TREE";
+static const char TAG[] = "RADIX_TREE";
 
 // ============================================================================
 // Node Creation and Destruction
@@ -480,11 +480,24 @@ httpd_err_t radix_insert_ws(radix_tree_t* tree, const char* pattern,
 // Route Lookup
 // ============================================================================
 
-radix_match_t radix_lookup(radix_tree_t* tree, const char* path,
-                           http_method_t method, bool is_websocket) {
-    radix_match_t result = {0};
+void radix_lookup(radix_tree_t* tree, const char* path,
+                  http_method_t method, bool is_websocket,
+                  radix_match_t* result,
+                  httpd_middleware_t* mw_out, uint8_t* mw_count_out) {
+    // Initialize only scalar fields - params[] array is accessed only
+    // up to param_count, so zeroing it would waste bytes per lookup
+    result->matched = false;
+    result->handler_chain = NULL;
+    result->handler = NULL;
+    result->user_ctx = NULL;
+    result->ws_handler = NULL;
+    result->ws_user_ctx = NULL;
+    result->is_websocket = false;
+    result->param_count = 0;
 
-    if (__builtin_expect(!tree || !path, 0)) return result;
+    if (mw_count_out) *mw_count_out = 0;
+
+    if (__builtin_expect(!tree || !path, 0)) return;
 
     ESP_LOGD(TAG, "Looking up: path='%s', method=%d, ws=%d", path, method, is_websocket);
 
@@ -497,8 +510,7 @@ radix_match_t radix_lookup(radix_tree_t* tree, const char* path,
     const char* p = path;
     bool traversed = false;  // Track if we've moved from root
 
-    // Temporary storage for middleware chain building
-    httpd_middleware_t mw_stack[CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE];
+    // Write middleware directly into caller's destination buffer
     uint8_t mw_count = 0;
 
     while (*p && node) {
@@ -519,19 +531,19 @@ radix_match_t radix_lookup(radix_tree_t* tree, const char* path,
             // This prevents "/" from matching the catch-all "*" pattern
             if (traversed && node->wildcard_child) {
                 // Wildcard matches empty string
-                if (result.param_count < CONFIG_HTTPD_MAX_ROUTE_PARAMS) {
-                    result.params[result.param_count].key = "*";
-                    result.params[result.param_count].key_len = 1;
-                    result.params[result.param_count].value = "";
-                    result.params[result.param_count].value_len = 0;
-                    result.param_count++;
+                if (result->param_count < CONFIG_HTTPD_MAX_ROUTE_PARAMS) {
+                    result->params[result->param_count].key = "*";
+                    result->params[result->param_count].key_len = 1;
+                    result->params[result->param_count].value = "";
+                    result->params[result->param_count].value_len = 0;
+                    result->param_count++;
                 }
                 node = node->wildcard_child;
-                // Collect middleware from wildcard node using memcpy
-                if (node->middleware_count > 0) {
+                // Collect middleware from wildcard node directly into caller's buffer
+                if (mw_out && node->middleware_count > 0) {
                     uint8_t avail = CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE - mw_count;
                     uint8_t to_copy = node->middleware_count < avail ? node->middleware_count : avail;
-                    memcpy(&mw_stack[mw_count], node->middlewares, to_copy * sizeof(httpd_middleware_t));
+                    memcpy(&mw_out[mw_count], node->middlewares, to_copy * sizeof(httpd_middleware_t));
                     mw_count += to_copy;
                 }
             }
@@ -557,12 +569,12 @@ radix_match_t radix_lookup(radix_tree_t* tree, const char* path,
         //    (wildcards capture the rest of the path, so they're preferred for multi-segment)
         if (__builtin_expect(node->wildcard_child && has_more_segments, 0)) {
             // Wildcard captures rest of path
-            if (result.param_count < CONFIG_HTTPD_MAX_ROUTE_PARAMS) {
-                result.params[result.param_count].key = "*";
-                result.params[result.param_count].key_len = 1;
-                result.params[result.param_count].value = p;
-                result.params[result.param_count].value_len = path_end - p;  // Use pointer arithmetic instead of strlen
-                result.param_count++;
+            if (result->param_count < CONFIG_HTTPD_MAX_ROUTE_PARAMS) {
+                result->params[result->param_count].key = "*";
+                result->params[result->param_count].key_len = 1;
+                result->params[result->param_count].value = p;
+                result->params[result->param_count].value_len = path_end - p;  // Use pointer arithmetic instead of strlen
+                result->param_count++;
             }
             node = node->wildcard_child;
             p = ""; // Consumed entire path
@@ -571,12 +583,12 @@ radix_match_t radix_lookup(radix_tree_t* tree, const char* path,
 
         // 3. Try parameter child for single segment
         if (__builtin_expect(node->param_child != NULL, 1)) {
-            if (result.param_count < CONFIG_HTTPD_MAX_ROUTE_PARAMS) {
-                result.params[result.param_count].key = node->param_child->param_name;
-                result.params[result.param_count].key_len = node->param_child->param_name_len;
-                result.params[result.param_count].value = p;
-                result.params[result.param_count].value_len = seg_len;
-                result.param_count++;
+            if (result->param_count < CONFIG_HTTPD_MAX_ROUTE_PARAMS) {
+                result->params[result->param_count].key = node->param_child->param_name;
+                result->params[result->param_count].key_len = node->param_child->param_name_len;
+                result->params[result->param_count].value = p;
+                result->params[result->param_count].value_len = seg_len;
+                result->param_count++;
             }
             p = seg_end;
             node = node->param_child;
@@ -585,12 +597,12 @@ radix_match_t radix_lookup(radix_tree_t* tree, const char* path,
 
         // 4. Try wildcard for last segment (single segment case)
         if (__builtin_expect(node->wildcard_child != NULL, 0)) {
-            if (result.param_count < CONFIG_HTTPD_MAX_ROUTE_PARAMS) {
-                result.params[result.param_count].key = "*";
-                result.params[result.param_count].key_len = 1;
-                result.params[result.param_count].value = p;
-                result.params[result.param_count].value_len = seg_len;
-                result.param_count++;
+            if (result->param_count < CONFIG_HTTPD_MAX_ROUTE_PARAMS) {
+                result->params[result->param_count].key = "*";
+                result->params[result->param_count].key_len = 1;
+                result->params[result->param_count].value = p;
+                result->params[result->param_count].value_len = seg_len;
+                result->param_count++;
             }
             node = node->wildcard_child;
             p = seg_end;
@@ -599,14 +611,14 @@ radix_match_t radix_lookup(radix_tree_t* tree, const char* path,
 
         // No match found
         ESP_LOGD(TAG, "No match for segment '%.*s'", (int)seg_len, p);
-        return result;
+        return;
 
     collect_middleware:
-        // Collect middleware from this node using memcpy
-        if (node->middleware_count > 0) {
+        // Collect middleware from this node directly into caller's buffer
+        if (mw_out && node->middleware_count > 0) {
             uint8_t avail = CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE - mw_count;
             uint8_t to_copy = node->middleware_count < avail ? node->middleware_count : avail;
-            memcpy(&mw_stack[mw_count], node->middlewares, to_copy * sizeof(httpd_middleware_t));
+            memcpy(&mw_out[mw_count], node->middlewares, to_copy * sizeof(httpd_middleware_t));
             mw_count += to_copy;
         }
     }
@@ -616,12 +628,12 @@ radix_match_t radix_lookup(radix_tree_t* tree, const char* path,
     if (node && !node->handlers && node->param_child &&
         node->param_child->is_optional && node->param_child->handlers) {
         node = node->param_child;
-        // Note: param is not added to result.params since it wasn't provided
-        // Collect middleware from this node using memcpy
-        if (node->middleware_count > 0) {
+        // Note: param is not added to result->params since it wasn't provided
+        // Collect middleware from this node directly into caller's buffer
+        if (mw_out && node->middleware_count > 0) {
             uint8_t avail = CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE - mw_count;
             uint8_t to_copy = node->middleware_count < avail ? node->middleware_count : avail;
-            memcpy(&mw_stack[mw_count], node->middlewares, to_copy * sizeof(httpd_middleware_t));
+            memcpy(&mw_out[mw_count], node->middlewares, to_copy * sizeof(httpd_middleware_t));
             mw_count += to_copy;
         }
     }
@@ -640,39 +652,28 @@ radix_match_t radix_lookup(radix_tree_t* tree, const char* path,
             ESP_LOGD(TAG, "Strict mode: trailing slash mismatch (path=%d, route=%d)",
                      path_has_trailing_slash, node->handlers->has_trailing_slash);
         } else if (is_websocket && node->handlers->has_ws) {
-            result.matched = true;
-            result.ws_handler = node->handlers->ws_handler;
-            result.ws_user_ctx = node->handlers->ws_user_ctx;
-            result.is_websocket = true;
+            result->matched = true;
+            result->ws_handler = node->handlers->ws_handler;
+            result->ws_user_ctx = node->handlers->ws_user_ctx;
+            result->is_websocket = true;
             ESP_LOGD(TAG, "Matched WebSocket route");
         } else if (!is_websocket) {
             // Direct chain check - non-null chain implies method is supported
             handler_node_t* chain = node->handlers->http_chains[method];
             if (chain) {
-                result.matched = true;
-                result.handler_chain = chain;
+                result->matched = true;
+                result->handler_chain = chain;
                 // For backwards compatibility, set first handler
-                result.handler = chain->handler;
-                result.user_ctx = chain->user_ctx;
-                result.is_websocket = false;
+                result->handler = chain->handler;
+                result->user_ctx = chain->user_ctx;
+                result->is_websocket = false;
                 ESP_LOGD(TAG, "Matched HTTP route (method=%d)", method);
             }
         }
 
-        // Note: Terminal middleware is already collected during traversal at collect_middleware label
-        // so we don't collect it again here to avoid duplicates
-
-        // Allocate and copy middleware if matched
-        if (result.matched && mw_count > 0) {
-            result.middlewares = (httpd_middleware_t*)malloc(
-                mw_count * sizeof(httpd_middleware_t));
-            if (result.middlewares) {
-                memcpy(result.middlewares, mw_stack,
-                       mw_count * sizeof(httpd_middleware_t));
-                result.middleware_count = mw_count;
-            }
+        // Middleware was collected directly into caller's buffer during traversal
+        if (result->matched && mw_count_out) {
+            *mw_count_out = mw_count;
         }
     }
-
-    return result;
 }

@@ -5,6 +5,7 @@
 
 import axios, { AxiosResponse } from 'axios';
 import { BASE_URL } from '../jest.setup';
+import { TIMEOUTS } from '../test-utils';
 
 describe('HTTP Routes', () => {
 
@@ -185,7 +186,7 @@ describe('HTTP Routes', () => {
     it('should handle multiple concurrent requests', async () => {
       // Use fewer concurrent requests for QEMU emulation
       const requests = Array(3).fill(null).map((_, i) =>
-        axios.get(`/api/data/concurrent-${i}`, { timeout: 15000 })
+        axios.get(`/api/data/concurrent-${i}`, { timeout: TIMEOUTS.HTTP })
       );
 
       const responses = await Promise.all(requests);
@@ -194,6 +195,6 @@ describe('HTTP Routes', () => {
         expect(response.status).toBe(200);
         expect(response.data.id).toBe(`concurrent-${i}`);
       });
-    }, 25000); // QEMU: Extended timeout for concurrent requests
+    }, TIMEOUTS.CONCURRENT);
   });
 });

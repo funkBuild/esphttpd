@@ -32,21 +32,26 @@ typedef enum {
 } parse_result_t;
 
 // Temporary parsing context (stack allocated)
+// Fields ordered by alignment to eliminate padding
 typedef struct {
+    // 4-byte aligned pointers first
+    const uint8_t* method;
+    const uint8_t* url;
+    const uint8_t* current_header_key;
+    const uint8_t* current_header_value;
+    // 4-byte enum/int
     parse_state_t state;
+    // 2-byte fields
     uint16_t line_pos;      // Position in current line
     uint16_t header_count;  // Number of headers parsed
-    bool expect_body;       // Expecting body based on method/headers
-
-    // Pointers into the buffer being parsed (zero-copy)
-    const uint8_t* method;
+    uint16_t url_len;
+    // 1-byte fields (packed together, no padding)
     uint8_t method_len;
-    const uint8_t* url;
-    uint8_t url_len;
-    const uint8_t* current_header_key;
     uint8_t header_key_len;
-    const uint8_t* current_header_value;
     uint8_t header_value_len;
+    bool expect_body;       // Expecting body based on method/headers
+    // Arrays at end
+    char ws_client_key[32]; // Per-parse WebSocket client key
 } http_parser_context_t;
 
 // Known header types for efficient processing
@@ -78,7 +83,8 @@ parse_result_t http_parse_request(connection_t* conn,
 // Process a single header (called by parser)
 void http_process_header(connection_t* conn,
                         const uint8_t* key, uint8_t key_len,
-                        const uint8_t* value, uint8_t value_len);
+                        const uint8_t* value, uint8_t value_len,
+                        http_parser_context_t* parser_ctx);
 
 // Utility functions for header processing
 header_type_t http_identify_header(const uint8_t* key, uint8_t len);
@@ -94,20 +100,22 @@ bool http_parse_url_params(const uint8_t* url, uint8_t len,
                           const uint8_t** params);
 
 // Inline utilities for fast character checking
+// RFC 7230 token chars: ALPHA / DIGIT / "!" / "#" / "$" / "%" / "&" / "'" /
+//                       "*" / "+" / "-" / "." / "^" / "_" / "`" / "|" / "~"
+// Bitmap lookup replaces 10+ branch chain with single table lookup
+static const uint32_t token_bitmap[8] = {
+    0x00000000, // 0x00-0x1F: no control chars
+    0x03FF6CFA, // 0x20-0x3F: digits, !, #, $, %, &, ', *, +, -, .
+    0xC7FFFFFE, // 0x40-0x5F: A-Z, ^, _
+    0x57FFFFFF, // 0x60-0x7F: `, a-z, |, ~
+    0x00000000, 0x00000000, 0x00000000, 0x00000000
+};
 static inline bool is_token_char(uint8_t c) {
-    return (c >= 'A' && c <= 'Z') ||
-           (c >= 'a' && c <= 'z') ||
-           (c >= '0' && c <= '9') ||
-           c == '-' || c == '_' || c == '.' || c == '!' ||
-           c == '~' || c == '*' || c == '\'' || c == '(' || c == ')';
+    return (token_bitmap[c >> 5] >> (c & 31)) & 1;
 }
 
 static inline bool is_whitespace(uint8_t c) {
     return c == ' ' || c == '\t';
-}
-
-static inline bool is_crlf(uint8_t c) {
-    return c == '\r' || c == '\n';
 }
 
 // Case-insensitive comparison for header names

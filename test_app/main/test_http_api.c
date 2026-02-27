@@ -7,6 +7,7 @@
 #include "esphttpd.h"
 #include "connection.h"
 #include "test_exports.h"
+#include "send_buffer.h"
 #include "http_parser.h"
 #include "esp_log.h"
 #include <string.h>
@@ -16,6 +17,10 @@ static const char* TAG = "TEST_HTTP_API";
 
 // Test server handle
 static httpd_handle_t test_server = NULL;
+
+// Mock send buffer for tests that need send_nonblocking
+static send_buffer_t mock_send_buf;
+static bool mock_send_buf_installed = false;
 
 // Helper to start test server
 static void start_test_server(void) {
@@ -32,12 +37,37 @@ static void stop_test_server(void) {
     }
 }
 
+// Install a mock send buffer at pool_index 0 for tests that use mock connections.
+// We seed the buffer with 1 byte so send_nonblocking queues data instead of
+// attempting a send() syscall on the mock fd=-1.
+static void install_mock_send_buffer(void) {
+    if (!g_test_send_buffers) return;
+    send_buffer_t** bufs = (send_buffer_t**)g_test_send_buffers;
+    send_buffer_init(&mock_send_buf);
+    send_buffer_alloc(&mock_send_buf);
+    // Seed with a byte so send_nonblocking takes the queue path (skips send())
+    uint8_t dummy = 0;
+    send_buffer_queue(&mock_send_buf, &dummy, 1);
+    bufs[0] = &mock_send_buf;
+    mock_send_buf_installed = true;
+}
+
+// Remove mock send buffer
+static void remove_mock_send_buffer(void) {
+    if (!mock_send_buf_installed || !g_test_send_buffers) return;
+    send_buffer_t** bufs = (send_buffer_t**)g_test_send_buffers;
+    send_buffer_free(&mock_send_buf);
+    bufs[0] = NULL;
+    mock_send_buf_installed = false;
+}
+
 // Helper to create a mock request context
 static void setup_mock_request(httpd_req_t* req, connection_t* conn) {
     memset(req, 0, sizeof(*req));
     memset(conn, 0, sizeof(*conn));
     conn->fd = -1; // Mock FD (won't actually send)
     conn->state = CONN_STATE_HTTP_HEADERS;
+    conn->pool_index = 0;
     req->_internal = conn;
     req->status_code = 200; // Default status
 }
@@ -77,12 +107,18 @@ static void test_resp_set_status_null_req(void) {
 // ==================== Response Header Tests ====================
 
 static void test_resp_set_header_basic(void) {
+    start_test_server();
+    install_mock_send_buffer();
+
     httpd_req_t req;
     connection_t conn;
     setup_mock_request(&req, &conn);
 
     httpd_err_t err = httpd_resp_set_header(&req, "X-Custom-Header", "custom-value");
     TEST_ASSERT_EQUAL(HTTPD_OK, err);
+
+    remove_mock_send_buffer();
+    stop_test_server();
 }
 
 static void test_resp_set_header_null_req(void) {
@@ -111,21 +147,33 @@ static void test_resp_set_header_null_value(void) {
 // ==================== Response Type Tests ====================
 
 static void test_resp_set_type_json(void) {
+    start_test_server();
+    install_mock_send_buffer();
+
     httpd_req_t req;
     connection_t conn;
     setup_mock_request(&req, &conn);
 
     httpd_err_t err = httpd_resp_set_type(&req, "application/json");
     TEST_ASSERT_EQUAL(HTTPD_OK, err);
+
+    remove_mock_send_buffer();
+    stop_test_server();
 }
 
 static void test_resp_set_type_html(void) {
+    start_test_server();
+    install_mock_send_buffer();
+
     httpd_req_t req;
     connection_t conn;
     setup_mock_request(&req, &conn);
 
     httpd_err_t err = httpd_resp_set_type(&req, "text/html");
     TEST_ASSERT_EQUAL(HTTPD_OK, err);
+
+    remove_mock_send_buffer();
+    stop_test_server();
 }
 
 static void test_resp_set_type_null_req(void) {
@@ -240,6 +288,57 @@ static void test_req_get_query_single_param(void) {
     int result = httpd_req_get_query(&req, "name", buf, sizeof(buf));
     TEST_ASSERT_TRUE(result > 0);
     TEST_ASSERT_EQUAL_STRING("test", buf);
+}
+
+static void test_req_get_query_multi_params(void) {
+    httpd_req_t req;
+    connection_t conn;
+    setup_mock_request(&req, &conn);
+
+    // Multiple parameters - verifies url_decode is bounded to each value
+    char query[] = "a=hello&b=world&c=foo";
+    req.query = query;
+    req.query_len = strlen(query);
+
+    char buf[64];
+
+    // First param should NOT include "&b=world&c=foo"
+    int result = httpd_req_get_query(&req, "a", buf, sizeof(buf));
+    TEST_ASSERT_TRUE(result > 0);
+    TEST_ASSERT_EQUAL_STRING("hello", buf);
+
+    // Middle param
+    result = httpd_req_get_query(&req, "b", buf, sizeof(buf));
+    TEST_ASSERT_TRUE(result > 0);
+    TEST_ASSERT_EQUAL_STRING("world", buf);
+
+    // Last param
+    result = httpd_req_get_query(&req, "c", buf, sizeof(buf));
+    TEST_ASSERT_TRUE(result > 0);
+    TEST_ASSERT_EQUAL_STRING("foo", buf);
+}
+
+static void test_req_get_query_encoded_multi_params(void) {
+    httpd_req_t req;
+    connection_t conn;
+    setup_mock_request(&req, &conn);
+
+    // URL-encoded values across multiple params
+    char query[] = "name=hello+world&tag=%23test";
+    req.query = query;
+    req.query_len = strlen(query);
+
+    char buf[64];
+
+    // '+' should decode to space, and stop at '&'
+    int result = httpd_req_get_query(&req, "name", buf, sizeof(buf));
+    TEST_ASSERT_TRUE(result > 0);
+    TEST_ASSERT_EQUAL_STRING("hello world", buf);
+
+    // %23 should decode to '#'
+    result = httpd_req_get_query(&req, "tag", buf, sizeof(buf));
+    TEST_ASSERT_TRUE(result > 0);
+    TEST_ASSERT_EQUAL_STRING("#test", buf);
 }
 
 static void test_req_get_query_string_basic(void) {
@@ -521,6 +620,8 @@ void test_http_api_run(void) {
     RUN_TEST(test_req_get_query_zero_buffer_size);
     RUN_TEST(test_req_get_query_no_query_string);
     RUN_TEST(test_req_get_query_single_param);
+    RUN_TEST(test_req_get_query_multi_params);
+    RUN_TEST(test_req_get_query_encoded_multi_params);
     RUN_TEST(test_req_get_query_string_basic);
     RUN_TEST(test_req_get_query_string_null_req);
 

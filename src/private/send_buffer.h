@@ -15,6 +15,12 @@ extern "C" {
 #define SEND_BUFFER_SIZE 4096
 #endif
 
+_Static_assert(SEND_BUFFER_SIZE <= UINT16_MAX,
+    "SEND_BUFFER_SIZE exceeds uint16_t capacity of send_buffer_t fields");
+
+_Static_assert((SEND_BUFFER_SIZE & (SEND_BUFFER_SIZE - 1)) == 0,
+    "SEND_BUFFER_SIZE must be a power of 2 for bitmask optimization");
+
 // Send buffer state - dynamically allocated
 typedef struct {
     // Ring buffer for queued send data
@@ -49,7 +55,7 @@ void send_buffer_reset(send_buffer_t* sb);
 
 // Queue data to send buffer
 // Returns bytes queued, or -1 if buffer full
-ssize_t send_buffer_queue(send_buffer_t* sb, const void* data, size_t len);
+ssize_t send_buffer_queue(send_buffer_t* __restrict sb, const void* __restrict data, size_t len);
 
 // Get pointer to contiguous data ready to send
 // Returns length of contiguous segment (may be less than total pending)
@@ -92,11 +98,9 @@ static inline size_t send_buffer_write_ptr(send_buffer_t* sb, uint8_t** ptr) {
 }
 
 // Commit written data (advance head after zero-copy write)
+// Uses bitmask since buffer size is enforced to be power of 2
 static inline void send_buffer_commit(send_buffer_t* sb, size_t len) {
-    sb->head += len;
-    if (sb->head >= sb->size) {
-        sb->head = 0;  // Wrap at boundary
-    }
+    sb->head = (sb->head + len) & (sb->size - 1);
 }
 
 // File streaming

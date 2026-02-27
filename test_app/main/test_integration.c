@@ -253,13 +253,15 @@ static void test_route_matching_integration(void) {
 
     // Routes are stored in radix tree - verify by lookup
     // (radix tree doesn't expose route list)
-    radix_match_t match1 = radix_lookup(g_server->legacy_routes, "/api/users", HTTP_GET, false);
+    radix_match_t match1;
+    radix_lookup(g_server->legacy_routes, "/api/users", HTTP_GET, false, &match1, NULL, NULL);
     TEST_ASSERT_TRUE(match1.matched);
-    if (match1.middlewares) free(match1.middlewares);
 
-    radix_match_t match2 = radix_lookup(g_server->legacy_routes, "/api/anything", HTTP_GET, false);
+
+    radix_match_t match2;
+    radix_lookup(g_server->legacy_routes, "/api/anything", HTTP_GET, false, &match2, NULL, NULL);
     TEST_ASSERT_TRUE(match2.matched);
-    if (match2.middlewares) free(match2.middlewares);
+
 
     stop_test_server();
 }
@@ -571,7 +573,8 @@ static void test_radix_tree_null_operations(void)
     TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, result);
 
     // Lookup on NULL tree should not match
-    radix_match_t lookup = radix_lookup(NULL, "/test", HTTP_GET, false);
+    radix_match_t lookup;
+    radix_lookup(NULL, "/test", HTTP_GET, false, &lookup, NULL, NULL);
     TEST_ASSERT_FALSE(lookup.matched);
     TEST_ASSERT_NULL(lookup.handler);
 }
@@ -643,11 +646,12 @@ static void test_radix_tree_many_routes(void)
     }
 
     // Verify some routes
-    radix_match_t lookup = radix_lookup(tree, "/api/route/25", HTTP_GET, false);
+    radix_match_t lookup;
+    radix_lookup(tree, "/api/route/25", HTTP_GET, false, &lookup, NULL, NULL);
     TEST_ASSERT_TRUE(lookup.matched);
     TEST_ASSERT_NOT_NULL(lookup.handler);
 
-    lookup = radix_lookup(tree, "/api/route/49", HTTP_GET, false);
+    radix_lookup(tree, "/api/route/49", HTTP_GET, false, &lookup, NULL, NULL);
     TEST_ASSERT_TRUE(lookup.matched);
     TEST_ASSERT_NOT_NULL(lookup.handler);
 

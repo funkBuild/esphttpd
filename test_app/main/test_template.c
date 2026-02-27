@@ -153,7 +153,7 @@ static void test_template_long_var_name(void) {
     template_context_t ctx;
     template_init_default(&ctx, test_var_callback, NULL);
 
-    // Create a variable name longer than 64 chars
+    // Create a variable name longer than 32 chars
     const char* input = "{{verylongvariablenamethatexceedsthemaximumlengthallowedforvariablenames}}";
     uint8_t output[128] = {0};
 

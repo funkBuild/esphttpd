@@ -236,9 +236,16 @@ static void test_callback_type_compatibility(void) {
 }
 
 // Helper to get request context by index
+// g_test_request_contexts points to request_context_t* array[MAX_CONNECTIONS]
+// (array of pointers, dynamically allocated per-connection in on_connect)
 static test_request_context_t* get_test_ctx(int idx) {
     if (!g_test_request_contexts) return NULL;
-    return &((test_request_context_t*)g_test_request_contexts)[idx];
+    test_request_context_t** ptrs = (test_request_context_t**)g_test_request_contexts;
+    // Allocate on demand for tests (since we don't go through on_connect)
+    if (!ptrs[idx]) {
+        ptrs[idx] = (test_request_context_t*)calloc(1, sizeof(test_request_context_t));
+    }
+    return ptrs[idx];
 }
 
 // Test httpd_req_defer with full request context
@@ -324,8 +331,10 @@ static void test_defer_pre_received_body(void) {
     ctx->req.content_length = 50;
     ctx->req.body_received = 0;
 
-    // Put some data in the body buffer (simulating data received with headers)
+    // Allocate and populate body buffer (simulating data received with headers)
     const uint8_t test_data[] = "Hello, World!";
+    ctx->body_buf = (uint8_t*)malloc(sizeof(test_data));
+    TEST_ASSERT_NOT_NULL(ctx->body_buf);
     memcpy(ctx->body_buf, test_data, sizeof(test_data));
     ctx->body_buf_len = sizeof(test_data);
     ctx->body_buf_pos = 0;
@@ -381,8 +390,10 @@ static void test_defer_body_already_complete(void) {
     ctx->req.content_length = 10;
     ctx->req.body_received = 0;
 
-    // Put complete body in buffer
+    // Allocate and populate complete body in buffer
     const uint8_t test_data[] = "0123456789";  // 10 bytes
+    ctx->body_buf = (uint8_t*)malloc(10);
+    TEST_ASSERT_NOT_NULL(ctx->body_buf);
     memcpy(ctx->body_buf, test_data, 10);
     ctx->body_buf_len = 10;
     ctx->body_buf_pos = 0;
@@ -591,6 +602,8 @@ static void test_defer_body_callback_error(void) {
     ctx->req.body_received = 0;
 
     const uint8_t test_data[] = "test";
+    ctx->body_buf = (uint8_t*)malloc(sizeof(test_data));
+    TEST_ASSERT_NOT_NULL(ctx->body_buf);
     memcpy(ctx->body_buf, test_data, sizeof(test_data));
     ctx->body_buf_len = sizeof(test_data);
     ctx->body_buf_pos = 0;

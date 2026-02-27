@@ -15,6 +15,7 @@
 
 import axios from 'axios';
 import { BASE_URL } from '../jest.setup';
+import { TIMEOUTS } from '../test-utils';
 
 describe('Non-Chunked Large Body Responses', () => {
 
@@ -50,7 +51,7 @@ describe('Non-Chunked Large Body Responses', () => {
       const size = 2048;
       const response = await axios.get(`/large-body/${size}`, {
         responseType: 'arraybuffer',
-        timeout: 10000
+        timeout: TIMEOUTS.HTTP
       });
 
       expect(response.status).toBe(200);
@@ -69,7 +70,7 @@ describe('Non-Chunked Large Body Responses', () => {
       const size = 4096;
       const response = await axios.get(`/large-body/${size}`, {
         responseType: 'arraybuffer',
-        timeout: 10000
+        timeout: TIMEOUTS.HTTP
       });
 
       expect(response.status).toBe(200);
@@ -85,7 +86,7 @@ describe('Non-Chunked Large Body Responses', () => {
       const size = 8192;
       const response = await axios.get(`/large-body/${size}`, {
         responseType: 'arraybuffer',
-        timeout: 15000
+        timeout: TIMEOUTS.HTTP
       });
 
       expect(response.status).toBe(200);
@@ -101,7 +102,7 @@ describe('Non-Chunked Large Body Responses', () => {
       const size = 16384;
       const response = await axios.get(`/large-body/${size}`, {
         responseType: 'arraybuffer',
-        timeout: 20000
+        timeout: TIMEOUTS.HTTP
       });
 
       expect(response.status).toBe(200);
@@ -119,7 +120,7 @@ describe('Non-Chunked Large Body Responses', () => {
       const size = 4096;
       const response = await axios.get(`/large-body/${size}`, {
         responseType: 'arraybuffer',
-        timeout: 10000
+        timeout: TIMEOUTS.HTTP
       });
 
       const contentLength = parseInt(response.headers['content-length']);
@@ -133,7 +134,7 @@ describe('Non-Chunked Large Body Responses', () => {
       const size = 4096;
       const response = await axios.get(`/large-body/${size}`, {
         responseType: 'arraybuffer',
-        timeout: 10000
+        timeout: TIMEOUTS.HTTP
       });
 
       // The server sets X-Expected-Length to the requested size
@@ -149,7 +150,7 @@ describe('Non-Chunked Large Body Responses', () => {
       const size = 1024;
       const response = await axios.get(`/large-body/${size}`, {
         responseType: 'arraybuffer',
-        timeout: 10000
+        timeout: TIMEOUTS.HTTP
       });
 
       expect(response.status).toBe(200);
@@ -160,7 +161,7 @@ describe('Non-Chunked Large Body Responses', () => {
       const size = 1500;
       const response = await axios.get(`/large-body/${size}`, {
         responseType: 'arraybuffer',
-        timeout: 10000
+        timeout: TIMEOUTS.HTTP
       });
 
       expect(response.status).toBe(200);
@@ -171,7 +172,7 @@ describe('Non-Chunked Large Body Responses', () => {
       const size = 1440;
       const response = await axios.get(`/large-body/${size}`, {
         responseType: 'arraybuffer',
-        timeout: 10000
+        timeout: TIMEOUTS.HTTP
       });
 
       expect(response.status).toBe(200);
@@ -182,7 +183,7 @@ describe('Non-Chunked Large Body Responses', () => {
       const size = 2880;
       const response = await axios.get(`/large-body/${size}`, {
         responseType: 'arraybuffer',
-        timeout: 10000
+        timeout: TIMEOUTS.HTTP
       });
 
       expect(response.status).toBe(200);
@@ -197,7 +198,7 @@ describe('Non-Chunked Large Body Responses', () => {
       const requests = sizes.map(size =>
         axios.get(`/large-body/${size}`, {
           responseType: 'arraybuffer',
-          timeout: 15000
+          timeout: TIMEOUTS.HTTP
         })
       );
 
@@ -225,7 +226,7 @@ describe('Non-Chunked Large Body Responses', () => {
       for (const size of sizes) {
         const response = await axios.get(`/large-body/${size}`, {
           responseType: 'arraybuffer',
-          timeout: 10000
+          timeout: TIMEOUTS.HTTP
         });
 
         expect(response.status).toBe(200);

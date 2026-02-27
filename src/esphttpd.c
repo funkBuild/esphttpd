@@ -20,12 +20,11 @@
 #include <sys/socket.h>
 #include <errno.h>
 #include <sys/stat.h>
-#include <sys/select.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 
-static const char* TAG = "ESPHTTPD";
+static const char TAG[] = "ESPHTTPD";
 
 // ============================================================================
 // Internal Structures
@@ -67,7 +66,7 @@ typedef struct {
 
 // HTTP route entry (new API)
 typedef struct {
-    char pattern[64];
+    const char* pattern;
     http_method_t method;
     httpd_handler_t handler;
     void* user_ctx;
@@ -76,7 +75,7 @@ typedef struct {
 
 // WebSocket route entry (new API)
 typedef struct {
-    char pattern[64];
+    const char* pattern;
     httpd_ws_handler_t handler;
     void* user_ctx;
     uint32_t ping_interval_ms;
@@ -84,15 +83,16 @@ typedef struct {
 
 // Mounted router entry
 typedef struct {
-    char prefix[32];
+    const char* prefix;
     uint8_t prefix_len;
     httpd_router_t router;  // httpd_router_t is already a pointer type
 } mounted_router_t;
 
 // Channel hash table entry (replaces linked list for O(1) lookup)
 typedef struct {
-    char name[32];              // Channel name (empty string if unused)
+    char name[16];              // Channel name (empty string if unused)
     int8_t index;               // Bitmask index (0-31), -1 if empty
+    uint8_t subscriber_count;   // Number of connections subscribed to this channel
 } channel_hash_entry_t;
 
 #define CHANNEL_HASH_BUCKETS 32  // Power of 2, >= MAX_CHANNELS for acceptable collision
@@ -105,6 +105,24 @@ static uint32_t channel_hash_fn(const char* str) {
         hash *= 16777619u;
     }
     return hash;
+}
+
+// Format size_t as hex with \r\n suffix. Returns total bytes written.
+static inline int format_hex(char* buf, size_t value) {
+    static const char hex_chars[] = "0123456789abcdef";
+    char tmp[8]; int n = 0;
+    do { tmp[n++] = hex_chars[value & 0xF]; value >>= 4; } while (value);
+    for (int i = n - 1; i >= 0; i--) *buf++ = tmp[i];
+    *buf++ = '\r'; *buf++ = '\n';
+    return n + 2;
+}
+
+// Format size_t as decimal digits. Returns number of digits written.
+static inline int format_uint(char* buf, size_t value) {
+    char tmp[16]; int n = 0;
+    do { tmp[n++] = '0' + (value % 10); value /= 10; } while (value);
+    for (int i = n - 1; i >= 0; i--) *buf++ = tmp[i];
+    return n;
 }
 
 // Server context structure
@@ -169,8 +187,12 @@ static inline bool ensure_channel_hash(struct httpd_server* server) {
         return false;
     }
 
-    // Initialize: set all index fields to -1 (empty)
-    memset(server->channel_hash, 0xFF, CHANNEL_HASH_BUCKETS * sizeof(channel_hash_entry_t));
+    // Initialize: set all slots to empty
+    for (int i = 0; i < CHANNEL_HASH_BUCKETS; i++) {
+        server->channel_hash[i].index = -1;
+        server->channel_hash[i].name[0] = '\0';
+        server->channel_hash[i].subscriber_count = 0;
+    }
     memset(server->channel_by_index, 0, sizeof(server->channel_by_index));
     server->channel_count = 0;
     return true;
@@ -194,7 +216,6 @@ typedef struct {
     httpd_req_t req;                      // Public request struct
     req_header_entry_t headers[MAX_REQ_HEADERS];  // Header index
     char* header_buf;                     // Header storage (dynamically allocated)
-    size_t header_buf_capacity;           // Allocated capacity
     char* uri_buf;                        // URI storage (dynamically allocated)
     struct httpd_server* server;          // Back pointer to server
     httpd_route_entry_t* matched_route;   // Matched route
@@ -202,6 +223,17 @@ typedef struct {
     uint8_t* body_buf;                    // Buffer for body data (NULL if not allocated)
     size_t body_buf_len;                  // Amount of data in body_buf
     size_t body_buf_pos;                  // Current read position in body_buf
+    // HTTP header accumulation buffer (for multi-recv parsing)
+    uint8_t* recv_buf;                    // Accumulated recv data (NULL if not parsing)
+    size_t recv_buf_len;                  // Amount of data accumulated
+    size_t recv_buf_capacity;             // Allocated capacity
+    http_parser_context_t parser_ctx;     // Persistent parser context across recv calls
+    bool parsing_in_progress;             // True while headers are being accumulated
+    bool recv_buf_is_heap;                // true if recv_buf was malloc'd (needs free)
+    bool uri_buf_is_heap;                 // true if uri_buf was malloc'd (needs free)
+    // Inline buffers to eliminate per-request malloc for common cases
+    uint8_t inline_recv_buf[512];         // Embedded buffer for single-packet requests
+    char inline_uri_buf[128];             // Embedded buffer for typical URI lengths
     // Query parameter cache (lazy parsing)
     query_param_entry_t query_params[MAX_QUERY_PARAMS];
     uint8_t query_param_count;
@@ -210,7 +242,8 @@ typedef struct {
     struct {
         httpd_body_cb_t on_body;          // Body data callback
         httpd_done_cb_t on_done;          // Completion callback
-        void* file_ctx;                   // Internal context for defer_to_file
+        FILE* file_fp;                    // File pointer for defer_to_file (inlined)
+        httpd_done_cb_t file_user_done_cb; // User's done callback for defer_to_file (inlined)
         bool active;                      // Request is in deferred mode
         bool paused;                      // Flow control - receiving paused
     } defer;
@@ -233,6 +266,8 @@ typedef struct {
         httpd_req_continuation_t cont;    // Continuation state
         bool active;                      // Continuation mode active
     } continuation;
+    // Middleware chain (persists for request lifetime, safe across deferred handlers)
+    httpd_middleware_t mw_chain[CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE];
 } request_context_t;
 
 // Per-connection WebSocket context
@@ -241,37 +276,30 @@ typedef struct {
     httpd_ws_route_entry_t* route;        // Associated route
     ws_frame_context_t frame_ctx;         // Frame parsing context
     uint32_t channel_mask;                // Bitmask of subscribed channels
+    uint8_t route_index;                  // Index into ws_routes[] for O(1) broadcast filter
 } ws_context_t;
 
-// Per-connection contexts (pointer arrays - dynamically allocated on connect)
+// Per-connection contexts (pointer arrays into pre-allocated backing storage)
 static request_context_t* request_contexts[MAX_CONNECTIONS];
 static ws_context_t* ws_contexts[MAX_CONNECTIONS];
 static send_buffer_t* connection_send_buffers[MAX_CONNECTIONS];
+
+// Pre-allocated backing arrays (allocated once at httpd_start, freed at httpd_stop)
+// Eliminates per-connect/disconnect malloc/free and prevents heap fragmentation
+static request_context_t* preallocated_request_contexts;
+static ws_context_t* preallocated_ws_contexts;
+static send_buffer_t* preallocated_send_buffers;
 
 // Global server instance (for now - could be made multi-instance later)
 static struct httpd_server server_instance;
 #ifdef CONFIG_ESPHTTPD_TEST_MODE
 struct httpd_server* g_server = NULL;  // Non-static for test access
+void* g_test_request_contexts = NULL;  // Non-static for test access
+void* g_test_send_buffers = NULL;      // Non-static for test access
 #else
 static struct httpd_server* g_server = NULL;
 #endif
 static filesystem_t fs_instance;
-
-// WebSocket client key buffer (used by http_parser)
-char ws_client_key[32] = {0};
-
-// Per-connection contexts
-static request_context_t request_contexts[MAX_CONNECTIONS];
-static ws_context_t ws_contexts[MAX_CONNECTIONS];
-
-#ifdef CONFIG_ESPHTTPD_TEST_MODE
-// Export request_contexts for test access (via void* cast for type safety)
-void* g_test_request_contexts = (void*)request_contexts;
-#endif
-
-
-// Track current connection being parsed (for header storage callback)
-static connection_t* g_parsing_connection = NULL;
 
 // Forward declarations
 static request_context_t* get_request_context(connection_t* conn);
@@ -293,7 +321,7 @@ static void on_write_ready(connection_t* conn);
 static void server_task(void* pvParameters);
 
 // Get send buffer for connection (returns NULL if not allocated)
-static inline send_buffer_t* get_send_buffer(connection_t* conn) {
+static inline __attribute__((always_inline)) send_buffer_t* get_send_buffer(connection_t* conn) {
     return connection_send_buffers[conn->pool_index];
 }
 
@@ -328,7 +356,7 @@ static bool drain_send_buffer(connection_t* conn) {
 
 // Non-blocking send - tries to send data, queues remainder if socket would block
 // Returns number of bytes sent/queued, or -1 on error
-static ssize_t send_nonblocking(connection_t* conn, const void* data, size_t len, int flags) {
+static ssize_t send_nonblocking(connection_t* __restrict conn, const void* __restrict data, size_t len, int flags) {
     if (!conn || !data || len == 0) {
         return 0;
     }
@@ -380,15 +408,26 @@ queue_data:
         }
     }
 
-    // Try to queue data - if buffer full, attempt one drain and retry
-    if (send_buffer_queue(sb, ptr, remaining) < 0) {
-        // Buffer full - try draining once
-        drain_send_buffer(conn);
-        if (send_buffer_queue(sb, ptr, remaining) < 0) {
-            // Still can't fit - data is too large for buffer
-            ESP_LOGE(TAG, "Send buffer full, cannot queue %zu bytes", remaining);
+    // Queue data in chunks when remaining exceeds buffer capacity.
+    // Between chunks, drain the buffer to the socket to free space.
+    while (remaining > 0) {
+        size_t space = send_buffer_space(sb);
+        if (space == 0) {
+            // Buffer full - drain to socket to make room
+            drain_send_buffer(conn);
+            space = send_buffer_space(sb);
+            if (space == 0) {
+                // Socket also full - no progress possible
+                ESP_LOGE(TAG, "Send buffer full, cannot queue %zu bytes", remaining);
+                return -1;
+            }
+        }
+        size_t to_queue = (remaining <= space) ? remaining : space;
+        if (send_buffer_queue(sb, ptr, to_queue) < 0) {
             return -1;
         }
+        ptr += to_queue;
+        remaining -= to_queue;
     }
 
     // Mark connection as having pending writes
@@ -397,28 +436,39 @@ queue_data:
     return (ssize_t)len;
 }
 
-// Legacy blocking send - for backwards compatibility during transition
-// TODO: Remove once all callers updated to non-blocking
-static ssize_t send_all(int fd, const void* data, size_t len, int flags) {
-    const uint8_t* ptr = (const uint8_t*)data;
-    size_t remaining = len;
+// WebSocket send callback - wraps send_nonblocking for use by websocket.c
+// Drops the flags parameter (WebSocket frames are complete messages, no MSG_MORE needed)
+static ssize_t ws_send_callback(connection_t* conn, const void* data, size_t len) {
+    return send_nonblocking(conn, data, len, 0);
+}
 
-    while (remaining > 0) {
-        ssize_t sent = send(fd, ptr, remaining, flags);
-        if (sent < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Socket buffer full, yield briefly and retry
-                vTaskDelay(1);
-                continue;
-            }
-            ESP_LOGE(TAG, "send_all failed: %s", strerror(errno));
+// Filesystem send callback - wraps send_nonblocking for use by filesystem.c
+static ssize_t fs_send_callback(connection_t* conn, const void* data, size_t len) {
+    return send_nonblocking(conn, data, len, MSG_MORE);
+}
+
+// Filesystem file stream callback - starts non-blocking file streaming via send_buffer
+// Ownership of file_fd transfers to send_buffer (it will close it when streaming completes)
+static int fs_file_stream_callback(connection_t* conn, int file_fd, size_t file_size) {
+    send_buffer_t* sb = get_send_buffer(conn);
+    if (!sb) return -1;
+
+    // Ensure send buffer is allocated
+    if (!sb->allocated) {
+        if (!send_buffer_alloc(sb)) {
+            ESP_LOGE(TAG, "Failed to allocate send buffer for file streaming");
             return -1;
         }
-        ptr += sent;
-        remaining -= sent;
     }
 
-    return (ssize_t)len;
+    // Start file streaming - send_buffer takes ownership of file_fd
+    if (!send_buffer_start_file(sb, file_fd, file_size)) {
+        return -1;
+    }
+
+    // Mark connection as write-pending to trigger on_write_ready
+    connection_mark_write_pending(&g_server->connection_pool, conn->pool_index, true);
+    return 0;
 }
 
 const char* httpd_status_text(int status) {
@@ -450,6 +500,59 @@ const char* httpd_status_text(int status) {
     }
 }
 
+// Pre-built HTTP status lines for common status codes.
+// Returns the status line string and sets *out_len to the string length.
+// For uncommon codes, formats into the provided fallback buffer.
+#define STATUS_LINE(code, text) "HTTP/1.1 " #code " " text "\r\n"
+static const char status_line_200[] = STATUS_LINE(200, "OK");
+static const char status_line_201[] = STATUS_LINE(201, "Created");
+static const char status_line_204[] = STATUS_LINE(204, "No Content");
+static const char status_line_301[] = STATUS_LINE(301, "Moved Permanently");
+static const char status_line_302[] = STATUS_LINE(302, "Found");
+static const char status_line_304[] = STATUS_LINE(304, "Not Modified");
+static const char status_line_400[] = STATUS_LINE(400, "Bad Request");
+static const char status_line_401[] = STATUS_LINE(401, "Unauthorized");
+static const char status_line_403[] = STATUS_LINE(403, "Forbidden");
+static const char status_line_404[] = STATUS_LINE(404, "Not Found");
+static const char status_line_405[] = STATUS_LINE(405, "Method Not Allowed");
+static const char status_line_500[] = STATUS_LINE(500, "Internal Server Error");
+#undef STATUS_LINE
+
+// Get pre-built status line for a status code. For common codes, returns a pointer
+// to a static string (zero-cost). For uncommon codes, formats into fallback_buf.
+// *out_len is always set to the length of the returned string.
+static const char* get_status_line(int status, char* fallback_buf, size_t fallback_size, int* out_len) {
+    switch (status) {
+        case 200: *out_len = sizeof(status_line_200) - 1; return status_line_200;
+        case 201: *out_len = sizeof(status_line_201) - 1; return status_line_201;
+        case 204: *out_len = sizeof(status_line_204) - 1; return status_line_204;
+        case 301: *out_len = sizeof(status_line_301) - 1; return status_line_301;
+        case 302: *out_len = sizeof(status_line_302) - 1; return status_line_302;
+        case 304: *out_len = sizeof(status_line_304) - 1; return status_line_304;
+        case 400: *out_len = sizeof(status_line_400) - 1; return status_line_400;
+        case 401: *out_len = sizeof(status_line_401) - 1; return status_line_401;
+        case 403: *out_len = sizeof(status_line_403) - 1; return status_line_403;
+        case 404: *out_len = sizeof(status_line_404) - 1; return status_line_404;
+        case 405: *out_len = sizeof(status_line_405) - 1; return status_line_405;
+        case 500: *out_len = sizeof(status_line_500) - 1; return status_line_500;
+        default: {
+            static const char prefix[] = "HTTP/1.1 ";
+            char* p = fallback_buf;
+            memcpy(p, prefix, sizeof(prefix) - 1);
+            p += sizeof(prefix) - 1;
+            p += format_uint(p, (size_t)status);
+            *p++ = ' ';
+            const char* text = httpd_status_text(status);
+            size_t text_len = strlen(text);
+            memcpy(p, text, text_len);
+            p += text_len;
+            *p++ = '\r'; *p++ = '\n';
+            *out_len = (int)(p - fallback_buf);
+            return fallback_buf;
+        }
+    }
+}
+
 // MIME type lookup table entry
 typedef struct {
     const char* ext;
@@ -471,7 +574,7 @@ static const mime_entry_t mime_w[] = { {"woff", 4, "font/woff"}, {"woff2", 5, "f
 static const mime_entry_t mime_x[] = { {"xml", 3, "application/xml"}, {NULL, 0, NULL} };
 
 // Dispatch table indexed by (first_char - 'a'), NULL for unused letters
-static const mime_entry_t* mime_dispatch[26] = {
+static const mime_entry_t* const mime_dispatch[26] = {
     NULL,    // a
     NULL,    // b
     mime_c,  // c
@@ -528,36 +631,22 @@ const char* httpd_get_mime_type(const char* path) {
     return "application/octet-stream";
 }
 
-// Hex digit to value lookup table (-1 for invalid chars)
-// Index by ASCII code, returns 0-15 for valid hex or -1 for invalid
-static const int8_t hex_lookup[256] = {
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // 0-15
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // 16-31
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // 32-47
-     0, 1, 2, 3, 4, 5, 6, 7, 8, 9,-1,-1,-1,-1,-1,-1, // 48-63 (0-9)
-    -1,10,11,12,13,14,15,-1,-1,-1,-1,-1,-1,-1,-1,-1, // 64-79 (A-F)
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // 80-95
-    -1,10,11,12,13,14,15,-1,-1,-1,-1,-1,-1,-1,-1,-1, // 96-111 (a-f)
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // 112-127
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // 128-255 (extended ASCII)
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-};
+// Compute hex digit value from ASCII char (saves 256 bytes vs lookup table)
+// Returns 0-15 for valid hex digits, -1 for invalid
+static inline int8_t hex_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if ((c | 0x20) >= 'a' && (c | 0x20) <= 'f') return (c | 0x20) - 'a' + 10;
+    return -1;
+}
 
-int httpd_url_decode(const char* src, char* dst, size_t dst_size) {
-    size_t src_len = strlen(src);
+// Length-bounded URL decode for non-null-terminated substrings (e.g., query parameter values)
+static int httpd_url_decode_n(const char* src, size_t src_len, char* dst, size_t dst_size) {
     size_t dst_idx = 0;
 
     for (size_t i = 0; i < src_len && dst_idx < dst_size - 1; i++) {
         if (src[i] == '%' && i + 2 < src_len) {
-            // O(1) hex lookup instead of strtol()
-            int8_t hi = hex_lookup[(uint8_t)src[i+1]];
-            int8_t lo = hex_lookup[(uint8_t)src[i+2]];
+            int8_t hi = hex_val(src[i+1]);
+            int8_t lo = hex_val(src[i+2]);
             if (hi >= 0 && lo >= 0) {
                 dst[dst_idx++] = (char)((hi << 4) | lo);
                 i += 2;
@@ -574,8 +663,14 @@ int httpd_url_decode(const char* src, char* dst, size_t dst_size) {
     return (int)dst_idx;
 }
 
-// Inline case-insensitive comparison - avoids libc call overhead
-static inline bool str_casecmp(const char* a, const char* b, size_t len) {
+int httpd_url_decode(const char* src, char* dst, size_t dst_size) {
+    return httpd_url_decode_n(src, strlen(src), dst, dst_size);
+}
+
+// Inline case-insensitive comparison for HTTP header names.
+// Uses the |0x20 trick which only works correctly for ASCII letters (A-Z/a-z).
+// Do NOT use for arbitrary string comparison — non-alpha chars may collide.
+static inline bool header_casecmp(const char* a, const char* b, size_t len) {
     for (size_t i = 0; i < len; i++) {
         // Fast case-insensitive compare using OR with 0x20
         // Works for ASCII letters: 'A'|0x20 == 'a', etc.
@@ -591,7 +686,7 @@ static inline bool str_casecmp(const char* a, const char* b, size_t len) {
 // ============================================================================
 
 // Get request_context from httpd_req_t for internal use - O(1) via pool_index
-static request_context_t* get_req_context(httpd_req_t* req) {
+static inline __attribute__((always_inline)) request_context_t* get_req_context(httpd_req_t* req) {
     if (!req || !req->_internal || !g_server) return NULL;
     connection_t* conn = (connection_t*)req->_internal;
     return request_contexts[conn->pool_index];
@@ -635,25 +730,25 @@ int httpd_req_get_query(httpd_req_t* req, const char* key, char* value, size_t v
     if (!req || !key || !value || value_size == 0) return -1;
     if (!req->query || req->query_len == 0) return -1;
 
+    size_t key_len = strlen(key);
+
     // Get request context and parse query if needed
     request_context_t* ctx = get_req_context(req);
     if (ctx) {
         parse_query_params(ctx);
 
         // O(k) lookup in cached parameters
-        size_t key_len = strlen(key);
         for (uint8_t i = 0; i < ctx->query_param_count; i++) {
             query_param_entry_t* entry = &ctx->query_params[i];
             if (entry->key_len == key_len && memcmp(entry->key, key, key_len) == 0) {
-                // Found - URL decode value into output buffer
-                return httpd_url_decode(entry->value, value, value_size);
+                // Found - URL decode value into output buffer (bounded by value_len)
+                return httpd_url_decode_n(entry->value, entry->value_len, value, value_size);
             }
         }
         return -1;  // Not found in cache
     }
 
     // Fallback to original linear scan if context unavailable
-    size_t key_len = strlen(key);
     const char* p = req->query;
     const char* end = req->query + req->query_len;
 
@@ -662,12 +757,12 @@ int httpd_req_get_query(httpd_req_t* req, const char* key, char* value, size_t v
         if (!eq) break;
 
         size_t k_len = eq - p;
+        const char* amp = memchr(eq + 1, '&', end - (eq + 1));
         if (k_len == key_len && memcmp(p, key, key_len) == 0) {
             const char* v_start = eq + 1;
-            return httpd_url_decode(v_start, value, value_size);
+            size_t v_len = amp ? (size_t)(amp - v_start) : (size_t)(end - v_start);
+            return httpd_url_decode_n(v_start, v_len, value, value_size);
         }
-
-        const char* amp = memchr(p, '&', end - p);
         if (!amp) break;
         p = amp + 1;
     }
@@ -690,103 +785,40 @@ static inline request_context_t* get_request_context(connection_t* conn) {
     return request_contexts[conn->pool_index];
 }
 
-static inline ws_context_t* get_ws_context(connection_t* conn) {
+static inline __attribute__((always_inline)) ws_context_t* get_ws_context(connection_t* conn) {
     if (!g_server) return NULL;
     return ws_contexts[conn->pool_index];
 }
 
 static void init_request_context(request_context_t* ctx, connection_t* conn) {
-    // Selective initialization - avoid clearing large buffers (~3.5KB savings)
-    // Only reset fields that need to be zeroed for a new request
-
-    // Free any previously allocated buffers
-    if (ctx->uri_buf) {
-        free(ctx->uri_buf);
-        ctx->uri_buf = NULL;
-    }
-    if (ctx->header_buf) {
-        free(ctx->header_buf);
-        ctx->header_buf = NULL;
-        ctx->header_buf_capacity = 0;
+    // On the first request of a connection, _internal is NULL (from calloc
+    // or on_disconnect memset), so all buffer pointers are guaranteed NULL.
+    // Skip the free() calls to avoid function call overhead.
+    if (ctx->req._internal) {
+        if (ctx->uri_buf_is_heap) free(ctx->uri_buf);
+        if (ctx->header_buf) free(ctx->header_buf);
+        if (ctx->body_buf) free(ctx->body_buf);
+        if (ctx->recv_buf_is_heap) free(ctx->recv_buf);
     }
 
-    // Essential pointers and connection info
+    // Zero the entire struct - compiler/hardware can optimize this
+    // into efficient word-sized or SIMD stores
+    memset(ctx, 0, sizeof(*ctx));
+
+    // Set the few non-zero fields
     ctx->req.fd = conn->fd;
     ctx->req._internal = conn;
-    ctx->req.header_buf = NULL;  // Will be allocated on first header
-    ctx->req.header_buf_size = 0;
-    ctx->req.uri = NULL;  // Will be set when URI is parsed
     ctx->req.status_code = 200;
     ctx->server = g_server;
-
-    // Reset request line fields
-    ctx->req.method = HTTP_GET;
-    ctx->req.uri_len = 0;
-    ctx->req.path = NULL;
-    ctx->req.path_len = 0;
-    ctx->req.query = NULL;
-    ctx->req.query_len = 0;
-    ctx->req.original_url = NULL;
-    ctx->req.original_url_len = 0;
-    ctx->req.base_url = NULL;
-    ctx->req.base_url_len = 0;
-
-    // Reset header tracking (don't clear header_buf itself)
-    ctx->req.header_buf_used = 0;
-    ctx->req.header_count = 0;
-
-    // Reset route params
-    ctx->req.param_count = 0;
-
-    // Reset body tracking
-    ctx->req.content_length = 0;
-    ctx->req.body_received = 0;
-
-    // Reset response state
-    ctx->req.headers_sent = false;
-    ctx->req.body_started = false;
-    ctx->req.user_data = NULL;
-    ctx->req.is_websocket = false;
-    ctx->req.ws_key[0] = '\0';
-
-    // Reset context fields
-    ctx->matched_route = NULL;
-    // Free any previously allocated body buffer
-    if (ctx->body_buf) {
-        free(ctx->body_buf);
-        ctx->body_buf = NULL;
-    }
-    ctx->body_buf_len = 0;
-    ctx->body_buf_pos = 0;
-    ctx->query_param_count = 0;
-    ctx->query_parsed = false;
-
-    // Reset deferred handling state
-    ctx->defer.on_body = NULL;
-    ctx->defer.on_done = NULL;
-    ctx->defer.file_ctx = NULL;
-    ctx->defer.active = false;
-    ctx->defer.paused = false;
-
-    // Reset async send state
-    ctx->async_send.on_done = NULL;
-    ctx->async_send.active = false;
-
-    // Reset data provider state
-    ctx->data_provider.provider = NULL;
-    ctx->data_provider.on_complete = NULL;
-    ctx->data_provider.active = false;
-    ctx->data_provider.eof_reached = false;
-    ctx->data_provider.use_chunked = false;
 }
 
-// Store header in request context
-void esphttpd_store_header(const uint8_t* key, uint8_t key_len,
+// Store header in request context (called from http_parser via extern)
+void esphttpd_store_header(connection_t* conn,
+                           const uint8_t* key, uint8_t key_len,
                            const uint8_t* value, uint8_t value_len) {
-    // Use the global parsing connection to find the request context
-    if (!g_parsing_connection || !g_server) return;
+    if (!conn || !g_server) return;
 
-    request_context_t* ctx = get_request_context(g_parsing_connection);
+    request_context_t* ctx = get_request_context(conn);
     if (!ctx) return;
 
     store_header_in_req(ctx, key, key_len, value, value_len);
@@ -802,9 +834,9 @@ static void store_header_in_req(request_context_t* ctx, const uint8_t* key, uint
     size_t required = ctx->req.header_buf_used + needed;
 
     // Allocate or grow header buffer if needed
-    if (required > ctx->header_buf_capacity) {
+    if (required > ctx->req.header_buf_size) {
         // Calculate new capacity - start with 256, grow to fit with margin
-        size_t new_capacity = ctx->header_buf_capacity ? ctx->header_buf_capacity : 256;
+        size_t new_capacity = ctx->req.header_buf_size ? ctx->req.header_buf_size : 256;
         while (new_capacity < required) {
             new_capacity = (new_capacity < 1024) ? new_capacity * 2 : new_capacity + 512;
         }
@@ -823,7 +855,6 @@ static void store_header_in_req(request_context_t* ctx, const uint8_t* key, uint
             return;
         }
         ctx->header_buf = new_buf;
-        ctx->header_buf_capacity = new_capacity;
         ctx->req.header_buf = new_buf;
         ctx->req.header_buf_size = new_capacity;
     }
@@ -879,14 +910,33 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
         .reuseaddr = true
     };
 
-    // Initialize components
+    // Initialize components (event_loop_init also initializes the connection pool)
     event_loop_init(&server->event_loop, &server->connection_pool, &el_config);
-    connection_pool_init(&server->connection_pool);
 
-    // Initialize per-connection context pointer arrays (all NULL initially)
-    memset(request_contexts, 0, sizeof(request_contexts));
-    memset(ws_contexts, 0, sizeof(ws_contexts));
-    memset(connection_send_buffers, 0, sizeof(connection_send_buffers));
+    // Pre-allocate per-connection context arrays (one contiguous block each)
+    // This eliminates malloc/free on every connect/disconnect and prevents heap fragmentation
+    preallocated_request_contexts = (request_context_t*)calloc(MAX_CONNECTIONS, sizeof(request_context_t));
+    preallocated_ws_contexts = (ws_context_t*)calloc(MAX_CONNECTIONS, sizeof(ws_context_t));
+    preallocated_send_buffers = (send_buffer_t*)calloc(MAX_CONNECTIONS, sizeof(send_buffer_t));
+
+    if (!preallocated_request_contexts || !preallocated_ws_contexts || !preallocated_send_buffers) {
+        ESP_LOGE(TAG, "Failed to pre-allocate per-connection contexts");
+        free(preallocated_request_contexts);
+        free(preallocated_ws_contexts);
+        free(preallocated_send_buffers);
+        preallocated_request_contexts = NULL;
+        preallocated_ws_contexts = NULL;
+        preallocated_send_buffers = NULL;
+        return HTTPD_ERR_NO_MEM;
+    }
+
+    // Point pointer arrays at pre-allocated backing storage and initialize send buffers
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        request_contexts[i] = &preallocated_request_contexts[i];
+        ws_contexts[i] = &preallocated_ws_contexts[i];
+        connection_send_buffers[i] = &preallocated_send_buffers[i];
+        send_buffer_init(connection_send_buffers[i]);
+    }
 
     // Initialize channel hash table
     init_channel_hash(server);
@@ -895,8 +945,24 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
     server->legacy_routes = radix_tree_create();
     if (!server->legacy_routes) {
         ESP_LOGE(TAG, "Failed to create legacy routes radix tree");
+        free(preallocated_request_contexts);
+        free(preallocated_ws_contexts);
+        free(preallocated_send_buffers);
+        preallocated_request_contexts = NULL;
+        preallocated_ws_contexts = NULL;
+        preallocated_send_buffers = NULL;
+        memset(request_contexts, 0, sizeof(request_contexts));
+        memset(ws_contexts, 0, sizeof(ws_contexts));
+        memset(connection_send_buffers, 0, sizeof(connection_send_buffers));
         return HTTPD_ERR_NO_MEM;
     }
+
+    // Register WebSocket send callback so frames route through send_nonblocking
+    ws_set_send_func(ws_send_callback);
+
+    // Register filesystem send callbacks so file serving routes through send_nonblocking
+    fs_set_send_func(fs_send_callback);
+    fs_set_file_stream_func(fs_file_stream_callback);
 
     // Setup event handlers
     server->handlers.on_http_request = on_http_request;
@@ -910,6 +976,10 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
 
     server->initialized = true;
     g_server = server;
+#ifdef CONFIG_ESPHTTPD_TEST_MODE
+    g_test_request_contexts = request_contexts;
+    g_test_send_buffers = connection_send_buffers;
+#endif
     *handle = server;
 
     // Add built-in CORS middleware if enabled
@@ -932,6 +1002,15 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
     if (ret != pdPASS) {
         server->initialized = false;
         g_server = NULL;
+        free(preallocated_request_contexts);
+        free(preallocated_ws_contexts);
+        free(preallocated_send_buffers);
+        preallocated_request_contexts = NULL;
+        preallocated_ws_contexts = NULL;
+        preallocated_send_buffers = NULL;
+        memset(request_contexts, 0, sizeof(request_contexts));
+        memset(ws_contexts, 0, sizeof(ws_contexts));
+        memset(connection_send_buffers, 0, sizeof(connection_send_buffers));
         return HTTPD_ERR_NO_MEM;
     }
     server->running = true;
@@ -949,13 +1028,42 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
     ESP_LOGI(TAG, "Stopping server");
     event_loop_stop(&server->event_loop);
 
-    // Close all active connections
+    // Close all active connections and free per-connection dynamic sub-buffers
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         if (connection_is_active(&server->connection_pool, i)) {
             connection_t* conn = &server->connection_pool.connections[i];
             close(conn->fd);
         }
+
+        // Free dynamically-allocated sub-buffers within pre-allocated contexts
+        if (request_contexts[i]) {
+            free(request_contexts[i]->uri_buf);
+            free(request_contexts[i]->header_buf);
+            free(request_contexts[i]->body_buf);
+            free(request_contexts[i]->recv_buf);
+            request_contexts[i] = NULL;
+        }
+
+        if (ws_contexts[i]) {
+            free(ws_contexts[i]->frame_ctx.payload_buffer);
+            ws_contexts[i] = NULL;
+        }
+
+        if (connection_send_buffers[i]) {
+            if (connection_send_buffers[i]->allocated) {
+                send_buffer_free(connection_send_buffers[i]);
+            }
+            connection_send_buffers[i] = NULL;
+        }
     }
+
+    // Free pre-allocated backing arrays
+    free(preallocated_request_contexts);
+    preallocated_request_contexts = NULL;
+    free(preallocated_ws_contexts);
+    preallocated_ws_contexts = NULL;
+    free(preallocated_send_buffers);
+    preallocated_send_buffers = NULL;
 
     server->initialized = false;
     server->running = false;
@@ -966,6 +1074,15 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
         server->legacy_routes = NULL;
     }
 
+    // Destroy mounted routers
+    for (int i = 0; i < server->mounted_router_count; i++) {
+        if (server->mounted_routers[i].router) {
+            httpd_router_destroy(server->mounted_routers[i].router);
+            server->mounted_routers[i].router = NULL;
+        }
+    }
+    server->mounted_router_count = 0;
+
     // Reset route counts
     server->ws_route_count = 0;
     server->middleware_count = 0;
@@ -973,8 +1090,19 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
     // Reset channel hash table
     init_channel_hash(server);
 
+    // Clear WebSocket send callback
+    ws_set_send_func(NULL);
+
+    // Clear filesystem send callbacks
+    fs_set_send_func(NULL);
+    fs_set_file_stream_func(NULL);
+
     if (g_server == server) {
         g_server = NULL;
+#ifdef CONFIG_ESPHTTPD_TEST_MODE
+        g_test_request_contexts = NULL;
+        g_test_send_buffers = NULL;
+#endif
     }
 
     return HTTPD_OK;
@@ -1038,7 +1166,7 @@ httpd_err_t httpd_register_ws_route(httpd_handle_t handle, const httpd_ws_route_
     }
 
     httpd_ws_route_entry_t* entry = &server->ws_routes[server->ws_route_count++];
-    strncpy(entry->pattern, route->pattern, sizeof(entry->pattern) - 1);
+    entry->pattern = route->pattern;
     entry->handler = route->handler;
     entry->user_ctx = route->user_ctx;
     entry->ping_interval_ms = route->ping_interval_ms;
@@ -1072,16 +1200,10 @@ httpd_err_t httpd_mount(httpd_handle_t handle, const char* prefix,
     }
 
     size_t prefix_len = strlen(prefix);
-    if (prefix_len >= sizeof(server->mounted_routers[0].prefix)) {
-        ESP_LOGE(TAG, "Mount prefix too long (max %zu)",
-                 sizeof(server->mounted_routers[0].prefix) - 1);
-        return HTTPD_ERR_INVALID_ARG;
-    }
 
     // Store the mounted router
     mounted_router_t* entry = &server->mounted_routers[server->mounted_router_count];
-    strncpy(entry->prefix, prefix, sizeof(entry->prefix) - 1);
-    entry->prefix[sizeof(entry->prefix) - 1] = '\0';
+    entry->prefix = prefix;
     entry->prefix_len = prefix_len;
     entry->router = router;
     server->mounted_router_count++;
@@ -1117,6 +1239,45 @@ httpd_err_t httpd_on_error(httpd_handle_t handle, httpd_err_handler_t handler) {
     return HTTPD_OK;
 }
 
+// Send a complete CORS preflight response as a single write.
+// Combines status line + all CORS headers + Content-Length: 0 + blank line into one buffer.
+static httpd_err_t send_cors_preflight(httpd_req_t* req, connection_t* conn, const char* cors_origin) {
+    // Pre-built constant parts of CORS preflight response
+    static const char cors_headers[] =
+        "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+        "Access-Control-Max-Age: 86400\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+
+    // Build complete response in one buffer: status + origin header + static headers
+    char resp_buf[384];
+    int pos = sizeof(status_line_204) - 1;
+    memcpy(resp_buf, status_line_204, pos);
+
+    // Add Access-Control-Allow-Origin header with config-dependent origin
+    static const char acao_prefix[] = "Access-Control-Allow-Origin: ";
+    memcpy(resp_buf + pos, acao_prefix, sizeof(acao_prefix) - 1);
+    pos += sizeof(acao_prefix) - 1;
+    size_t origin_len = strlen(cors_origin);
+    memcpy(resp_buf + pos, cors_origin, origin_len);
+    pos += origin_len;
+    resp_buf[pos++] = '\r';
+    resp_buf[pos++] = '\n';
+
+    // Append the static CORS headers
+    memcpy(resp_buf + pos, cors_headers, sizeof(cors_headers) - 1);
+    pos += sizeof(cors_headers) - 1;
+
+    // Single send for the entire response
+    if (send_nonblocking(conn, resp_buf, pos, 0) < 0) {
+        return HTTPD_ERR_IO;
+    }
+    req->headers_sent = true;
+    req->body_started = true;
+    return HTTPD_OK;
+}
+
 // Built-in CORS middleware
 static httpd_err_t cors_middleware(httpd_req_t* req, httpd_next_t next) {
     connection_t* conn = (connection_t*)req->_internal;
@@ -1125,14 +1286,9 @@ static httpd_err_t cors_middleware(httpd_req_t* req, httpd_next_t next) {
     // Get CORS origin from server config
     const char* cors_origin = g_server->config.cors_origin ? g_server->config.cors_origin : "*";
 
-    // Handle OPTIONS preflight requests
+    // Handle OPTIONS preflight requests - send complete response in single write
     if (req->method == HTTP_OPTIONS) {
-        httpd_resp_set_status(req, 204);
-        httpd_resp_set_header(req, "Access-Control-Allow-Origin", cors_origin);
-        httpd_resp_set_header(req, "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
-        httpd_resp_set_header(req, "Access-Control-Allow-Headers", "Content-Type, Authorization");
-        httpd_resp_set_header(req, "Access-Control-Max-Age", "86400");
-        return httpd_resp_send(req, NULL, 0);
+        return send_cors_preflight(req, conn, cors_origin);
     }
 
     // For all other requests, add CORS headers and continue
@@ -1185,10 +1341,10 @@ const char* httpd_req_get_header(httpd_req_t* req, const char* key) {
 
     for (int i = 0; i < req->header_count; i++) {
         req_header_entry_t* entry = &ctx->headers[i];
-        // Filter by length and first char before expensive str_casecmp
+        // Filter by length and first char before expensive header_casecmp
         if (entry->key_len == key_len &&
             (ctx->header_buf[entry->key_offset] | 0x20) == first_lower &&
-            str_casecmp(&ctx->header_buf[entry->key_offset], key, key_len)) {
+            header_casecmp(&ctx->header_buf[entry->key_offset], key, key_len)) {
             return &ctx->header_buf[entry->value_offset];
         }
     }
@@ -1255,57 +1411,30 @@ int httpd_req_recv(httpd_req_t* req, void* buf, size_t len) {
         }
     }
 
-    // If we need more data, receive from socket
+    // If we need more data, do a single non-blocking recv from socket.
+    // This avoids blocking the event loop - callers should use deferred or
+    // continuation handling if they need to wait for more data.
     remaining = req->content_length - req->body_received;
     if (remaining > 0 && total_received < len) {
         size_t to_recv = (len - total_received) < remaining ? (len - total_received) : remaining;
 
-        // Handle non-blocking socket - wait for data with select()
-        while (1) {
-            ssize_t received = recv(conn->fd, (char*)buf + total_received, to_recv, 0);
+        ssize_t received = recv(conn->fd, (char*)buf + total_received, to_recv, MSG_DONTWAIT);
 
-            if (received > 0) {
-                req->body_received += received;
-                total_received += received;
-                break;
-            } else if (received == 0) {
-                // Connection closed
-                break;
+        if (received > 0) {
+            req->body_received += received;
+            total_received += received;
+        } else if (received == 0) {
+            // Connection closed
+            if (total_received == 0) return -1;
+        } else {
+            // received < 0
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // No data available right now - return what we have so far
+                // (which may be 0 if no pre-buffered data either)
             } else {
-                // received < 0
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    // Non-blocking socket has no data - wait with select()
-                    fd_set read_fds;
-                    struct timeval tv;
-                    FD_ZERO(&read_fds);
-                    FD_SET(conn->fd, &read_fds);
-                    tv.tv_sec = 30;  // 30 second timeout for body data
-                    tv.tv_usec = 0;
-
-                    int sel = select(conn->fd + 1, &read_fds, NULL, NULL, &tv);
-                    if (sel > 0) {
-                        // Data available, retry recv
-                        continue;
-                    } else if (sel == 0) {
-                        // Timeout
-                        ESP_LOGW(TAG, "recv timeout waiting for body data");
-                        break;
-                    } else {
-                        // select error
-                        ESP_LOGE(TAG, "select error: %s", strerror(errno));
-                        if (total_received == 0) {
-                            return -1;
-                        }
-                        break;
-                    }
-                } else {
-                    // Real error
-                    ESP_LOGE(TAG, "recv error: %s", strerror(errno));
-                    if (total_received == 0) {
-                        return (int)received;
-                    }
-                    break;
-                }
+                // Real error
+                ESP_LOGE(TAG, "recv error: %s", strerror(errno));
+                if (total_received == 0) return -1;
             }
         }
     }
@@ -1339,19 +1468,33 @@ httpd_err_t httpd_resp_set_header(httpd_req_t* req, const char* key, const char*
 
     // If headers not yet started, send status first
     if (!req->headers_sent) {
-        char status_line[64];
-        int len = snprintf(status_line, sizeof(status_line),
-                          "HTTP/1.1 %d %s\r\n",
-                          req->status_code, httpd_status_text(req->status_code));
-        if (send_all(conn->fd, status_line, len, MSG_MORE) < 0) {
+        char fallback_buf[64];
+        int len;
+        const char* sl = get_status_line(req->status_code, fallback_buf, sizeof(fallback_buf), &len);
+        if (send_nonblocking(conn, sl, len, MSG_MORE) < 0) {
             return HTTPD_ERR_IO;
         }
         req->headers_sent = true;
     }
 
-    char header[512];
-    int len = snprintf(header, sizeof(header), "%s: %s\r\n", key, value);
-    if (send_all(conn->fd, header, len, MSG_MORE) < 0) {
+    char header[256];
+    size_t key_len = strlen(key);
+
+    // Track if user is manually setting Content-Length
+    // Short-circuit: check length + first char before expensive strcasecmp
+    if (key_len == 14 && (key[0] | 0x20) == 'c' && strcasecmp(key, "Content-Length") == 0) {
+        req->content_length_set = true;
+    }
+    size_t val_len = strlen(value);
+    size_t total = key_len + 2 + val_len + 2; // "key: value\r\n"
+    if (total > sizeof(header)) return HTTPD_ERR_INVALID_ARG;
+    memcpy(header, key, key_len);
+    header[key_len] = ':';
+    header[key_len + 1] = ' ';
+    memcpy(header + key_len + 2, value, val_len);
+    header[key_len + 2 + val_len] = '\r';
+    header[key_len + 2 + val_len + 1] = '\n';
+    if (send_nonblocking(conn, header, total, MSG_MORE) < 0) {
         return HTTPD_ERR_IO;
     }
 
@@ -1370,28 +1513,80 @@ httpd_err_t httpd_resp_send(httpd_req_t* req, const char* body, ssize_t len) {
 
     size_t body_len = (len >= 0) ? (size_t)len : (body ? strlen(body) : 0);
 
-    // Track if we're starting fresh (no headers sent yet)
-    bool was_headers_fresh = !req->headers_sent;
+    // Fast path: coalesce small responses into a single send
+    // Only when no headers have been sent yet and Content-Length wasn't manually set
+    if (!req->headers_sent && !req->content_length_set && body_len <= 256) {
+        char resp_buf[512];
+        size_t pos = 0;
+
+        // Status line
+        char fallback_buf[64];
+        int slen;
+        const char* sl = get_status_line(req->status_code, fallback_buf, sizeof(fallback_buf), &slen);
+        memcpy(resp_buf, sl, slen);
+        pos += slen;
+
+        // Content-Length header via memcpy (avoid snprintf)
+        static const char cl_prefix[] = "Content-Length: ";
+        memcpy(resp_buf + pos, cl_prefix, sizeof(cl_prefix) - 1);
+        pos += sizeof(cl_prefix) - 1;
+        // Convert body_len to digits
+        char digits[16];
+        int ndigits = 0;
+        {
+            size_t val = body_len;
+            do {
+                digits[ndigits++] = '0' + (val % 10);
+                val /= 10;
+            } while (val > 0);
+            // Reverse digits into resp_buf
+            for (int i = ndigits - 1; i >= 0; i--) {
+                resp_buf[pos++] = digits[i];
+            }
+        }
+        resp_buf[pos++] = '\r';
+        resp_buf[pos++] = '\n';
+
+        // End headers
+        resp_buf[pos++] = '\r';
+        resp_buf[pos++] = '\n';
+
+        // Body
+        if (body && body_len > 0) {
+            memcpy(resp_buf + pos, body, body_len);
+            pos += body_len;
+        }
+
+        if (send_nonblocking(conn, resp_buf, pos, 0) < 0) {
+            return HTTPD_ERR_IO;
+        }
+        req->headers_sent = true;
+        req->body_started = true;
+        return HTTPD_OK;
+    }
+
+    // Standard path: multiple sends for large bodies or when headers were already partially sent
 
     // Send status line if not sent
     if (!req->headers_sent) {
-        char status_line[64];
-        int slen = snprintf(status_line, sizeof(status_line),
-                           "HTTP/1.1 %d %s\r\n",
-                           req->status_code, httpd_status_text(req->status_code));
-        if (send_nonblocking(conn, status_line, slen, MSG_MORE) < 0) {
+        char fallback_buf[64];
+        int slen;
+        const char* sl = get_status_line(req->status_code, fallback_buf, sizeof(fallback_buf), &slen);
+        if (send_nonblocking(conn, sl, slen, MSG_MORE) < 0) {
             return HTTPD_ERR_IO;
         }
         req->headers_sent = true;
     }
 
-    // Only send Content-Length if this is a fresh response (headers just started)
-    // or if there's actually body content to send.
-    // If headers were already being sent (user called httpd_resp_set_header before),
-    // they may have already set Content-Length manually.
-    if (was_headers_fresh || body_len > 0) {
+    // Add Content-Length unless the user already set it manually via httpd_resp_set_header
+    if (!req->content_length_set) {
         char cl_header[64];
-        int cl_len = snprintf(cl_header, sizeof(cl_header), "Content-Length: %zu\r\n", body_len);
+        static const char cl_pfx[] = "Content-Length: ";
+        memcpy(cl_header, cl_pfx, sizeof(cl_pfx) - 1);
+        int cl_len = sizeof(cl_pfx) - 1;
+        cl_len += format_uint(cl_header + cl_len, body_len);
+        cl_header[cl_len++] = '\r';
+        cl_header[cl_len++] = '\n';
         if (send_nonblocking(conn, cl_header, cl_len, MSG_MORE) < 0) {
             return HTTPD_ERR_IO;
         }
@@ -1403,14 +1598,10 @@ httpd_err_t httpd_resp_send(httpd_req_t* req, const char* body, ssize_t len) {
     }
     req->body_started = true;
 
-    // Send body - use blocking send to ensure complete delivery before handler returns.
-    // Non-blocking send would queue data to be drained by on_write_ready, but the
-    // connection state may change after the handler returns (e.g., ready for next
-    // request in keep-alive), causing the queued data to never be sent.
-    // For httpd_resp_send (Content-Length responses), blocking is the correct approach
-    // since we've already committed to sending exactly body_len bytes.
+    // Send body via non-blocking send. Data is sent directly if the socket accepts it,
+    // otherwise queued to the send buffer for draining by on_write_ready in the event loop.
     if (body && body_len > 0) {
-        if (send_all(conn->fd, body, body_len, 0) < 0) {
+        if (send_nonblocking(conn, body, body_len, 0) < 0) {
             return HTTPD_ERR_IO;
         }
     }
@@ -1430,16 +1621,20 @@ httpd_err_t httpd_resp_send_chunk(httpd_req_t* req, const char* chunk, ssize_t l
     // Finalize headers if body hasn't started yet
     if (!req->body_started) {
         // Build complete header block: status line + Transfer-Encoding + blank line
-        char header_block[256];
+        static const char te_chunked[] = "Transfer-Encoding: chunked\r\n\r\n";
+        char header_block[128];
         int header_len;
         if (!req->headers_sent) {
-            header_len = snprintf(header_block, sizeof(header_block),
-                               "HTTP/1.1 %d %s\r\nTransfer-Encoding: chunked\r\n\r\n",
-                               req->status_code, httpd_status_text(req->status_code));
+            char fallback_buf[64];
+            int sl_len;
+            const char* sl = get_status_line(req->status_code, fallback_buf, sizeof(fallback_buf), &sl_len);
+            memcpy(header_block, sl, sl_len);
+            memcpy(header_block + sl_len, te_chunked, sizeof(te_chunked) - 1);
+            header_len = sl_len + (int)(sizeof(te_chunked) - 1);
             req->headers_sent = true;
         } else {
-            header_len = snprintf(header_block, sizeof(header_block),
-                               "Transfer-Encoding: chunked\r\n\r\n");
+            header_len = sizeof(te_chunked) - 1;
+            memcpy(header_block, te_chunked, header_len);
         }
 
         // Queue headers atomically (small enough to always fit)
@@ -1464,15 +1659,15 @@ httpd_err_t httpd_resp_send_chunk(httpd_req_t* req, const char* chunk, ssize_t l
 
         // Build chunk header: "XXXX\r\n" (max 10 bytes for 32-bit size)
         char size_header[16];
-        int header_len = snprintf(size_header, sizeof(size_header), "%zx\r\n", chunk_len);
+        int header_len = format_hex(size_header, chunk_len);
 
         // Calculate total frame size
         size_t frame_size = header_len + chunk_len + 2;  // +2 for trailing \r\n
 
-        // For small chunks (<=512 bytes total), build complete frame in stack buffer
+        // For small chunks (<=256 bytes total), build complete frame in stack buffer
         // This ensures atomic queuing for typical use cases
-        if (frame_size <= 512) {
-            uint8_t frame_buf[512];
+        if (frame_size <= 256) {
+            uint8_t frame_buf[256];
             memcpy(frame_buf, size_header, header_len);
             memcpy(frame_buf + header_len, chunk, chunk_len);
             memcpy(frame_buf + header_len + chunk_len, "\r\n", 2);
@@ -1548,11 +1743,63 @@ httpd_err_t httpd_resp_send_chunk(httpd_req_t* req, const char* chunk, ssize_t l
 httpd_err_t httpd_resp_send_error(httpd_req_t* req, int status, const char* message) {
     if (!req) return HTTPD_ERR_INVALID_ARG;
 
+    connection_t* conn = (connection_t*)req->_internal;
+    if (!conn) return HTTPD_ERR_CONN_CLOSED;
+
     req->status_code = status;
     const char* msg = message ? message : httpd_status_text(status);
+    size_t msg_len = strlen(msg);
 
-    httpd_resp_set_type(req, "text/plain");
-    return httpd_resp_send(req, msg, -1);
+    // Build entire error response in a single buffer to avoid multiple send calls.
+    // Format: status_line + Content-Type + Content-Length + blank line + body
+    char resp[384];
+    size_t pos = 0;
+
+    // Status line
+    char fallback_buf[64];
+    int slen;
+    const char* sl = get_status_line(status, fallback_buf, sizeof(fallback_buf), &slen);
+    memcpy(resp + pos, sl, slen);
+    pos += slen;
+
+    // Content-Type: text/plain\r\n
+    static const char ct_plain[] = "Content-Type: text/plain\r\n";
+    memcpy(resp + pos, ct_plain, sizeof(ct_plain) - 1);
+    pos += sizeof(ct_plain) - 1;
+
+    // Content-Length: <digits>\r\n
+    static const char cl_prefix[] = "Content-Length: ";
+    memcpy(resp + pos, cl_prefix, sizeof(cl_prefix) - 1);
+    pos += sizeof(cl_prefix) - 1;
+    char digits[16];
+    int ndigits = 0;
+    {
+        size_t val = msg_len;
+        do {
+            digits[ndigits++] = '0' + (val % 10);
+            val /= 10;
+        } while (val > 0);
+        for (int i = ndigits - 1; i >= 0; i--) {
+            resp[pos++] = digits[i];
+        }
+    }
+    resp[pos++] = '\r';
+    resp[pos++] = '\n';
+
+    // End headers
+    resp[pos++] = '\r';
+    resp[pos++] = '\n';
+
+    // Body
+    memcpy(resp + pos, msg, msg_len);
+    pos += msg_len;
+
+    if (send_nonblocking(conn, resp, pos, 0) < 0) {
+        return HTTPD_ERR_IO;
+    }
+    req->headers_sent = true;
+    req->body_started = true;
+    return HTTPD_OK;
 }
 
 httpd_err_t httpd_resp_sendfile(httpd_req_t* req, const char* path) {
@@ -1579,25 +1826,111 @@ httpd_err_t httpd_resp_sendfile(httpd_req_t* req, const char* path) {
     const char* mime_type = filesystem_get_mime_type(path);
     httpd_resp_set_type(req, mime_type);
 
-    // Send file using chunked transfer
-    char chunk[512];
+    // Set Content-Length from stat result (avoids chunked transfer encoding overhead)
+    char cl_str[24];
+    int cl_str_len = format_uint(cl_str, (size_t)st.st_size);
+    cl_str[cl_str_len] = '\0';
+    httpd_resp_set_header(req, "Content-Length", cl_str);
+
+    // Finalize headers and stream file body with Content-Length encoding
+    connection_t* conn = (connection_t*)req->_internal;
+    if (!conn) {
+        fclose(f);
+        return HTTPD_ERR_CONN_CLOSED;
+    }
+
+    // End headers (status line + Content-Type + Content-Length already sent by set_header calls)
+    if (send_nonblocking(conn, "\r\n", 2, st.st_size > 0 ? MSG_MORE : 0) < 0) {
+        fclose(f);
+        return HTTPD_ERR_IO;
+    }
+    req->body_started = true;
+
+    // Stream file data directly (no chunked framing)
+    char buf[512];
     size_t bytes_read;
-    while ((bytes_read = fread(chunk, 1, sizeof(chunk), f)) > 0) {
-        if (httpd_resp_send_chunk(req, chunk, bytes_read) != HTTPD_OK) {
+    while ((bytes_read = fread(buf, 1, sizeof(buf), f)) > 0) {
+        if (send_nonblocking(conn, buf, bytes_read, 0) < 0) {
             fclose(f);
             return HTTPD_ERR_IO;
         }
     }
 
     fclose(f);
-
-    // Send final empty chunk
-    return httpd_resp_send_chunk(req, NULL, 0);
+    return HTTPD_OK;
 }
 
 httpd_err_t httpd_resp_send_json(httpd_req_t* req, const char* json) {
+    if (!req) return HTTPD_ERR_INVALID_ARG;
+
+    connection_t* conn = (connection_t*)req->_internal;
+    if (!conn) return HTTPD_ERR_CONN_CLOSED;
+
+    size_t json_len = json ? strlen(json) : 0;
+
+    // Fast path: coalesce status + Content-Type + Content-Length + body into one send.
+    // httpd_resp_set_type() would call httpd_resp_set_header() which sends the status
+    // line and sets headers_sent=true, defeating the coalescing in httpd_resp_send().
+    // By building everything inline, we avoid that and send in a single syscall.
+    if (!req->headers_sent && !req->content_length_set && json_len <= 256) {
+        // 512 buf covers: status line (~24) + Content-Type (~38) +
+        // Content-Length (~24) + CRLF (2) + body (<=256) = ~344 max
+        char resp_buf[512];
+        size_t pos = 0;
+
+        // Status line
+        char fallback_buf[64];
+        int slen;
+        const char* sl = get_status_line(req->status_code, fallback_buf, sizeof(fallback_buf), &slen);
+        memcpy(resp_buf, sl, slen);
+        pos += slen;
+
+        // Content-Type header (fixed string, avoid snprintf)
+        static const char ct_header[] = "Content-Type: application/json\r\n";
+        memcpy(resp_buf + pos, ct_header, sizeof(ct_header) - 1);
+        pos += sizeof(ct_header) - 1;
+
+        // Content-Length header via memcpy (avoid snprintf)
+        static const char cl_prefix[] = "Content-Length: ";
+        memcpy(resp_buf + pos, cl_prefix, sizeof(cl_prefix) - 1);
+        pos += sizeof(cl_prefix) - 1;
+        char digits[16];
+        int ndigits = 0;
+        {
+            size_t val = json_len;
+            do {
+                digits[ndigits++] = '0' + (val % 10);
+                val /= 10;
+            } while (val > 0);
+            for (int i = ndigits - 1; i >= 0; i--) {
+                resp_buf[pos++] = digits[i];
+            }
+        }
+        resp_buf[pos++] = '\r';
+        resp_buf[pos++] = '\n';
+
+        // End headers
+        resp_buf[pos++] = '\r';
+        resp_buf[pos++] = '\n';
+
+        // Body
+        if (json && json_len > 0) {
+            memcpy(resp_buf + pos, json, json_len);
+            pos += json_len;
+        }
+
+        if (send_nonblocking(conn, resp_buf, pos, 0) < 0) {
+            return HTTPD_ERR_IO;
+        }
+        req->headers_sent = true;
+        req->body_started = true;
+        return HTTPD_OK;
+    }
+
+    // Fallback: use standard header + send path for large bodies or
+    // when headers were already partially sent
     httpd_resp_set_type(req, "application/json");
-    return httpd_resp_send(req, json, -1);
+    return httpd_resp_send(req, json, (ssize_t)json_len);
 }
 
 // ============================================================================
@@ -1618,16 +1951,24 @@ httpd_err_t httpd_resp_send_async(httpd_req_t* req, const char* body, ssize_t le
 
     // Build all headers in one buffer to minimize syscalls
     if (!req->headers_sent) {
-        char header_buf[256];
-        int header_len = snprintf(header_buf, sizeof(header_buf),
-            "HTTP/1.1 %d %s\r\n"
-            "Content-Length: %zu\r\n"
-            "\r\n",
-            req->status_code, httpd_status_text(req->status_code),
-            body_len);
-
-        if (header_len < 0 || (size_t)header_len >= sizeof(header_buf)) {
-            return HTTPD_ERR_NO_MEM;
+        char header_buf[128];
+        char fallback_buf[64];
+        int sl_len;
+        const char* sl = get_status_line(req->status_code, fallback_buf, sizeof(fallback_buf), &sl_len);
+        memcpy(header_buf, sl, sl_len);
+        int header_len;
+        if (req->content_length_set) {
+            memcpy(header_buf + sl_len, "\r\n", 2);
+            header_len = sl_len + 2;
+        } else {
+            static const char cl_pfx[] = "Content-Length: ";
+            char* p = header_buf + sl_len;
+            memcpy(p, cl_pfx, sizeof(cl_pfx) - 1);
+            p += sizeof(cl_pfx) - 1;
+            p += format_uint(p, body_len);
+            *p++ = '\r'; *p++ = '\n';
+            *p++ = '\r'; *p++ = '\n';
+            header_len = (int)(p - header_buf);
         }
 
         // Single syscall for all headers
@@ -1636,11 +1977,22 @@ httpd_err_t httpd_resp_send_async(httpd_req_t* req, const char* body, ssize_t le
         }
         req->headers_sent = true;
     } else {
-        // Headers already partially sent, just send Content-Length and terminator
-        char cl_buf[80];
-        int cl_len = snprintf(cl_buf, sizeof(cl_buf), "Content-Length: %zu\r\n\r\n", body_len);
-        if (send_nonblocking(conn, cl_buf, cl_len, body_len > 0 ? MSG_MORE : 0) < 0) {
-            return HTTPD_ERR_IO;
+        // Headers already partially sent, send Content-Length (if not already set) and terminator
+        if (req->content_length_set) {
+            if (send_nonblocking(conn, "\r\n", 2, body_len > 0 ? MSG_MORE : 0) < 0) {
+                return HTTPD_ERR_IO;
+            }
+        } else {
+            char cl_buf[80];
+            static const char cl_pfx[] = "Content-Length: ";
+            memcpy(cl_buf, cl_pfx, sizeof(cl_pfx) - 1);
+            int cl_len = sizeof(cl_pfx) - 1;
+            cl_len += format_uint(cl_buf + cl_len, body_len);
+            cl_buf[cl_len++] = '\r'; cl_buf[cl_len++] = '\n';
+            cl_buf[cl_len++] = '\r'; cl_buf[cl_len++] = '\n';
+            if (send_nonblocking(conn, cl_buf, cl_len, body_len > 0 ? MSG_MORE : 0) < 0) {
+                return HTTPD_ERR_IO;
+            }
         }
     }
 
@@ -1673,18 +2025,25 @@ httpd_err_t httpd_resp_sendfile_async(httpd_req_t* req, const char* path,
         return HTTPD_ERR_CONN_CLOSED;
     }
 
-    // Note: filesystem_serve_file uses blocking I/O internally.
-    // The file is sent synchronously before this function returns.
+    // filesystem_serve_file queues headers and starts file streaming via send_buffer.
+    // The actual file data is sent asynchronously by the event loop's on_write_ready handler.
     int result = filesystem_serve_file(g_server->filesystem, conn, path, false);
 
-    httpd_err_t err = (result < 0) ? HTTPD_ERR_NOT_FOUND : HTTPD_OK;
-
-    // Invoke callback immediately since send completed synchronously
-    if (on_done) {
-        on_done(req, err);
+    if (result < 0) {
+        if (on_done) on_done(req, HTTPD_ERR_NOT_FOUND);
+        return HTTPD_ERR_NOT_FOUND;
     }
 
-    return err;
+    // Set up async completion tracking - on_done fires when send buffer is drained
+    if (on_done) {
+        request_context_t* ctx = get_request_context(conn);
+        if (ctx) {
+            ctx->async_send.on_done = on_done;
+            ctx->async_send.active = true;
+        }
+    }
+
+    return HTTPD_OK;
 }
 
 // ============================================================================
@@ -1707,30 +2066,40 @@ httpd_err_t httpd_resp_send_provider(httpd_req_t* req, ssize_t content_length,
 
     // Send headers - if headers not started yet, send status line first
     if (!req->headers_sent) {
-        char status_line[64];
-        int slen = snprintf(status_line, sizeof(status_line),
-                           "HTTP/1.1 %d %s\r\n",
-                           req->status_code, httpd_status_text(req->status_code));
-        if (send_all(conn->fd, status_line, slen, MSG_MORE) < 0) {
+        char fallback_buf[64];
+        int slen;
+        const char* sl = get_status_line(req->status_code, fallback_buf, sizeof(fallback_buf), &slen);
+        if (send_nonblocking(conn, sl, slen, MSG_MORE) < 0) {
             return HTTPD_ERR_IO;
         }
         req->headers_sent = true;
     }
 
-    // Send Content-Length or Transfer-Encoding header
+    // Send Content-Length or Transfer-Encoding header (skip if user already set Content-Length)
     char header_buf[64];
     int header_len;
     if (use_chunked) {
-        header_len = snprintf(header_buf, sizeof(header_buf), "Transfer-Encoding: chunked\r\n");
+        static const char te_chunked[] = "Transfer-Encoding: chunked\r\n";
+        memcpy(header_buf, te_chunked, sizeof(te_chunked) - 1);
+        header_len = sizeof(te_chunked) - 1;
+    } else if (req->content_length_set) {
+        header_len = 0;
     } else {
-        header_len = snprintf(header_buf, sizeof(header_buf), "Content-Length: %zd\r\n", content_length);
+        static const char cl_pfx[] = "Content-Length: ";
+        memcpy(header_buf, cl_pfx, sizeof(cl_pfx) - 1);
+        header_len = sizeof(cl_pfx) - 1;
+        header_len += format_uint(header_buf + header_len, (size_t)content_length);
+        header_buf[header_len++] = '\r';
+        header_buf[header_len++] = '\n';
     }
-    if (send_all(conn->fd, header_buf, header_len, MSG_MORE) < 0) {
-        return HTTPD_ERR_IO;
+    if (header_len > 0) {
+        if (send_nonblocking(conn, header_buf, header_len, MSG_MORE) < 0) {
+            return HTTPD_ERR_IO;
+        }
     }
 
     // End headers
-    if (send_all(conn->fd, "\r\n", 2, 0) < 0) {
+    if (send_nonblocking(conn, "\r\n", 2, 0) < 0) {
         return HTTPD_ERR_IO;
     }
 
@@ -1814,7 +2183,7 @@ httpd_err_t httpd_resp_send_continue(httpd_req_t* req) {
 
     // Use compile-time constant length instead of runtime strlen()
     static const char response[] = "HTTP/1.1 100 Continue\r\n\r\n";
-    if (send_all(conn->fd, response, sizeof(response) - 1, 0) < 0) {
+    if (send_nonblocking(conn, response, sizeof(response) - 1, 0) < 0) {
         return HTTPD_ERR_IO;
     }
 
@@ -1825,22 +2194,15 @@ httpd_err_t httpd_resp_send_continue(httpd_req_t* req) {
 // Deferred (Async) Request Handling
 // ============================================================================
 
-// Internal context for httpd_req_defer_to_file
-typedef struct {
-    FILE* fp;
-    httpd_done_cb_t user_done_cb;
-} defer_file_ctx_t;
-
 // Internal body callback for defer_to_file
 static httpd_err_t defer_file_body_cb(httpd_req_t* req, const void* data, size_t len) {
     request_context_t* ctx = (request_context_t*)((char*)req - offsetof(request_context_t, req));
-    defer_file_ctx_t* file_ctx = (defer_file_ctx_t*)ctx->defer.file_ctx;
 
-    if (!file_ctx || !file_ctx->fp) {
+    if (!ctx->defer.file_fp) {
         return HTTPD_ERR_IO;
     }
 
-    size_t written = fwrite(data, 1, len, file_ctx->fp);
+    size_t written = fwrite(data, 1, len, ctx->defer.file_fp);
     if (written != len) {
         ESP_LOGE(TAG, "Failed to write to file: wrote %zu of %zu bytes", written, len);
         return HTTPD_ERR_IO;
@@ -1852,20 +2214,17 @@ static httpd_err_t defer_file_body_cb(httpd_req_t* req, const void* data, size_t
 // Internal done callback for defer_to_file
 static void defer_file_done_cb(httpd_req_t* req, httpd_err_t err) {
     request_context_t* ctx = (request_context_t*)((char*)req - offsetof(request_context_t, req));
-    defer_file_ctx_t* file_ctx = (defer_file_ctx_t*)ctx->defer.file_ctx;
 
-    if (file_ctx) {
-        if (file_ctx->fp) {
-            fclose(file_ctx->fp);
-        }
-        httpd_done_cb_t user_cb = file_ctx->user_done_cb;
-        free(file_ctx);
-        ctx->defer.file_ctx = NULL;
+    if (ctx->defer.file_fp) {
+        fclose(ctx->defer.file_fp);
+        ctx->defer.file_fp = NULL;
+    }
+    httpd_done_cb_t user_cb = ctx->defer.file_user_done_cb;
+    ctx->defer.file_user_done_cb = NULL;
 
-        // Call user's done callback
-        if (user_cb) {
-            user_cb(req, err);
-        }
+    // Call user's done callback
+    if (user_cb) {
+        user_cb(req, err);
     }
 }
 
@@ -1980,25 +2339,17 @@ httpd_err_t httpd_req_defer_to_file(httpd_req_t* req, const char* path, httpd_do
         return HTTPD_ERR_INVALID_ARG;
     }
 
-    // Allocate file context
-    defer_file_ctx_t* file_ctx = (defer_file_ctx_t*)calloc(1, sizeof(defer_file_ctx_t));
-    if (!file_ctx) {
-        return HTTPD_ERR_NO_MEM;
-    }
+    // Store file context inline in defer struct (no heap allocation needed)
+    request_context_t* ctx = (request_context_t*)((char*)req - offsetof(request_context_t, req));
 
     // Open file for writing
-    file_ctx->fp = fopen(path, "wb");
-    if (!file_ctx->fp) {
+    ctx->defer.file_fp = fopen(path, "wb");
+    if (!ctx->defer.file_fp) {
         ESP_LOGE(TAG, "Failed to open file for writing: %s", path);
-        free(file_ctx);
         return HTTPD_ERR_IO;
     }
 
-    file_ctx->user_done_cb = on_done;
-
-    // Store context and set up defer
-    request_context_t* ctx = (request_context_t*)((char*)req - offsetof(request_context_t, req));
-    ctx->defer.file_ctx = file_ctx;
+    ctx->defer.file_user_done_cb = on_done;
 
     ESP_LOGI(TAG, "Deferring body to file: %s (content_length=%zu)", path, req->content_length);
 
@@ -2102,6 +2453,20 @@ bool httpd_req_is_continuation(httpd_req_t* req) {
 
 #include "mbedtls/base64.h"
 
+/**
+ * Constant-time string comparison to prevent timing attacks.
+ * Always compares the full length regardless of where differences occur.
+ */
+static bool constant_time_compare_n(const char* a, size_t len_a, const char* b, size_t len_b) {
+    // Use len_b to avoid leaking length of 'a' (the secret)
+    volatile uint8_t result = len_a ^ len_b;
+    size_t len = len_a < len_b ? len_a : len_b;
+    for (size_t i = 0; i < len; i++) {
+        result |= (uint8_t)(a[i] ^ b[i]);
+    }
+    return result == 0;
+}
+
 bool httpd_check_basic_auth(httpd_req_t* req, const char* username, const char* password) {
     if (!req || !username || !password) return false;
 
@@ -2109,12 +2474,12 @@ bool httpd_check_basic_auth(httpd_req_t* req, const char* username, const char* 
     if (!auth_header) return false;
 
     // Check for "Basic " prefix
-    if (strncmp(auth_header, "Basic ", 6) != 0) return false;
+    if (memcmp(auth_header, "Basic ", 6) != 0) return false;
 
     const char* encoded = auth_header + 6;
 
     // Decode base64 credentials
-    unsigned char decoded[256];
+    unsigned char decoded[128];
     size_t decoded_len = 0;
     int ret = mbedtls_base64_decode(decoded, sizeof(decoded) - 1, &decoded_len,
                                      (const unsigned char*)encoded, strlen(encoded));
@@ -2126,16 +2491,18 @@ bool httpd_check_basic_auth(httpd_req_t* req, const char* username, const char* 
     char* colon = strchr((char*)decoded, ':');
     if (!colon) return false;
 
-    // Split at colon
+    // Split at colon - lengths known from decode
     *colon = '\0';
     const char* recv_user = (char*)decoded;
+    size_t recv_user_len = (size_t)(colon - (char*)decoded);
     const char* recv_pass = colon + 1;
+    size_t recv_pass_len = decoded_len - recv_user_len - 1;
 
-    // Compare credentials (constant-time comparison would be more secure)
-    if (strcmp(recv_user, username) != 0) return false;
-    if (strcmp(recv_pass, password) != 0) return false;
+    // Compare credentials using constant-time comparison to prevent timing attacks
+    bool user_ok = constant_time_compare_n(username, strlen(username), recv_user, recv_user_len);
+    bool pass_ok = constant_time_compare_n(password, strlen(password), recv_pass, recv_pass_len);
 
-    return true;
+    return user_ok && pass_ok;
 }
 
 httpd_err_t httpd_resp_send_auth_challenge(httpd_req_t* req, const char* realm) {
@@ -2147,11 +2514,16 @@ httpd_err_t httpd_resp_send_auth_challenge(httpd_req_t* req, const char* realm) 
 
     // Build WWW-Authenticate header value
     char auth_value[128];
-    snprintf(auth_value, sizeof(auth_value), "Basic realm=\"%s\"", actual_realm);
+    static const char auth_prefix[] = "Basic realm=\"";
+    memcpy(auth_value, auth_prefix, sizeof(auth_prefix) - 1);
+    size_t realm_len = strlen(actual_realm);
+    memcpy(auth_value + sizeof(auth_prefix) - 1, actual_realm, realm_len);
+    auth_value[sizeof(auth_prefix) - 1 + realm_len] = '"';
+    auth_value[sizeof(auth_prefix) + realm_len] = '\0';
 
     httpd_resp_set_header(req, "WWW-Authenticate", auth_value);
     httpd_resp_set_type(req, "text/plain");
-    return httpd_resp_send(req, "401 Unauthorized", -1);
+    return httpd_resp_send(req, "401 Unauthorized", sizeof("401 Unauthorized") - 1);
 }
 
 // ============================================================================
@@ -2165,7 +2537,7 @@ httpd_err_t httpd_ws_accept(httpd_req_t* req, httpd_ws_t** ws_out) {
     if (!conn || !g_server) return HTTPD_ERR_CONN_CLOSED;
 
     // Send WebSocket handshake response
-    if (ws_send_handshake_response(conn->fd, req->ws_key) < 0) {
+    if (ws_send_handshake_response(conn, req->ws_key) < 0) {
         return HTTPD_ERR_IO;
     }
 
@@ -2204,7 +2576,10 @@ httpd_err_t httpd_ws_send(httpd_ws_t* ws, const void* data, size_t len, ws_type_
         default: return HTTPD_ERR_INVALID_ARG;
     }
 
-    if (ws_send_frame(ws->fd, opcode, (const uint8_t*)data, len, false) < 0) {
+    connection_t* conn = (connection_t*)ws->_internal;
+    if (!conn) return HTTPD_ERR_CONN_CLOSED;
+
+    if (ws_send_frame(conn, opcode, (const uint8_t*)data, len, false) < 0) {
         return HTTPD_ERR_IO;
     }
 
@@ -2224,6 +2599,19 @@ int httpd_ws_broadcast(httpd_handle_t handle, const char* pattern,
     ws_opcode_internal_t opcode = (type == WS_TYPE_BINARY) ? WS_OPCODE_BINARY : WS_OPCODE_TEXT;
     int sent = 0;
 
+    // Resolve pattern to route_index once, then compare indices in the loop
+    bool match_all = (strcmp(pattern, "*") == 0);
+    uint8_t target_index = UINT8_MAX;
+    if (!match_all) {
+        for (int r = 0; r < server->ws_route_count; r++) {
+            if (strcmp(server->ws_routes[r].pattern, pattern) == 0) {
+                target_index = (uint8_t)r;
+                break;
+            }
+        }
+        if (target_index == UINT8_MAX) return 0;  // No matching route
+    }
+
     // O(k) iteration where k = number of active WebSocket connections
     uint32_t mask = server->connection_pool.ws_active_mask;
     while (mask) {
@@ -2231,8 +2619,11 @@ int httpd_ws_broadcast(httpd_handle_t handle, const char* pattern,
         mask &= mask - 1;  // Clear lowest set bit
 
         connection_t* conn = &server->connection_pool.connections[i];
-        // TODO: Check if connection matches pattern
-        if (ws_send_frame(conn->fd, opcode, (const uint8_t*)data, len, false) >= 0) {
+        ws_context_t* ws_ctx = ws_contexts[i];
+        // Filter by route index: skip connections with no route or mismatched index
+        if (!ws_ctx || !ws_ctx->route) continue;
+        if (!match_all && ws_ctx->route_index != target_index) continue;
+        if (ws_send_frame(conn, opcode, (const uint8_t*)data, len, false) >= 0) {
             sent++;
         }
     }
@@ -2257,8 +2648,20 @@ httpd_err_t httpd_ws_close(httpd_ws_t* ws, uint16_t code, const char* reason) {
         close_len += reason_len;
     }
 
-    ws_send_frame(ws->fd, WS_OPCODE_CLOSE, close_data, close_len, false);
-    ws->connected = false;
+    connection_t* conn = (connection_t*)ws->_internal;
+    ws_send_frame(conn, WS_OPCODE_CLOSE, close_data, close_len, false);
+
+    // Per RFC 6455 section 5.5.1: after sending a Close frame, wait for the
+    // client's Close frame before closing the TCP connection.
+    if (conn && g_server) {
+        conn->state = CONN_STATE_WS_CLOSING;
+        conn->last_activity = g_server->event_loop.tick_count;
+        // Remove from ws_active_mask so timeout checking applies
+        connection_mark_ws_inactive(&g_server->connection_pool, conn->pool_index);
+    } else {
+        // Fallback: no connection context, close immediately
+        ws->connected = false;
+    }
 
     return HTTPD_OK;
 }
@@ -2336,6 +2739,7 @@ static int find_or_create_channel(const char* channel) {
             strncpy(entry->name, channel, sizeof(entry->name) - 1);
             entry->name[sizeof(entry->name) - 1] = '\0';
             entry->index = g_server->channel_count++;
+            entry->subscriber_count = 0;
 
             // Update index -> entry mapping
             g_server->channel_by_index[entry->index] = entry;
@@ -2358,7 +2762,13 @@ httpd_err_t httpd_ws_join(httpd_ws_t* ws, const char* channel) {
     int idx = find_or_create_channel(channel);
     if (idx < 0) return HTTPD_ERR_NO_MEM;
 
-    ctx->channel_mask |= (1u << idx);
+    uint32_t bit = 1u << idx;
+    if (!(ctx->channel_mask & bit)) {
+        ctx->channel_mask |= bit;
+        // Increment subscriber count on the channel entry
+        channel_hash_entry_t* entry = g_server->channel_by_index[idx];
+        if (entry) entry->subscriber_count++;
+    }
     return HTTPD_OK;
 }
 
@@ -2371,11 +2781,15 @@ httpd_err_t httpd_ws_leave(httpd_ws_t* ws, const char* channel) {
     int idx = find_channel(channel);
     if (idx < 0) return HTTPD_ERR_NOT_FOUND;
 
-    if (!(ctx->channel_mask & (1u << idx))) {
+    uint32_t bit = 1u << idx;
+    if (!(ctx->channel_mask & bit)) {
         return HTTPD_ERR_NOT_FOUND;
     }
 
-    ctx->channel_mask &= ~(1u << idx);
+    ctx->channel_mask &= ~bit;
+    // Decrement subscriber count on the channel entry
+    channel_hash_entry_t* entry = g_server->channel_by_index[idx];
+    if (entry && entry->subscriber_count > 0) entry->subscriber_count--;
     return HTTPD_OK;
 }
 
@@ -2383,9 +2797,20 @@ void httpd_ws_leave_all(httpd_ws_t* ws) {
     if (!ws) return;
 
     ws_context_t* ctx = get_ws_context_from_ws(ws);
-    if (ctx) {
-        ctx->channel_mask = 0;
+    if (!ctx) return;
+
+    // Decrement subscriber count for each channel the connection was in
+    uint32_t mask = ctx->channel_mask;
+    while (mask && g_server) {
+        int idx = __builtin_ctz(mask);  // Get lowest set bit
+        mask &= mask - 1;              // Clear lowest set bit
+
+        channel_hash_entry_t* entry = g_server->channel_by_index[idx];
+        if (entry && entry->subscriber_count > 0) {
+            entry->subscriber_count--;
+        }
     }
+    ctx->channel_mask = 0;
 }
 
 bool httpd_ws_in_channel(httpd_ws_t* ws, const char* channel) {
@@ -2428,7 +2853,7 @@ int httpd_ws_publish(httpd_handle_t handle, const char* channel,
         ws_context_t* ctx = ws_contexts[i];
         if (ctx && (ctx->channel_mask & channel_mask)) {
             connection_t* conn = &server->connection_pool.connections[i];
-            if (ws_send_frame(conn->fd, opcode, (const uint8_t*)data, len, false) >= 0) {
+            if (ws_send_frame(conn, opcode, (const uint8_t*)data, len, false) >= 0) {
                 sent++;
             }
         }
@@ -2444,22 +2869,9 @@ unsigned int httpd_ws_channel_size(httpd_handle_t handle, const char* channel) {
     int idx = find_channel(channel);
     if (idx < 0) return 0;
 
-    uint32_t channel_mask = 1u << idx;
-    unsigned int count = 0;
-
-    // O(k) iteration where k = number of active WebSocket connections
-    uint32_t ws_mask = server->connection_pool.ws_active_mask;
-    while (ws_mask) {
-        int i = __builtin_ctz(ws_mask);  // Get index of lowest set bit
-        ws_mask &= ws_mask - 1;  // Clear lowest set bit
-
-        ws_context_t* ctx = ws_contexts[i];
-        if (ctx && (ctx->channel_mask & channel_mask)) {
-            count++;
-        }
-    }
-
-    return count;
+    // O(1) lookup via maintained subscriber count
+    channel_hash_entry_t* entry = server->channel_by_index[idx];
+    return entry ? entry->subscriber_count : 0;
 }
 
 unsigned int httpd_ws_get_channels(httpd_ws_t* ws, const char** channels, unsigned int max_channels) {
@@ -2572,31 +2984,134 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
     request_context_t* ctx = get_request_context(conn);
     if (!ctx) return;
 
-    init_request_context(ctx, conn);
+    // Only initialize on the first call for this request (not on continuation)
+    if (!ctx->parsing_in_progress) {
+        init_request_context(ctx, conn);
+        ctx->parsing_in_progress = true;
+    }
 
-    // Set global parsing connection so headers can be stored
-    g_parsing_connection = conn;
+    // Accumulate incoming data into the per-connection recv buffer.
+    // First recv: allocate to exact size (typically 200-500 bytes for most
+    // HTTP requests that complete in a single packet, saving ~3.5KB vs 4096).
+    // Only grow to max size (4096) on PARSE_NEED_MORE (multi-packet headers).
+    size_t new_total = ctx->recv_buf_len + len;
+    if (new_total > 4096) {
+        // Header data too large
+        ESP_LOGE(TAG, "Request headers too large (%zu bytes)", new_total);
+        ctx->parsing_in_progress = false;
+        httpd_resp_send_error(&ctx->req, 431, "Request Header Fields Too Large");
+        return;
+    }
+    if (!ctx->recv_buf) {
+        // First recv: use inline buffer if data fits (avoids malloc for the
+        // common single-packet case where headers fit in one recv call).
+        if (len <= sizeof(ctx->inline_recv_buf)) {
+            ctx->recv_buf = ctx->inline_recv_buf;
+            ctx->recv_buf_capacity = sizeof(ctx->inline_recv_buf);
+            ctx->recv_buf_is_heap = false;
+        } else {
+            ctx->recv_buf = (uint8_t*)malloc(len);
+            if (!ctx->recv_buf) {
+                ESP_LOGE(TAG, "Failed to allocate recv buffer");
+                ctx->parsing_in_progress = false;
+                httpd_resp_send_error(&ctx->req, 500, "Internal Server Error");
+                return;
+            }
+            ctx->recv_buf_capacity = len;
+            ctx->recv_buf_is_heap = true;
+        }
+    } else if (new_total > ctx->recv_buf_capacity) {
+        // Subsequent recv: grow to max size so further appends never realloc.
+        // Parser pointers from prior calls reference the old buffer, so we
+        // must adjust them after the buffer moves.
+        uint8_t* old_buf = ctx->recv_buf;
+        uint8_t* new_buf;
+        if (!ctx->recv_buf_is_heap) {
+            // Currently using inline buffer - must malloc and copy
+            new_buf = (uint8_t*)malloc(4096);
+            if (!new_buf) {
+                ESP_LOGE(TAG, "Failed to grow recv buffer");
+                ctx->parsing_in_progress = false;
+                httpd_resp_send_error(&ctx->req, 500, "Internal Server Error");
+                return;
+            }
+            memcpy(new_buf, old_buf, ctx->recv_buf_len);
+            ctx->recv_buf_is_heap = true;
+        } else {
+            new_buf = (uint8_t*)realloc(ctx->recv_buf, 4096);
+            if (!new_buf) {
+                ESP_LOGE(TAG, "Failed to grow recv buffer");
+                ctx->parsing_in_progress = false;
+                httpd_resp_send_error(&ctx->req, 500, "Internal Server Error");
+                return;
+            }
+        }
+        ctx->recv_buf = new_buf;
+        ctx->recv_buf_capacity = 4096;
+        // Fixup parser pointers that reference the old buffer
+        if (new_buf != old_buf) {
+            ptrdiff_t delta = new_buf - old_buf;
+            if (ctx->parser_ctx.url)
+                ctx->parser_ctx.url = (const uint8_t*)((const char*)ctx->parser_ctx.url + delta);
+            if (ctx->parser_ctx.method)
+                ctx->parser_ctx.method = (const uint8_t*)((const char*)ctx->parser_ctx.method + delta);
+            if (ctx->parser_ctx.current_header_key)
+                ctx->parser_ctx.current_header_key = (const uint8_t*)((const char*)ctx->parser_ctx.current_header_key + delta);
+            if (ctx->parser_ctx.current_header_value)
+                ctx->parser_ctx.current_header_value = (const uint8_t*)((const char*)ctx->parser_ctx.current_header_value + delta);
+        }
+    }
+    size_t parse_offset = ctx->recv_buf_len;  // Bytes already parsed
+    memcpy(ctx->recv_buf + ctx->recv_buf_len, buffer, len);
+    ctx->recv_buf_len = new_total;
 
-    // Parse request using http_parser
-    http_parser_context_t parser_ctx = {0};
-    parse_result_t result = http_parse_request(conn, buffer, len, &parser_ctx);
-
-    // Clear global parsing connection
-    g_parsing_connection = NULL;
+    // Parse incrementally: only pass the newly-received bytes to the parser.
+    // The parser's state machine resumes from its current state and processes
+    // only the new data. Parser pointers from earlier calls point into
+    // recv_buf (which is stable/non-reallocating after first growth), and new
+    // pointers set during this call point into recv_buf + parse_offset, also
+    // valid. Headers are stored exactly once as they are parsed (no re-processing).
+    parse_result_t result = http_parse_request(conn,
+                                               ctx->recv_buf + parse_offset, len,
+                                               &ctx->parser_ctx);
 
     if (result == PARSE_ERROR) {
+        ctx->parsing_in_progress = false;
         httpd_resp_send_error(&ctx->req, 400, "Bad Request");
         return;
     }
 
-    // Copy URL to request context (dynamically allocated)
-    if (parser_ctx.url && parser_ctx.url_len > 0 && parser_ctx.url_len < 2048) {
-        ctx->uri_buf = (char*)malloc(parser_ctx.url_len + 1);
+    if (result == PARSE_NEED_MORE) {
+        // Headers incomplete - wait for more data. The connection stays in
+        // CONN_STATE_NEW or CONN_STATE_HTTP_HEADERS so the event loop will
+        // call on_http_request again when more data arrives.
+        return;
+    }
+
+    // Parsing complete (PARSE_OK or PARSE_COMPLETE). Parser pointers now
+    // reference ctx->recv_buf which persists for the request lifetime.
+    ctx->parsing_in_progress = false;
+
+    // Adjust header_bytes: the parser set it relative to the buffer slice
+    // we passed (recv_buf + parse_offset), so add the offset to get the
+    // absolute position within the full recv_buf.
+    conn->header_bytes += parse_offset;
+
+    // Copy URL to request context (inline buffer or heap-allocated)
+    if (ctx->parser_ctx.url && ctx->parser_ctx.url_len > 0) {
+        size_t url_buf_needed = ctx->parser_ctx.url_len + 1;
+        if (url_buf_needed <= sizeof(ctx->inline_uri_buf)) {
+            ctx->uri_buf = ctx->inline_uri_buf;
+            ctx->uri_buf_is_heap = false;
+        } else {
+            ctx->uri_buf = (char*)malloc(url_buf_needed);
+            ctx->uri_buf_is_heap = true;
+        }
         if (ctx->uri_buf) {
-            memcpy(ctx->uri_buf, parser_ctx.url, parser_ctx.url_len);
-            ctx->uri_buf[parser_ctx.url_len] = '\0';
+            memcpy(ctx->uri_buf, ctx->parser_ctx.url, ctx->parser_ctx.url_len);
+            ctx->uri_buf[ctx->parser_ctx.url_len] = '\0';
             ctx->req.uri = ctx->uri_buf;
-            ctx->req.uri_len = parser_ctx.url_len;
+            ctx->req.uri_len = ctx->parser_ctx.url_len;
 
             // Split path and query
             char* query = strchr(ctx->uri_buf, '?');
@@ -2623,8 +3138,8 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
     // Check for WebSocket upgrade
     ctx->req.is_websocket = conn->upgrade_ws;
     if (conn->upgrade_ws) {
-        // Copy WebSocket key from global buffer (set by parser)
-        snprintf(ctx->req.ws_key, sizeof(ctx->req.ws_key), "%s", ws_client_key);
+        // Point to WebSocket key in parser context (persists for request lifetime)
+        ctx->req.ws_key = ctx->parser_ctx.ws_client_key;
     }
 
     // Store content length
@@ -2632,12 +3147,12 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
 
     // Save any body data that was received along with headers
     // conn->header_bytes contains the number of header bytes (including final CRLF)
-    if (conn->content_length > 0 && len > conn->header_bytes) {
-        size_t body_in_buffer = len - conn->header_bytes;
+    if (conn->content_length > 0 && ctx->recv_buf_len > conn->header_bytes) {
+        size_t body_in_buffer = ctx->recv_buf_len - conn->header_bytes;
         // Dynamically allocate body buffer for pre-received data
         ctx->body_buf = (uint8_t*)malloc(body_in_buffer);
         if (ctx->body_buf) {
-            memcpy(ctx->body_buf, buffer + conn->header_bytes, body_in_buffer);
+            memcpy(ctx->body_buf, ctx->recv_buf + conn->header_bytes, body_in_buffer);
             ctx->body_buf_len = body_in_buffer;
             ctx->body_buf_pos = 0;
         } else {
@@ -2648,6 +3163,15 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
         }
     }
 
+    // Free the recv accumulation buffer now that parsing is complete
+    if (ctx->recv_buf) {
+        if (ctx->recv_buf_is_heap) free(ctx->recv_buf);
+        ctx->recv_buf = NULL;
+        ctx->recv_buf_len = 0;
+        ctx->recv_buf_capacity = 0;
+        ctx->recv_buf_is_heap = false;
+    }
+
     // Save original URL
     ctx->req.original_url = ctx->req.path;
     ctx->req.original_url_len = ctx->req.path_len;
@@ -2656,14 +3180,10 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
 
     // Handle CORS preflight requests before route matching
     // This allows OPTIONS requests to succeed even without explicit OPTIONS routes
+    // Send complete response in single write (avoids 5x snprintf + 5x send overhead)
     if (g_server->config.enable_cors && ctx->req.method == HTTP_OPTIONS) {
         const char* cors_origin = g_server->config.cors_origin ? g_server->config.cors_origin : "*";
-        httpd_resp_set_status(&ctx->req, 204);
-        httpd_resp_set_header(&ctx->req, "Access-Control-Allow-Origin", cors_origin);
-        httpd_resp_set_header(&ctx->req, "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
-        httpd_resp_set_header(&ctx->req, "Access-Control-Allow-Headers", "Content-Type, Authorization");
-        httpd_resp_set_header(&ctx->req, "Access-Control-Max-Age", "86400");
-        httpd_resp_send(&ctx->req, NULL, 0);
+        send_cors_preflight(&ctx->req, conn, cors_origin);
         return;
     }
 
@@ -2674,6 +3194,7 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
                 // WebSocket route found - set up context
                 ws_context_t* ws_ctx = get_ws_context(conn);
                 ws_ctx->route = &g_server->ws_routes[i];
+                ws_ctx->route_index = (uint8_t)i;
                 ws_ctx->ws.fd = conn->fd;
                 ws_ctx->ws._internal = conn;
 
@@ -2682,7 +3203,7 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
 
                 // Send WebSocket handshake response FIRST (HTTP 101 Switching Protocols)
                 // This MUST happen before the handler can send any WebSocket frames
-                if (ws_send_handshake_response(conn->fd, ctx->req.ws_key) < 0) {
+                if (ws_send_handshake_response(conn, ctx->req.ws_key) < 0) {
                     // Handshake failed - close connection
                     return;
                 }
@@ -2706,7 +3227,9 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
 
     // Try mounted routers first
     bool route_found = false;
-    radix_match_t match = {0};
+    radix_match_t match;
+    httpd_middleware_t route_mw[CONFIG_HTTPD_MAX_ROUTE_MIDDLEWARE];
+    uint8_t route_mw_count = 0;
     httpd_router_t matched_router = NULL;  // httpd_router_t is already a pointer
 
     // Fast path: single router case (common configuration)
@@ -2716,17 +3239,14 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
             memcmp(ctx->req.path, mr->prefix, mr->prefix_len) == 0) {
             const char* stripped_path = ctx->req.path + mr->prefix_len;
             if (stripped_path[0] == '\0') stripped_path = "/";
-            match = radix_lookup(mr->router->tree, stripped_path,
-                               ctx->req.method, ctx->req.is_websocket);
+            radix_lookup(mr->router->tree, stripped_path,
+                        ctx->req.method, ctx->req.is_websocket, &match,
+                        route_mw, &route_mw_count);
             if (match.matched) {
                 ctx->req.base_url = mr->prefix;
                 ctx->req.base_url_len = mr->prefix_len;
                 matched_router = mr->router;
                 route_found = true;
-            } else if (match.middlewares) {
-                free(match.middlewares);
-                match.middlewares = NULL;
-                match.middleware_count = 0;
             }
         }
     } else {
@@ -2744,8 +3264,9 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
                     stripped_path = "/";  // Handle exact prefix match
                 }
 
-                match = radix_lookup(mr->router->tree, stripped_path,
-                                   ctx->req.method, ctx->req.is_websocket);
+                radix_lookup(mr->router->tree, stripped_path,
+                            ctx->req.method, ctx->req.is_websocket, &match,
+                            route_mw, &route_mw_count);
 
                 if (match.matched) {
                     // Set base URL
@@ -2755,65 +3276,49 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
                     route_found = true;
                     break;
                 }
-
-                // Clean up middleware from failed match
-                if (match.middlewares) {
-                    free(match.middlewares);
-                    match.middlewares = NULL;
-                    match.middleware_count = 0;
-                }
             }
         }
     }
 
     // Fall back to legacy route table if no router matched (O(log n) radix tree lookup)
+    // Reuse the same match variable to avoid a second radix_match_t on the stack
     if (!route_found && g_server->legacy_routes) {
-        radix_match_t legacy_match = radix_lookup(g_server->legacy_routes, ctx->req.path,
-                                                   ctx->req.method, false);
+        radix_lookup(g_server->legacy_routes, ctx->req.path,
+                    ctx->req.method, false, &match, NULL, NULL);
 
-        if (legacy_match.matched && legacy_match.handler) {
+        if (match.matched && match.handler) {
             route_found = true;
 
             // Copy parameters from radix match using memcpy (faster than field-by-field)
-            uint8_t param_count = legacy_match.param_count < 8 ? legacy_match.param_count : 8;
+            uint8_t param_count = match.param_count < 8 ? match.param_count : 8;
             if (param_count > 0) {
-                memcpy(ctx->req.params, legacy_match.params, param_count * sizeof(httpd_param_t));
+                memcpy(ctx->req.params, match.params, param_count * sizeof(httpd_param_t));
             }
-            ctx->req.param_count = legacy_match.param_count;
+            ctx->req.param_count = match.param_count;
 
             // Build middleware chain: server global only (no router middleware for legacy routes)
-            httpd_middleware_t mw_chain[MAX_MIDDLEWARES];
             uint8_t mw_count = g_server->middleware_count;
 
             // Use memcpy instead of loop for middleware chain copying
             if (mw_count > 0) {
-                memcpy(mw_chain, g_server->middlewares, mw_count * sizeof(httpd_middleware_t));
+                memcpy(ctx->mw_chain, g_server->middlewares, mw_count * sizeof(httpd_middleware_t));
             }
 
             // Set up middleware context
-            ctx->req._mw.chain = mw_chain;
+            ctx->req._mw.chain = ctx->mw_chain;
             ctx->req._mw.chain_len = mw_count;
             ctx->req._mw.current = 0;
-            ctx->req._mw.final_handler = legacy_match.handler;
-            ctx->req._mw.final_user_ctx = legacy_match.user_ctx;
+            ctx->req._mw.final_handler = match.handler;
+            ctx->req._mw.final_user_ctx = match.user_ctx;
             ctx->req._mw.router = NULL;
 
             // Execute middleware chain
-            httpd_err_t err = (mw_count > 0) ? _middleware_next(&ctx->req) : legacy_match.handler(&ctx->req);
+            httpd_err_t err = (mw_count > 0) ? _middleware_next(&ctx->req) : match.handler(&ctx->req);
             if (err != HTTPD_OK) {
                 handle_error(err, &ctx->req);
             }
 
-            // Clean up allocated middleware from radix match
-            if (legacy_match.middlewares) {
-                free(legacy_match.middlewares);
-            }
             return;
-        }
-
-        // Clean up if no match
-        if (legacy_match.middlewares) {
-            free(legacy_match.middlewares);
         }
     }
 
@@ -2827,14 +3332,13 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
         ctx->req.param_count = match.param_count;
 
         // Build middleware chain: server global + router + route using memcpy
-        httpd_middleware_t mw_chain[CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE];
         uint8_t mw_count = 0;
 
         // Add server global middleware
         uint8_t server_mw = g_server->middleware_count < CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE
                            ? g_server->middleware_count : CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE;
         if (server_mw > 0) {
-            memcpy(mw_chain, g_server->middlewares, server_mw * sizeof(httpd_middleware_t));
+            memcpy(ctx->mw_chain, g_server->middlewares, server_mw * sizeof(httpd_middleware_t));
             mw_count = server_mw;
         }
 
@@ -2844,23 +3348,21 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
             uint8_t router_mw = matched_router->middleware_count < avail
                                ? matched_router->middleware_count : avail;
             if (router_mw > 0) {
-                memcpy(mw_chain + mw_count, matched_router->middlewares, router_mw * sizeof(httpd_middleware_t));
+                memcpy(ctx->mw_chain + mw_count, matched_router->middlewares, router_mw * sizeof(httpd_middleware_t));
                 mw_count += router_mw;
             }
         }
 
-        // Add route middleware
-        if (mw_count < CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE) {
+        // Add route middleware (collected directly by radix_lookup into route_mw)
+        if (route_mw_count > 0 && mw_count < CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE) {
             uint8_t avail = CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE - mw_count;
-            uint8_t route_mw = match.middleware_count < avail ? match.middleware_count : avail;
-            if (route_mw > 0) {
-                memcpy(mw_chain + mw_count, match.middlewares, route_mw * sizeof(httpd_middleware_t));
-                mw_count += route_mw;
-            }
+            uint8_t to_copy = route_mw_count < avail ? route_mw_count : avail;
+            memcpy(ctx->mw_chain + mw_count, route_mw, to_copy * sizeof(httpd_middleware_t));
+            mw_count += to_copy;
         }
 
         // Set up middleware context
-        ctx->req._mw.chain = mw_chain;
+        ctx->req._mw.chain = ctx->mw_chain;
         ctx->req._mw.chain_len = mw_count;
         ctx->req._mw.current = 0;
         ctx->req._mw.router = matched_router;
@@ -2880,10 +3382,6 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
             }
         }
 
-        // Clean up allocated middleware
-        if (match.middlewares) {
-            free(match.middlewares);
-        }
         return;
     }
 
@@ -2895,7 +3393,7 @@ static void on_http_body(connection_t* conn, uint8_t* buffer, size_t len) {
     // Quick check using connection bitfields - avoids context lookup for sync handlers
     // This is the hot path optimization: bitfields are O(1) vs get_request_context
     if (!conn->deferred && !conn->continuation) {
-        // Non-deferred/non-continuation: body is received via blocking httpd_req_recv()
+        // Non-deferred/non-continuation: body is received via non-blocking httpd_req_recv()
         return;
     }
 
@@ -3034,7 +3532,25 @@ static void on_ws_frame(connection_t* conn, uint8_t* buffer, size_t len) {
             ws_ctx->frame_ctx.state = WS_STATE_OPCODE;
             ws_ctx->frame_ctx.payload_received = 0;
         } else if (result == WS_FRAME_CLOSE) {
-            // Close frame received - disconnect will be handled by event loop
+            if (conn->state == CONN_STATE_WS_CLOSING) {
+                // Server-initiated close: client acknowledged our close frame.
+                // Complete the disconnect now (RFC 6455 close handshake done).
+                if (ws_ctx->route && ws_ctx->route->handler) {
+                    httpd_ws_event_t disconnect_event = {
+                        .type = WS_EVENT_DISCONNECT,
+                        .data = NULL,
+                        .len = 0
+                    };
+                    ws_ctx->route->handler(&ws_ctx->ws, &disconnect_event);
+                }
+                ws_ctx->ws.connected = false;
+                ws_ctx->channel_mask = 0;
+                conn->state = CONN_STATE_CLOSED;
+            }
+            // Client-initiated close (CONN_STATE_WEBSOCKET):
+            // ws_handle_control_frame already echoed the close frame.
+            // Wait for the client to close TCP (recv returns 0), which
+            // triggers on_ws_disconnect via handle_connection_data.
             break;
         } else if (result == WS_FRAME_NEED_MORE) {
             // Need more data - wait for next read
@@ -3043,35 +3559,16 @@ static void on_ws_frame(connection_t* conn, uint8_t* buffer, size_t len) {
     }
 }
 
-// Called when a new connection is accepted - allocate per-connection contexts
+// Called when a new connection is accepted - reset pre-allocated per-connection contexts
 static void on_connect(connection_t* conn) {
     int idx = conn->pool_index;
 
-    // Allocate request context
-    if (!request_contexts[idx]) {
-        request_contexts[idx] = (request_context_t*)calloc(1, sizeof(request_context_t));
-        if (!request_contexts[idx]) {
-            ESP_LOGE(TAG, "Failed to allocate request context for connection %d", idx);
-            return;
-        }
-    }
+    // No need to zero request_contexts or ws_contexts here:
+    // - on_disconnect already NULLed freed pointers
+    // - init_request_context will memset the full struct before first use
 
-    // Allocate WebSocket context
-    if (!ws_contexts[idx]) {
-        ws_contexts[idx] = (ws_context_t*)calloc(1, sizeof(ws_context_t));
-        if (!ws_contexts[idx]) {
-            ESP_LOGE(TAG, "Failed to allocate ws context for connection %d", idx);
-            return;
-        }
-    }
-
-    // Allocate send buffer
-    if (!connection_send_buffers[idx]) {
-        connection_send_buffers[idx] = (send_buffer_t*)calloc(1, sizeof(send_buffer_t));
-        if (!connection_send_buffers[idx]) {
-            ESP_LOGE(TAG, "Failed to allocate send buffer for connection %d", idx);
-            return;
-        }
+    // Reset pre-allocated send buffer (keeps buffer dealloc'd until needed)
+    if (connection_send_buffers[idx]) {
         send_buffer_init(connection_send_buffers[idx]);
     }
 }
@@ -3104,6 +3601,15 @@ static void on_ws_disconnect(connection_t* conn) {
 static void on_disconnect(connection_t* conn) {
     int idx = conn->pool_index;
     request_context_t* ctx = get_request_context(conn);
+
+    // Handle WebSocket disconnect if the WS disconnect handler was not
+    // already called (e.g., WS_CLOSING timed out waiting for client ack)
+    if (conn->is_websocket) {
+        ws_context_t* ws_ctx = get_ws_context(conn);
+        if (ws_ctx && ws_ctx->ws.connected) {
+            on_ws_disconnect(conn);
+        }
+    }
 
     // Handle disconnect for deferred requests
     if (conn->deferred) {
@@ -3140,35 +3646,37 @@ static void on_disconnect(connection_t* conn) {
         }
     }
 
-    // Free per-connection contexts (dynamic allocation)
-    // Free request context and its internal buffers
+    // Free dynamically-sized sub-buffers but only NULL the freed pointers.
+    // init_request_context will memset the full struct before first use,
+    // so a full memset here would be redundant.
     if (request_contexts[idx]) {
-        if (request_contexts[idx]->uri_buf) {
-            free(request_contexts[idx]->uri_buf);
-        }
-        if (request_contexts[idx]->header_buf) {
-            free(request_contexts[idx]->header_buf);
-        }
-        if (request_contexts[idx]->body_buf) {
-            free(request_contexts[idx]->body_buf);
-        }
-        free(request_contexts[idx]);
-        request_contexts[idx] = NULL;
+        if (request_contexts[idx]->uri_buf_is_heap) free(request_contexts[idx]->uri_buf);
+        request_contexts[idx]->uri_buf = NULL;
+        request_contexts[idx]->uri_buf_is_heap = false;
+        free(request_contexts[idx]->header_buf);
+        request_contexts[idx]->header_buf = NULL;
+        free(request_contexts[idx]->body_buf);
+        request_contexts[idx]->body_buf = NULL;
+        if (request_contexts[idx]->recv_buf_is_heap) free(request_contexts[idx]->recv_buf);
+        request_contexts[idx]->recv_buf = NULL;
+        request_contexts[idx]->recv_buf_is_heap = false;
     }
 
-    // Free WebSocket context
+    // Reset WebSocket context - free payload buffer, zero struct.
+    // ws_context_t is small (~60 bytes) and has no init_* equivalent,
+    // so memset here is the single source of truth for a clean slate.
     if (ws_contexts[idx]) {
-        free(ws_contexts[idx]);
-        ws_contexts[idx] = NULL;
+        free(ws_contexts[idx]->frame_ctx.payload_buffer);
+        memset(ws_contexts[idx], 0, sizeof(ws_context_t));
     }
 
-    // Free send buffer
+    // Reset send buffer - free internal ring buffer, keep struct
     if (connection_send_buffers[idx]) {
         if (connection_send_buffers[idx]->allocated) {
             send_buffer_free(connection_send_buffers[idx]);
+        } else {
+            send_buffer_init(connection_send_buffers[idx]);
         }
-        free(connection_send_buffers[idx]);
-        connection_send_buffers[idx] = NULL;
     }
 }
 
@@ -3177,7 +3685,7 @@ static void on_write_ready(connection_t* conn) {
     send_buffer_t* sb = get_send_buffer(conn);
     request_context_t* ctx = get_request_context(conn);
 
-    // Safety check for dynamic allocation
+    // Safety check for pre-allocated contexts
     if (!sb || !ctx) return;
 
     // Main send loop - keep filling and sending until EAGAIN or complete
@@ -3230,7 +3738,7 @@ static void on_write_ready(connection_t* conn) {
                 if (bytes > 0) {
                     if (ctx->data_provider.use_chunked) {
                         // Format chunk: size\r\n data \r\n
-                        int header_len = snprintf((char*)write_ptr, 8, "%zx\r\n", bytes);
+                        int header_len = format_hex((char*)write_ptr, (size_t)bytes);
                         // Move data if header is shorter than 8 bytes
                         if (header_len < 8) {
                             memmove(write_ptr + header_len, data_ptr, bytes);
@@ -3282,7 +3790,6 @@ static void on_write_ready(connection_t* conn) {
             }
             // Real error - invoke async callback with error and close connection
             ESP_LOGE(TAG, "Send error on conn [%d]: %s", conn->pool_index, strerror(errno));
-            request_context_t* ctx = get_request_context(conn);
             if (ctx && ctx->async_send.active) {
                 httpd_send_cb_t callback = ctx->async_send.on_done;
                 ctx->async_send.active = false;
@@ -3325,7 +3832,6 @@ static void on_write_ready(connection_t* conn) {
         }
 
         // Check for async send completion
-        request_context_t* ctx = get_request_context(conn);
         if (ctx && ctx->async_send.active) {
             httpd_send_cb_t callback = ctx->async_send.on_done;
             ctx->async_send.active = false;

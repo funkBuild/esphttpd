@@ -91,33 +91,23 @@ typedef struct {
  * @brief Radix tree node structure
  */
 struct radix_node {
-    // Segment (edge label)
+    // All pointers first (28 bytes, 4-byte aligned)
     char* segment;                        // Heap allocated, e.g. "users", ":id"
-    uint8_t segment_len;
-
-    // Node type
-    radix_node_type_t type;
-
-    // For NODE_PARAM: parameter name (points into segment after ':')
-    const char* param_name;
-    uint8_t param_name_len;
-    bool is_optional;                     // For :param? optional parameters
-
-    // Static children (sorted by first character for faster lookup)
-    radix_node_t** children;              // Dynamic array of child pointers
-    uint8_t child_count;
-    uint8_t child_capacity;
-
-    // Special children (only one of each allowed per node)
+    const char* param_name;               // For NODE_PARAM: points into segment after ':'
+    radix_node_t** children;              // Dynamic array of child pointers (sorted by first char)
     radix_node_t* param_child;            // :param child
     radix_node_t* wildcard_child;         // * child
+    node_handlers_t* handlers;            // NULL if no route terminates here
+    httpd_middleware_t* middlewares;       // Per-route middleware
 
-    // Handlers at this node (NULL if no route terminates here)
-    node_handlers_t* handlers;
-
-    // Per-route middleware
-    httpd_middleware_t* middlewares;
+    // All uint8_t/bool fields packed (7 bytes + 1 padding)
+    uint8_t segment_len;
+    uint8_t type;                         // radix_node_type_t, stored as uint8_t
+    uint8_t param_name_len;
+    uint8_t child_count;
+    uint8_t child_capacity;
     uint8_t middleware_count;
+    bool is_optional;                     // For :param? optional parameters
 };
 
 // ============================================================================
@@ -165,10 +155,6 @@ typedef struct {
     httpd_ws_handler_t ws_handler;   // WebSocket handler
     void* ws_user_ctx;               // WebSocket user context
     bool is_websocket;               // This is a WebSocket route
-
-    // Collected middleware chain (heap allocated, caller must free)
-    httpd_middleware_t* middlewares;
-    uint8_t middleware_count;
 
     // Extracted parameters
     radix_param_t params[CONFIG_HTTPD_MAX_ROUTE_PARAMS];
@@ -244,10 +230,14 @@ httpd_err_t radix_insert_ws(radix_tree_t* tree, const char* pattern,
  * @param path URL path (without query string)
  * @param method HTTP method
  * @param is_websocket Whether this is a WebSocket upgrade
- * @return Match result (caller must free match.middlewares if matched)
+ * @param result Output parameter for match result (caller must provide; will be zeroed)
+ * @param mw_out Destination buffer for collected middleware (can be NULL)
+ * @param mw_count_out Output for middleware count written to mw_out (can be NULL)
  */
-radix_match_t radix_lookup(radix_tree_t* tree, const char* path,
-                           http_method_t method, bool is_websocket);
+void radix_lookup(radix_tree_t* tree, const char* path,
+                  http_method_t method, bool is_websocket,
+                  radix_match_t* result,
+                  httpd_middleware_t* mw_out, uint8_t* mw_count_out);
 
 // ============================================================================
 // Helper Functions (internal)

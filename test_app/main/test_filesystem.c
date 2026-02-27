@@ -145,6 +145,18 @@ static void test_validate_path_backslash_traversal(void) {
     TEST_ASSERT_FALSE(filesystem_validate_path("\\..\\etc\\passwd"));
 }
 
+// --- URL-encoded Control Character Tests (should NOT be rejected) ---
+
+static void test_validate_path_percent_0e_not_rejected(void) {
+    // %0e is Shift Out control character, NOT a dot - should be allowed
+    TEST_ASSERT_TRUE(filesystem_validate_path("/file%0ename.txt"));
+}
+
+static void test_validate_path_percent_0f_not_rejected(void) {
+    // %0f is Shift In control character, NOT a slash - should be allowed
+    TEST_ASSERT_TRUE(filesystem_validate_path("/file%0fname.txt"));
+}
+
 // --- Edge Cases ---
 
 static void test_validate_path_percent_sign_valid(void) {
@@ -328,6 +340,10 @@ void test_filesystem_run(void) {
     // Backslash tests
     RUN_TEST(test_validate_path_backslash);
     RUN_TEST(test_validate_path_backslash_traversal);
+
+    // URL-encoded control characters (should NOT be rejected)
+    RUN_TEST(test_validate_path_percent_0e_not_rejected);
+    RUN_TEST(test_validate_path_percent_0f_not_rejected);
 
     // Edge cases
     RUN_TEST(test_validate_path_percent_sign_valid);
