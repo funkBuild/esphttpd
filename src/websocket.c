@@ -94,6 +94,46 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
     size_t i = 0;
     *bytes_consumed = 0;
 
+    // Fast path: process common masked small frame header in one shot
+    // Most WebSocket frames from clients are: opcode(1) + length(1) + mask(4) + payload
+    // If we're at OPCODE state and have at least 6 bytes, process header all at once
+    if (ctx->state == WS_STATE_OPCODE && buffer_len >= 6) {
+        uint8_t first_byte = buffer[0];
+        uint8_t opcode = first_byte & 0x0F;
+        bool fin = (first_byte & 0x80) != 0;
+
+        // Validate opcode
+        if (__builtin_expect(opcode > WS_OPCODE_PONG ||
+            (opcode >= 0x3 && opcode <= 0x7), 0)) {
+            ESP_LOGE(TAG, "Invalid opcode: 0x%x", opcode);
+            return WS_FRAME_ERROR;
+        }
+        if (__builtin_expect((opcode & 0x08) && !fin, 0)) {
+            ESP_LOGE(TAG, "Fragmented control frame");
+            return WS_FRAME_ERROR;
+        }
+
+        uint8_t second_byte = buffer[1];
+        bool masked = (second_byte & 0x80) != 0;
+        uint8_t payload_len = second_byte & 0x7F;
+
+        // Fast path only for small masked frames (most common: ~90% of client frames)
+        if (__builtin_expect(payload_len < 126 && masked, 1)) {
+            conn->ws_fin = fin;
+            conn->ws_opcode = opcode;
+            conn->ws_masked = 1;
+            conn->ws_payload_len = payload_len;
+
+            // Read mask key directly (4 bytes at offset 2)
+            memcpy(&conn->ws_mask_key, &buffer[2], 4);
+            conn->ws_payload_read = 0;
+            ctx->payload_received = 0;
+            i = 6;
+            // Fall through to PAYLOAD state handling below
+            goto fast_payload;
+        }
+    }
+
     while (i < buffer_len) {
         switch (ctx->state) {
             case WS_STATE_OPCODE: {
@@ -200,17 +240,27 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
             }
 
             case WS_STATE_MASK: {
-                ((uint8_t*)&conn->ws_mask_key)[ctx->mask_bytes_read] = buffer[i];
-                ctx->mask_bytes_read++;
-                i++;
-
-                if (ctx->mask_bytes_read == 4) {
+                // Try to read remaining mask bytes in bulk when available
+                uint8_t remaining_mask = 4 - ctx->mask_bytes_read;
+                size_t available = buffer_len - i;
+                if (available >= remaining_mask) {
+                    memcpy(((uint8_t*)&conn->ws_mask_key) + ctx->mask_bytes_read,
+                           &buffer[i], remaining_mask);
                     ctx->mask_bytes_read = 0;
                     conn->ws_payload_read = 0;
                     ctx->state = WS_STATE_PAYLOAD;
+                    i += remaining_mask;
+                } else {
+                    // Partial mask - read what we can
+                    memcpy(((uint8_t*)&conn->ws_mask_key) + ctx->mask_bytes_read,
+                           &buffer[i], available);
+                    ctx->mask_bytes_read += available;
+                    i += available;
                 }
                 break;
             }
+
+        fast_payload:
 
             case WS_STATE_PAYLOAD: {
                 // Cache control frame check result to avoid duplicate function calls

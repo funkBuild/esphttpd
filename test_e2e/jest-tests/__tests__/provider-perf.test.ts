@@ -9,7 +9,7 @@
 
 import axios from 'axios';
 import { BASE_URL } from '../jest.setup';
-import { verifyBlockPattern, TIMEOUTS } from '../test-utils';
+import { verifyBlockPattern, TIMEOUTS, MIN_THROUGHPUT_KBPS } from '../test-utils';
 
 interface PerfResult {
   endpoint: string;
@@ -149,9 +149,9 @@ describe('Data Provider API Performance', () => {
       console.log(`\nProvider vs Old API: ${improvementVsOld}% ${parseFloat(improvementVsOld) >= 0 ? 'faster' : 'slower'}`);
 
       // Minimum throughput regression guard (conservative for QEMU)
-      expect(avgOld).toBeGreaterThan(500);           // 500 KB/s minimum
-      expect(avgProvider).toBeGreaterThan(500);
-      expect(avgProviderChunked).toBeGreaterThan(500);
+      expect(avgOld).toBeGreaterThan(MIN_THROUGHPUT_KBPS);
+      expect(avgProvider).toBeGreaterThan(MIN_THROUGHPUT_KBPS);
+      expect(avgProviderChunked).toBeGreaterThan(MIN_THROUGHPUT_KBPS);
 
       // Provider API should not regress vs old API
       expect(avgProvider).toBeGreaterThanOrEqual(avgOld * 0.5);
@@ -219,9 +219,9 @@ describe('Data Provider API Performance', () => {
       console.log(`\nProvider vs Old API: ${improvementVsOld}% ${parseFloat(improvementVsOld) >= 0 ? 'faster' : 'slower'}`);
 
       // Minimum throughput regression guard (conservative for QEMU)
-      expect(avgOld).toBeGreaterThan(500);           // 500 KB/s minimum
-      expect(avgProvider).toBeGreaterThan(500);
-      expect(avgProviderChunked).toBeGreaterThan(500);
+      expect(avgOld).toBeGreaterThan(MIN_THROUGHPUT_KBPS);
+      expect(avgProvider).toBeGreaterThan(MIN_THROUGHPUT_KBPS);
+      expect(avgProviderChunked).toBeGreaterThan(MIN_THROUGHPUT_KBPS);
 
       // Provider API should not regress vs old API
       expect(avgProvider).toBeGreaterThanOrEqual(avgOld * 0.5);

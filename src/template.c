@@ -79,10 +79,17 @@ int template_process(template_context_t* ctx,
         switch (ctx->state) {
             case TEMPLATE_STATE_TEXT:
                 // Most common case: normal text character (not start of delimiter)
-                // Check if NOT start delimiter first (most common path)
+                // Bulk scan: use memchr to find next potential delimiter start
                 if (__builtin_expect(c != first_delim_char, 1) && ctx->delim_pos == 0) {
-                    // Fast path: normal text character
-                    output[out_pos++] = c;
+                    // Bulk copy text until next delimiter char or end of input
+                    const uint8_t* next_delim = (const uint8_t*)memchr(&input[in_pos + 1], first_delim_char, input_len - in_pos - 1);
+                    size_t span = next_delim ? (size_t)(next_delim - &input[in_pos]) : (input_len - in_pos);
+                    size_t avail = output_size - out_pos;
+                    if (span > avail) span = avail;
+                    memcpy(output + out_pos, &input[in_pos], span);
+                    out_pos += span;
+                    in_pos += span;
+                    continue;
                 } else if (c == start_delim[ctx->delim_pos]) {
                     ctx->delim_pos++;
                     if (ctx->delim_pos == delim_len_start) {

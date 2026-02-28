@@ -127,7 +127,7 @@ describe('Deferred Upload API', () => {
         // Accept timeout as known QEMU limitation
         expect(error.code).toBe('ECONNABORTED');
       }
-    }, TIMEOUTS.HTTP);
+    }, TIMEOUTS.HTTP + 5000);
   });
 
   describe('GET /upload/defer/verify', () => {

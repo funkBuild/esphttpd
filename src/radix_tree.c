@@ -484,15 +484,8 @@ void radix_lookup(radix_tree_t* tree, const char* path,
                   http_method_t method, bool is_websocket,
                   radix_match_t* result,
                   httpd_middleware_t* mw_out, uint8_t* mw_count_out) {
-    // Initialize only scalar fields - params[] array is accessed only
-    // up to param_count, so zeroing it would waste bytes per lookup
+    // Initialize only the fields checked before being set
     result->matched = false;
-    result->handler_chain = NULL;
-    result->handler = NULL;
-    result->user_ctx = NULL;
-    result->ws_handler = NULL;
-    result->ws_user_ctx = NULL;
-    result->is_websocket = false;
     result->param_count = 0;
 
     if (mw_count_out) *mw_count_out = 0;
@@ -500,11 +493,6 @@ void radix_lookup(radix_tree_t* tree, const char* path,
     if (__builtin_expect(!tree || !path, 0)) return;
 
     ESP_LOGD(TAG, "Looking up: path='%s', method=%d, ws=%d", path, method, is_websocket);
-
-    // Calculate path end once for efficient wildcard value_len computation
-    size_t path_len = strlen(path);
-    const char* path_end = path + path_len;
-    bool path_has_trailing_slash = false;
 
     radix_node_t* node = tree->root;
     const char* p = path;
@@ -573,7 +561,7 @@ void radix_lookup(radix_tree_t* tree, const char* path,
                 result->params[result->param_count].key = "*";
                 result->params[result->param_count].key_len = 1;
                 result->params[result->param_count].value = p;
-                result->params[result->param_count].value_len = path_end - p;  // Use pointer arithmetic instead of strlen
+                result->params[result->param_count].value_len = strlen(p);  // Computed only on wildcard match (rare)
                 result->param_count++;
             }
             node = node->wildcard_child;
@@ -642,9 +630,10 @@ void radix_lookup(radix_tree_t* tree, const char* path,
     if (node && node->handlers) {
         // In strict mode, trailing slashes must match
         bool strict_ok = true;
-        if (tree->strict) {
-            // Use pre-calculated path_len (already computed at function start)
-            path_has_trailing_slash = (path_len > 1 && path[path_len - 1] == '/');
+        if (__builtin_expect(tree->strict, 0)) {
+            // Compute path_len only when strict mode is active (rare)
+            size_t path_len = strlen(path);
+            bool path_has_trailing_slash = (path_len > 1 && path[path_len - 1] == '/');
             strict_ok = (path_has_trailing_slash == node->handlers->has_trailing_slash);
         }
 

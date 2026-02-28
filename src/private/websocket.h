@@ -25,8 +25,9 @@ typedef enum {
 // Maximum WebSocket payload size we'll buffer (8KB should be enough for most use cases)
 #define WS_MAX_PAYLOAD_SIZE 8192
 
-// Default pre-allocated buffer size (256 bytes handles most small messages)
-#define WS_DEFAULT_BUFFER_SIZE 256
+// Default pre-allocated buffer size (128 bytes handles control frames and small messages)
+// Grows dynamically via ensure_payload_buffer() for larger payloads
+#define WS_DEFAULT_BUFFER_SIZE 128
 
 // WebSocket frame info (per-connection state)
 typedef struct {

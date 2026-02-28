@@ -68,14 +68,14 @@ describe('Query Parameters', () => {
   });
 
   describe('GET /api/query with URL-encoded characters', () => {
-    it('should include encoded characters in raw query string', async () => {
+    it('should decode URL-encoded characters in parameter values', async () => {
       const response = await axios.get('/api/query?name=hello%20world');
 
       expect(response.status).toBe(200);
       // Raw query string preserves the encoding as sent over the wire
-      expect(response.data.raw).toContain('name=hello');
-      // The value may or may not be URL-decoded depending on the server implementation
-      expect(response.data.params.name).toBeTruthy();
+      expect(response.data.raw).toBe('name=hello%20world');
+      // httpd_req_get_query() URL-decodes the value
+      expect(response.data.params.name).toBe('hello world');
     });
   });
 

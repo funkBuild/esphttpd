@@ -83,20 +83,26 @@ describe('WebSocket', () => {
       ws.send(binaryData);
     }, TIMEOUTS.HTTP);
 
-    it('should handle multiple messages in sequence', (done) => {
+    it('should handle multiple messages in sequence', async () => {
       const messages = ['first', 'second'];
-      let receivedCount = 0;
-      const timeout = setTimeout(() => done(new Error('Timeout waiting for messages')), TIMEOUTS.WS_BROADCAST);
+      const received: string[] = [];
 
-      ws.on('message', (data) => {
-        expect(data.toString()).toBe(messages[receivedCount]);
-        receivedCount++;
-        if (receivedCount === messages.length) {
-          clearTimeout(timeout);
-          done();
-        }
+      const allReceived = new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Timeout waiting for messages')), TIMEOUTS.WS_BROADCAST);
+        ws.on('message', (data) => {
+          received.push(data.toString());
+          if (received.length === messages.length) {
+            clearTimeout(timeout);
+            resolve();
+          }
+        });
       });
+
+      // Send after listener is registered
       messages.forEach(msg => ws.send(msg));
+      await allReceived;
+
+      expect(received).toEqual(messages);
     }, TIMEOUTS.WS_BROADCAST + 5000);
   });
 
@@ -312,21 +318,27 @@ describe('WebSocket', () => {
     });
 
     it('should receive welcome message on connect', (done) => {
-      const timeout = setTimeout(() => done(new Error('Timeout waiting for welcome')), TIMEOUTS.WS_MESSAGE);
+      const timeout = setTimeout(() => {
+        cleanupWs(extraWs);
+        done(new Error('Timeout waiting for welcome'));
+      }, TIMEOUTS.WS_MESSAGE);
 
       // Need fresh connection since beforeEach already received welcome
-      const ws = new WebSocket(`${WS_URL}/ws/channel`);
-      ws.on('message', (data) => {
+      let extraWs: WebSocket | null = new WebSocket(`${WS_URL}/ws/channel`);
+      extraWs.on('message', (data) => {
         const msg = JSON.parse(data.toString());
         if (msg.type === 'welcome') {
           clearTimeout(timeout);
           expect(msg.message).toBe('Connected to channel server');
-          ws.terminate();
+          cleanupWs(extraWs);
+          extraWs = null;
           done();
         }
       });
-      ws.on('error', (err) => {
+      extraWs.on('error', (err) => {
         clearTimeout(timeout);
+        cleanupWs(extraWs);
+        extraWs = null;
         done(err);
       });
     }, TIMEOUTS.WS_HANDSHAKE);

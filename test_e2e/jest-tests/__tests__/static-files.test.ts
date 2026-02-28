@@ -89,9 +89,9 @@ describe('Static File Serving', () => {
       const response = await axios.get('/static/styles.css');
 
       expect(response.status).toBe(200);
-      // Check for common headers (server may or may not set these)
-      expect(response.headers).toBeDefined();
-      expect(response.headers['content-length']).toBeDefined();
+      // Content-Length should be a numeric string
+      const contentLength = parseInt(response.headers['content-length'], 10);
+      expect(contentLength).toBeGreaterThan(0);
     });
   });
 
@@ -176,6 +176,28 @@ describe('Static File Serving', () => {
     });
   });
 
+  describe('URL-Encoded Paths', () => {
+    it('should handle percent-encoded spaces in filenames', async () => {
+      const response = await axios.get('/static/file%20name.txt', {
+        validateStatus: () => true
+      });
+
+      expect(response.status).toBe(200);
+      expect(response.headers['content-type']).toContain('text/plain');
+      // Server echoes the raw URI filename (percent-encoding preserved)
+      expect(response.data).toContain('Mock static file:');
+    });
+
+    it('should handle percent-encoded slashes in filenames', async () => {
+      const response = await axios.get('/static/file%2Fname.txt', {
+        validateStatus: () => true
+      });
+
+      // Server should respond without crashing
+      expect(response.status).toBeLessThan(500);
+    });
+  });
+
   describe('Content Negotiation', () => {
     it('should respect Accept headers for static files', async () => {
       const response = await axios.get('/static/data.json', {
@@ -195,7 +217,7 @@ describe('Static File Serving', () => {
       const response = await axios.get('/static/very-long-filename-that-might-cause-issues-with-buffer-overflow-attacks-or-similar-problems.txt');
 
       expect(response.status).toBe(200);
-      expect(response.data).toBeDefined();
+      expect(response.data).toContain('Mock static file: very-long-filename-that-might-cause-issues-with-buffer-overflow-attacks-or-similar-problems.txt');
     });
   });
 });

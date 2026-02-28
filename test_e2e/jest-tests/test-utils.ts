@@ -37,6 +37,13 @@ export const TIMEOUTS = {
   PERF_CONCURRENT: 120000,
 };
 
+/**
+ * Minimum throughput (KB/s) for performance regression guards.
+ * Conservative default for QEMU emulation. Override via MIN_THROUGHPUT_KBPS
+ * environment variable for faster environments (e.g. real hardware).
+ */
+export const MIN_THROUGHPUT_KBPS = parseInt(process.env.MIN_THROUGHPUT_KBPS || '100', 10);
+
 // Test credentials (must match server-side TEST_AUTH_USER/TEST_AUTH_PASS)
 export const TEST_USER = 'testuser';
 export const TEST_PASS = 'testpass';

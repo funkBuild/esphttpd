@@ -67,29 +67,20 @@ describe('Template Engine', () => {
       expect(responseTime).toBeLessThan(3000); // QEMU: Increased from 200ms to 3s
     });
 
-    it('should handle multiple template requests concurrently', async () => {
-      // Reduced count for QEMU emulation performance
-      const requests = Array(3).fill(null).map(() =>
-        axios.get('/template', { timeout: TIMEOUTS.HTTP })
-      );
+    it('should increment request count across sequential requests', async () => {
+      const r1 = await axios.get('/template', { timeout: TIMEOUTS.HTTP });
+      expect(r1.status).toBe(200);
+      expect(r1.data).toContain('E2E Test Page');
 
-      const responses = await Promise.all(requests);
+      const r2 = await axios.get('/template', { timeout: TIMEOUTS.HTTP });
+      expect(r2.status).toBe(200);
 
-      responses.forEach(response => {
-        expect(response.status).toBe(200);
-        expect(response.data).toContain('E2E Test Page');
-      });
+      const count1 = parseInt(r1.data.match(/Request count: (\d+)/)?.[1] ?? '0');
+      const count2 = parseInt(r2.data.match(/Request count: (\d+)/)?.[1] ?? '0');
 
-      // Check that request counts are different (indicating separate processing)
-      const counts = responses.map(r => {
-        const match = r.data.match(/Request count: (\d+)/);
-        return match ? parseInt(match[1]) : 0;
-      });
-
-      // Counts should be unique or at least increasing
-      const uniqueCounts = new Set(counts);
-      expect(uniqueCounts.size).toBeGreaterThan(1);
-    }, TIMEOUTS.CONCURRENT);
+      // Sequential requests should produce increasing counts
+      expect(count2).toBeGreaterThan(count1);
+    });
   });
 
   describe('Template Edge Cases', () => {

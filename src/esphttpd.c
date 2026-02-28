@@ -212,9 +212,12 @@ typedef struct {
 } query_param_entry_t;
 
 // Per-connection request context
+// Layout: fields that need zeroing per-request are grouped first (up to _zero_end),
+// followed by scratch buffers that don't need zeroing. init_request_context() only
+// memsets up to _zero_end, saving ~768 bytes of unnecessary zeroing per request.
 typedef struct {
+    // === Fields that NEED zeroing per request (memset target) ===
     httpd_req_t req;                      // Public request struct
-    req_header_entry_t headers[MAX_REQ_HEADERS];  // Header index
     char* header_buf;                     // Header storage (dynamically allocated)
     char* uri_buf;                        // URI storage (dynamically allocated)
     struct httpd_server* server;          // Back pointer to server
@@ -231,11 +234,6 @@ typedef struct {
     bool parsing_in_progress;             // True while headers are being accumulated
     bool recv_buf_is_heap;                // true if recv_buf was malloc'd (needs free)
     bool uri_buf_is_heap;                 // true if uri_buf was malloc'd (needs free)
-    // Inline buffers to eliminate per-request malloc for common cases
-    uint8_t inline_recv_buf[512];         // Embedded buffer for single-packet requests
-    char inline_uri_buf[128];             // Embedded buffer for typical URI lengths
-    // Query parameter cache (lazy parsing)
-    query_param_entry_t query_params[MAX_QUERY_PARAMS];
     uint8_t query_param_count;
     bool query_parsed;
     // Deferred (async) body handling
@@ -266,8 +264,15 @@ typedef struct {
         httpd_req_continuation_t cont;    // Continuation state
         bool active;                      // Continuation mode active
     } continuation;
-    // Middleware chain (persists for request lifetime, safe across deferred handlers)
-    httpd_middleware_t mw_chain[CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE];
+    char _zero_end[0];                    // Marker: memset stops here
+
+    // === Scratch buffers that DON'T need zeroing per request ===
+    // (only accessed up to their respective counts, or written before read)
+    req_header_entry_t headers[MAX_REQ_HEADERS];  // Header index (accessed up to header_count)
+    uint8_t inline_recv_buf[512];         // Embedded buffer for single-packet requests
+    char inline_uri_buf[64];              // Embedded buffer for typical URI lengths (heap fallback for longer)
+    query_param_entry_t query_params[MAX_QUERY_PARAMS];  // Lazy parsed (accessed up to query_param_count)
+    httpd_middleware_t mw_chain[CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE];  // Accessed up to middleware count
 } request_context_t;
 
 // Per-connection WebSocket context
@@ -608,22 +613,26 @@ const char* httpd_get_mime_type(const char* path) {
     if (!ext) return "application/octet-stream";
     ext++;
 
-    // Get extension length
-    size_t ext_len = strlen(ext);
+    // Single-pass: lowercase and compute length simultaneously (max 5 chars)
+    char lower[6];
+    size_t ext_len = 0;
+    while (ext[ext_len] && ext_len < 6) {
+        lower[ext_len] = ext[ext_len] | 0x20;
+        ext_len++;
+    }
+    // Reject empty, too long (>5), or still has chars beyond our scan
     if (ext_len == 0 || ext_len > 5) return "application/octet-stream";
 
-    // Convert first char to lowercase for dispatch
-    char first = ext[0];
-    if (first >= 'A' && first <= 'Z') first += 32;
-    if (first < 'a' || first > 'z') return "application/octet-stream";
+    // Bounds check for dispatch
+    if (lower[0] < 'a' || lower[0] > 'z') return "application/octet-stream";
 
     // O(1) dispatch to correct group
-    const mime_entry_t* group = mime_dispatch[first - 'a'];
+    const mime_entry_t* group = mime_dispatch[lower[0] - 'a'];
     if (!group) return "application/octet-stream";
 
-    // Search within small group (max 4 entries)
+    // Search within small group (max 4 entries) using memcmp on pre-lowered extension
     for (const mime_entry_t* e = group; e->ext; e++) {
-        if (e->ext_len == ext_len && strcasecmp(ext, e->ext) == 0) {
+        if (e->ext_len == ext_len && memcmp(lower, e->ext, ext_len) == 0) {
             return e->mime;
         }
     }
@@ -801,9 +810,10 @@ static void init_request_context(request_context_t* ctx, connection_t* conn) {
         if (ctx->recv_buf_is_heap) free(ctx->recv_buf);
     }
 
-    // Zero the entire struct - compiler/hardware can optimize this
-    // into efficient word-sized or SIMD stores
-    memset(ctx, 0, sizeof(*ctx));
+    // Zero only the fields that need zeroing (up to _zero_end marker).
+    // Skips ~768 bytes of scratch buffers (inline_recv_buf, inline_uri_buf,
+    // headers array, query_params, mw_chain) that are written before read.
+    memset(ctx, 0, offsetof(request_context_t, _zero_end));
 
     // Set the few non-zero fields
     ctx->req.fd = conn->fd;

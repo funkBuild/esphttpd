@@ -252,40 +252,53 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                 }
                 break;
 
-            case PARSE_STATE_URL:
+            case PARSE_STATE_URL: {
                 if (!ctx->url) {
                     ctx->url = &buffer[i];
                     ctx->url_len = 0;
                 }
-                if (c == ' ') {
+                // Bulk scan: find the space terminating the URL using memchr
+                const uint8_t* space = (const uint8_t*)memchr(&buffer[i], ' ', buffer_len - i);
+                if (space) {
+                    size_t span = space - &buffer[i];
+                    ctx->url_len += span;
+                    if (__builtin_expect(ctx->url_len >= 2048, 0)) {
+                        return PARSE_ERROR;
+                    }
                     if (__builtin_expect(ctx->url_len == 0, 0)) {
                         return PARSE_ERROR;
                     }
-                    // Store URL info in connection
-                    // Note: In production, would copy URL to persistent storage
                     conn->url_len = ctx->url_len;
                     ctx->state = PARSE_STATE_VERSION;
-                } else if (__builtin_expect(c == '\r' || c == '\n', 0)) {
-                    return PARSE_ERROR; // Invalid request line
+                    i += span; // i will be incremented past the space below
                 } else {
-                    ctx->url_len++;
-                    if (__builtin_expect(ctx->url_len >= 2048, 0)) { // Max URL length
+                    // No space found - consume remaining buffer
+                    size_t span = buffer_len - i;
+                    ctx->url_len += span;
+                    if (__builtin_expect(ctx->url_len >= 2048, 0)) {
                         return PARSE_ERROR;
                     }
+                    i = buffer_len;
+                    continue;
                 }
                 break;
+            }
 
-            case PARSE_STATE_VERSION:
-                // Skip until end of line (we assume HTTP/1.1)
-                if (c == '\r') {
-                    // Expect \n next
-                } else if (c == '\n') {
+            case PARSE_STATE_VERSION: {
+                // Bulk scan: find \n to skip version string
+                const uint8_t* nl = (const uint8_t*)memchr(&buffer[i], '\n', buffer_len - i);
+                if (nl) {
                     ctx->state = PARSE_STATE_HEADER_KEY;
                     ctx->current_header_key = NULL;
                     ctx->header_key_len = 0;
                     conn->header_bytes = 0;
+                    i = nl - buffer; // i will be incremented past \n below
+                } else {
+                    i = buffer_len;
+                    continue;
                 }
                 break;
+            }
 
             case PARSE_STATE_HEADER_KEY:
                 // Most common: regular header character (not \r, \n, or :)
@@ -318,10 +331,36 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                 }
                 break;
 
-            case PARSE_STATE_HEADER_VALUE:
-                // Most common: regular header value character (not \r or \n)
-                if (__builtin_expect(c == '\r', 0)) {
-                    // End of header value
+            case PARSE_STATE_HEADER_VALUE: {
+                // First byte: check for leading whitespace to find value start
+                if (!ctx->current_header_value) {
+                    if (c == '\r') {
+                        // Empty value
+                        ctx->header_count++;
+                        break;
+                    }
+                    if (c == '\n') {
+                        ctx->state = PARSE_STATE_HEADER_KEY;
+                        ctx->current_header_key = NULL;
+                        ctx->header_key_len = 0;
+                        break;
+                    }
+                    if (!is_whitespace(c)) {
+                        ctx->current_header_value = &buffer[i];
+                        ctx->header_value_len = 0;
+                    } else {
+                        break;
+                    }
+                }
+                // Bulk scan: find \r to end the header value
+                const uint8_t* cr = (const uint8_t*)memchr(&buffer[i], '\r', buffer_len - i);
+                if (cr) {
+                    size_t span = cr - &buffer[i];
+                    ctx->header_value_len += span;
+                    if (__builtin_expect(ctx->header_value_len >= 255, 0)) {
+                        return PARSE_ERROR;
+                    }
+                    // End of header value - process it
                     if (ctx->current_header_key && ctx->current_header_value) {
                         http_process_header(conn,
                                           ctx->current_header_key, ctx->header_key_len,
@@ -329,23 +368,19 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                                           ctx);
                     }
                     ctx->header_count++;
-                } else if (__builtin_expect(c == '\n', 0)) {
-                    ctx->state = PARSE_STATE_HEADER_KEY;
-                    ctx->current_header_key = NULL;
-                    ctx->header_key_len = 0;
+                    i = cr - buffer; // i will be incremented past \r below
                 } else {
-                    if (!ctx->current_header_value && !is_whitespace(c)) {
-                        ctx->current_header_value = &buffer[i];
-                        ctx->header_value_len = 0;
+                    // No \r found - consume remaining buffer
+                    size_t span = buffer_len - i;
+                    ctx->header_value_len += span;
+                    if (__builtin_expect(ctx->header_value_len >= 255, 0)) {
+                        return PARSE_ERROR;
                     }
-                    if (ctx->current_header_value) {
-                        ctx->header_value_len++;
-                        if (__builtin_expect(ctx->header_value_len == 255, 0)) { // Max header value length
-                            return PARSE_ERROR;
-                        }
-                    }
+                    i = buffer_len;
+                    continue;
                 }
                 break;
+            }
 
             case PARSE_STATE_HEADERS_COMPLETE:
                 conn->state = CONN_STATE_HTTP_HEADERS;
@@ -383,7 +418,7 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
         i++;
 
         // Prevent excessive header size (use loop counter directly instead of redundant field)
-        if (i > 4096) {
+        if (__builtin_expect(i > 4096, 0)) {
             ESP_LOGE(TAG, "Headers too large");
             return PARSE_ERROR;
         }
