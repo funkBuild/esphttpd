@@ -6,6 +6,14 @@
  * @brief High-performance HTTP/WebSocket server for ESP32
  *
  * Modern C API with proper error handling, thread safety, and extensibility.
+ *
+ * Transport modes:
+ * - Default: BSD sockets + select() in a dedicated FreeRTOS task
+ * - Raw API (CONFIG_HTTPD_USE_RAW_API=y): lwIP raw TCP callbacks in tcpip_thread
+ *   Eliminates socket layer overhead (~20-110us per request).
+ *   Requires: CONFIG_LWIP_TCPIP_CORE_LOCKING=y, CONFIG_LWIP_TCPIP_TASK_STACK_SIZE >= 6144
+ *   Constraint: Handlers must not block (no vTaskDelay, no blocking I/O).
+ *   The fd field in httpd_req_t and httpd_ws_t is set to -1 under raw API mode.
  */
 
 #include <stdint.h>

@@ -1,4 +1,5 @@
 #include "private/event_loop.h"
+#ifndef CONFIG_HTTPD_USE_RAW_API
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -6,20 +7,23 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
+#endif
 #include <string.h>
 #include <stdlib.h>
-#include <errno.h>
 #include "esp_log.h"
 
-static const char TAG[] = "EVENT_LOOP";
+static const char TAG[] __attribute__((unused)) = "EVENT_LOOP";
 
 // Default configuration
 static const event_loop_config_t default_config = {
     .port = 80,
     .backlog = 5,
     .timeout_ms = 30000,        // 30 second timeout
+#ifndef CONFIG_HTTPD_USE_RAW_API
     .select_timeout_ms = 1000,   // 1 second select timeout
     .io_buffer_size = 1024,      // 1KB I/O buffer
+#endif
     .nodelay = true,             // Disable Nagle's algorithm
     .reuseaddr = true            // Allow address reuse
 };
@@ -32,19 +36,33 @@ void event_loop_init(event_loop_t* loop, connection_pool_t* pool, const event_lo
     memset(loop, 0, sizeof(event_loop_t));
     loop->pool = pool;
     loop->config = *config;
+#ifdef CONFIG_HTTPD_USE_RAW_API
+    loop->listen_pcb = NULL;
+    // Compute timeout in poll intervals (each poll = CONFIG_HTTPD_RAW_POLL_INTERVAL * 500ms)
+    uint32_t poll_interval_ms = CONFIG_HTTPD_RAW_POLL_INTERVAL * 500;
+    loop->timeout_ticks = config->timeout_ms / (poll_interval_ms > 0 ? poll_interval_ms : 1000);
+#else
     loop->listen_fd = -1;
-    loop->running = false;
-
     // Precompute timeout in ticks (avoid division in hot path)
     loop->timeout_ticks = config->timeout_ms / config->select_timeout_ms;
-
     // Precompute select timeout struct (avoid repeated struct construction)
     loop->select_timeout.tv_sec = config->select_timeout_ms / 1000;
     loop->select_timeout.tv_usec = (config->select_timeout_ms % 1000) * 1000;
+#endif
+    loop->running = false;
 
     // Initialize connection pool
     connection_pool_init(pool);
 }
+
+void event_loop_stop(event_loop_t* loop) {
+    loop->running = false;
+}
+
+// ============================================================================
+// Socket-based event loop (select mode)
+// ============================================================================
+#ifndef CONFIG_HTTPD_USE_RAW_API
 
 int event_loop_create_listener(event_loop_t* loop) {
     struct sockaddr_in server_addr;
@@ -381,8 +399,6 @@ void event_loop_run(event_loop_t* loop, const event_handlers_t* handlers) {
     ESP_LOGI(TAG, "Event loop stopped");
 }
 
-void event_loop_stop(event_loop_t* loop) {
-    loop->running = false;
-}
+#endif // !CONFIG_HTTPD_USE_RAW_API
 
 // Connection pool functions moved to connection.c to avoid duplication

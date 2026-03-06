@@ -261,6 +261,12 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                 const uint8_t* space = (const uint8_t*)memchr(&buffer[i], ' ', buffer_len - i);
                 if (space) {
                     size_t span = space - &buffer[i];
+                    // Reject control characters in URL (request smuggling protection)
+                    const uint8_t* cr = (const uint8_t*)memchr(&buffer[i], '\r', span);
+                    const uint8_t* lf = (const uint8_t*)memchr(&buffer[i], '\n', span);
+                    if (__builtin_expect(cr != NULL || lf != NULL, 0)) {
+                        return PARSE_ERROR;
+                    }
                     ctx->url_len += span;
                     if (__builtin_expect(ctx->url_len >= 2048, 0)) {
                         return PARSE_ERROR;
@@ -272,9 +278,15 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                     ctx->state = PARSE_STATE_VERSION;
                     i += span; // i will be incremented past the space below
                 } else {
-                    // No space found - consume remaining buffer
-                    size_t span = buffer_len - i;
-                    ctx->url_len += span;
+                    // No space found - check for control chars (missing version)
+                    size_t remaining = buffer_len - i;
+                    const uint8_t* cr = (const uint8_t*)memchr(&buffer[i], '\r', remaining);
+                    const uint8_t* lf = (const uint8_t*)memchr(&buffer[i], '\n', remaining);
+                    if (__builtin_expect(cr != NULL || lf != NULL, 0)) {
+                        return PARSE_ERROR;
+                    }
+                    // Consume remaining buffer
+                    ctx->url_len += remaining;
                     if (__builtin_expect(ctx->url_len >= 2048, 0)) {
                         return PARSE_ERROR;
                     }
@@ -335,11 +347,14 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                 // First byte: check for leading whitespace to find value start
                 if (!ctx->current_header_value) {
                     if (c == '\r') {
-                        // Empty value
+                        // Empty value - stay in HEADER_VALUE; \n will trigger
+                        // transition to HEADER_KEY on next iteration
                         ctx->header_count++;
                         break;
                     }
                     if (c == '\n') {
+                        // Empty value (LF-only) or \n after \r from previous
+                        // header - transition to HEADER_KEY
                         ctx->state = PARSE_STATE_HEADER_KEY;
                         ctx->current_header_key = NULL;
                         ctx->header_key_len = 0;
@@ -352,14 +367,23 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                         break;
                     }
                 }
-                // Bulk scan: find \r to end the header value
+                // Bulk scan: find \r or \n to end the header value
                 const uint8_t* cr = (const uint8_t*)memchr(&buffer[i], '\r', buffer_len - i);
-                if (cr) {
-                    size_t span = cr - &buffer[i];
-                    ctx->header_value_len += span;
-                    if (__builtin_expect(ctx->header_value_len >= 255, 0)) {
+                const uint8_t* lf = (const uint8_t*)memchr(&buffer[i], '\n', buffer_len - i);
+                // Find earliest line terminator
+                const uint8_t* end = NULL;
+                if (cr && lf) {
+                    end = (cr < lf) ? cr : lf;
+                } else {
+                    end = cr ? cr : lf;
+                }
+                if (end) {
+                    size_t span = end - &buffer[i];
+                    // Check overflow before truncating to uint8_t
+                    if (__builtin_expect((size_t)ctx->header_value_len + span >= 255, 0)) {
                         return PARSE_ERROR;
                     }
+                    ctx->header_value_len += span;
                     // End of header value - process it
                     if (ctx->current_header_key && ctx->current_header_value) {
                         http_process_header(conn,
@@ -368,14 +392,27 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                                           ctx);
                     }
                     ctx->header_count++;
-                    i = cr - buffer; // i will be incremented past \r below
+                    // Reset value pointer so \n handler can trigger HEADER_KEY transition
+                    ctx->current_header_value = NULL;
+                    if (*end == '\r') {
+                        // CRLF: point to \r; i++ moves to \n which triggers
+                        // HEADER_KEY transition via the NULL value \n handler above
+                        i = end - buffer;
+                    } else {
+                        // LF-only: transition directly to HEADER_KEY
+                        ctx->state = PARSE_STATE_HEADER_KEY;
+                        ctx->current_header_key = NULL;
+                        ctx->header_key_len = 0;
+                        i = end - buffer; // i++ moves past \n to next line
+                    }
                 } else {
-                    // No \r found - consume remaining buffer
+                    // No terminator found - consume remaining buffer
                     size_t span = buffer_len - i;
-                    ctx->header_value_len += span;
-                    if (__builtin_expect(ctx->header_value_len >= 255, 0)) {
+                    // Check overflow before truncating to uint8_t
+                    if (__builtin_expect((size_t)ctx->header_value_len + span >= 255, 0)) {
                         return PARSE_ERROR;
                     }
+                    ctx->header_value_len += span;
                     i = buffer_len;
                     continue;
                 }

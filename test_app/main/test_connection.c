@@ -341,15 +341,23 @@ static void test_full_connection_pool(void)
 // Test structure sizes (verify packing)
 static void test_structure_sizes(void)
 {
-    // Connection should be compact (naturally aligned, ~40 bytes)
+    // Connection should be compact (naturally aligned)
     size_t conn_size = sizeof(connection_t);
     ESP_LOGI(TAG, "connection_t size: %u bytes", conn_size);
-    TEST_ASSERT_LESS_OR_EQUAL(48, conn_size); // Naturally aligned, ~40 bytes
+#ifdef CONFIG_HTTPD_USE_RAW_API
+    TEST_ASSERT_LESS_OR_EQUAL(64, conn_size); // With raw TCP fields (~60 bytes)
+#else
+    TEST_ASSERT_LESS_OR_EQUAL(48, conn_size); // Socket mode (~40 bytes)
+#endif
 
     // Pool size
     size_t pool_size = sizeof(connection_pool_t);
     ESP_LOGI(TAG, "connection_pool_t size: %u bytes", pool_size);
+#ifdef CONFIG_HTTPD_USE_RAW_API
+    TEST_ASSERT_LESS_OR_EQUAL(1728, pool_size); // 16 * ~60 + overhead
+#else
     TEST_ASSERT_LESS_OR_EQUAL(1536, pool_size); // 16 * ~40 + 12 bytes overhead
+#endif
 }
 
 // ============================================================================

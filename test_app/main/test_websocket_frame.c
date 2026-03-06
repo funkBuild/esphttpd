@@ -555,6 +555,11 @@ static void test_frame_ctx_init_success(void)
     TEST_ASSERT_TRUE(result);
     TEST_ASSERT_EQUAL(WS_STATE_OPCODE, ctx.state);
     TEST_ASSERT_EQUAL(0, ctx.payload_received);
+
+    // Clean up allocated buffer
+    if (ctx.payload_buffer) {
+        free(ctx.payload_buffer);
+    }
 }
 
 // Test masking with offset

@@ -150,4 +150,30 @@ menu "ESPHTTPD Configuration"
 
     endmenu
 
+    menu "Transport Configuration"
+
+        config HTTPD_USE_RAW_API
+            bool "Use lwIP raw TCP API instead of BSD sockets"
+            default n
+            help
+                Use lwIP raw TCP callbacks instead of BSD sockets + select().
+                Eliminates context switch overhead (~20-110us per request)
+                by running handlers directly in tcpip_thread.
+
+                Requires CONFIG_LWIP_TCPIP_CORE_LOCKING=y and
+                CONFIG_LWIP_TCPIP_TASK_STACK_SIZE >= 6144.
+
+                Handlers must not block in callbacks.
+
+        config HTTPD_RAW_POLL_INTERVAL
+            int "Raw API poll interval (half-seconds)"
+            default 4
+            range 1 16
+            depends on HTTPD_USE_RAW_API
+            help
+                lwIP tcp_poll interval in half-seconds.
+                Default 4 = poll every 2 seconds for timeout checking.
+
+    endmenu
+
 endmenu

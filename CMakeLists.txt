@@ -13,6 +13,14 @@ else()
     message(STATUS "LittleFS support disabled (component not found)")
 endif()
 
+# Check if raw TCP API is enabled
+if(CONFIG_HTTPD_USE_RAW_API)
+    set(RAW_TCP_SOURCES "src/raw_tcp.c")
+    message(STATUS "Raw TCP API mode enabled")
+else()
+    set(RAW_TCP_SOURCES "")
+endif()
+
 idf_component_register(
     SRCS
         "src/esphttpd.c"
@@ -24,6 +32,7 @@ idf_component_register(
         "src/router_api.c"
         "src/template.c"
         "src/send_buffer.c"
+        ${RAW_TCP_SOURCES}
         ${FILESYSTEM_SOURCES}
     INCLUDE_DIRS
         "include"           # Public API

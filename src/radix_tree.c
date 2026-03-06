@@ -484,8 +484,9 @@ void radix_lookup(radix_tree_t* tree, const char* path,
                   http_method_t method, bool is_websocket,
                   radix_match_t* result,
                   httpd_middleware_t* mw_out, uint8_t* mw_count_out) {
-    // Initialize only the fields checked before being set
+    // Initialize result fields for early-return safety
     result->matched = false;
+    result->handler = NULL;
     result->param_count = 0;
 
     if (mw_count_out) *mw_count_out = 0;
@@ -638,8 +639,7 @@ void radix_lookup(radix_tree_t* tree, const char* path,
         }
 
         if (!strict_ok) {
-            ESP_LOGD(TAG, "Strict mode: trailing slash mismatch (path=%d, route=%d)",
-                     path_has_trailing_slash, node->handlers->has_trailing_slash);
+            ESP_LOGD(TAG, "Strict mode: trailing slash mismatch for route");
         } else if (is_websocket && node->handlers->has_ws) {
             result->matched = true;
             result->ws_handler = node->handlers->ws_handler;

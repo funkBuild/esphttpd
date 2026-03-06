@@ -3,6 +3,11 @@
 #include "connection.h"
 #include "esp_log.h"
 #include <string.h>
+
+// Event loop tests are socket-specific (fd_sets, select_timeout, listen_fd)
+// Skip entirely under raw TCP API mode
+#ifndef CONFIG_HTTPD_USE_RAW_API
+
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -383,3 +388,12 @@ void test_event_loop_run(void) {
 
     ESP_LOGI(TAG, "Event Loop tests completed");
 }
+
+#else // CONFIG_HTTPD_USE_RAW_API
+
+// Stub test runner when raw API is enabled
+void test_event_loop_run(void) {
+    // Event loop tests are socket-specific, skipped under raw TCP API mode
+}
+
+#endif // CONFIG_HTTPD_USE_RAW_API

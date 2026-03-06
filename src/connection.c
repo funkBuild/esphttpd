@@ -38,6 +38,13 @@ void connection_cleanup_closed(connection_pool_t* pool)
             // Selective field reset instead of expensive memset
             conn->fd = -1;
             conn->state = CONN_STATE_FREE;
+#ifdef CONFIG_HTTPD_USE_RAW_API
+            conn->raw.pcb = NULL;
+            conn->raw.recv_chain = NULL;
+            conn->raw.recv_offset = 0;
+            conn->raw.unacked_bytes = 0;
+            conn->raw.write_pending = false;
+#endif
 
             // Clear bitmasks using pre-isolated bit
             uint32_t clear_bit = ~bit;
@@ -46,6 +53,35 @@ void connection_cleanup_closed(connection_pool_t* pool)
             pool->ws_active_mask &= clear_bit;
         }
     }
+}
+
+// Allocate a free connection slot without accepting a socket
+// Used by both socket and raw API paths
+connection_t* connection_alloc_slot(connection_pool_t* pool)
+{
+    if (!pool) return NULL;
+
+    // Find first free slot using O(1) bit manipulation
+    uint32_t free_mask = ~pool->active_mask;
+    if (free_mask == 0) {
+        return NULL;
+    }
+
+    int i = __builtin_ctz(free_mask);
+    if (i >= MAX_CONNECTIONS) {
+        return NULL;
+    }
+
+    connection_t* conn = &pool->connections[i];
+
+    memset(conn, 0, sizeof(connection_t));
+    conn->fd = -1;
+    conn->state = CONN_STATE_NEW;
+    conn->pool_index = i;
+
+    connection_mark_active(pool, i);
+
+    return conn;
 }
 
 connection_t* connection_accept(connection_pool_t* pool, int listen_fd)

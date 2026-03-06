@@ -118,10 +118,11 @@ typedef struct {
     uint8_t value_len;
 } test_req_header_entry_t;
 
-// Per-connection request context (must match esphttpd.c)
+// Per-connection request context (must match esphttpd.c request_context_t EXACTLY)
+// Fields are ordered: zero-target group first, then scratch buffers after _zero_end
 typedef struct {
+    // === Fields that NEED zeroing per request (memset target) ===
     httpd_req_t req;                      // Public request struct
-    test_req_header_entry_t headers[MAX_REQ_HEADERS];  // Header index
     char* header_buf;                     // Header storage (dynamically allocated)
     char* uri_buf;                        // URI storage (dynamically allocated)
     struct httpd_server* server;          // Back pointer to server
@@ -138,11 +139,6 @@ typedef struct {
     bool parsing_in_progress;             // True while headers are being accumulated
     bool recv_buf_is_heap;                // true if recv_buf was malloc'd (needs free)
     bool uri_buf_is_heap;                 // true if uri_buf was malloc'd (needs free)
-    // Inline buffers to eliminate per-request malloc for common cases
-    uint8_t inline_recv_buf[512];         // Embedded buffer for single-packet requests
-    char inline_uri_buf[128];             // Embedded buffer for typical URI lengths
-    // Query parameter cache (lazy parsing)
-    test_query_param_entry_t query_params[MAX_QUERY_PARAMS];
     uint8_t query_param_count;
     bool query_parsed;
     // Deferred (async) body handling
@@ -173,6 +169,13 @@ typedef struct {
         httpd_req_continuation_t cont;    // Continuation state
         bool active;                      // Continuation mode active
     } continuation;
+    char _zero_end[0];                    // Marker: memset stops here
+
+    // === Scratch buffers that DON'T need zeroing per request ===
+    test_req_header_entry_t headers[MAX_REQ_HEADERS];  // Header index
+    uint8_t inline_recv_buf[512];         // Embedded buffer for single-packet requests
+    char inline_uri_buf[64];             // Embedded buffer for typical URI lengths
+    test_query_param_entry_t query_params[MAX_QUERY_PARAMS];
     // Middleware chain (persists for request lifetime, safe across deferred handlers)
     httpd_middleware_t mw_chain[CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE];
 } test_request_context_t;
@@ -184,6 +187,12 @@ extern void* g_test_request_contexts;
 // Global connection_send_buffers pointer array accessible to tests
 // Points to send_buffer_t*[MAX_CONNECTIONS] - pointers into pre-allocated backing storage
 extern void* g_test_send_buffers;
+
+#ifdef CONFIG_HTTPD_USE_RAW_API
+#include "raw_tcp.h"
+// Tests can install a mock for raw_tcp_write to capture output
+// See raw_tcp.h: raw_tcp_set_write_mock()
+#endif
 
 #endif // CONFIG_ESPHTTPD_TEST_MODE
 

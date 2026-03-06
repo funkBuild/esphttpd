@@ -1,9 +1,18 @@
 #ifndef _CORE_CONNECTION_H_
 #define _CORE_CONNECTION_H_
 
+#include "sdkconfig.h"
+
 #include <stdint.h>
 #include <stdbool.h>
+#ifndef CONFIG_HTTPD_USE_RAW_API
 #include <sys/socket.h>
+#endif
+
+#ifdef CONFIG_HTTPD_USE_RAW_API
+struct tcp_pcb;  // Forward declaration
+struct pbuf;     // Forward declaration
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -51,12 +60,28 @@ typedef enum {
     WS_OPCODE_PONG         = 0xA
 } ws_opcode_internal_t;
 
+#ifdef CONFIG_HTTPD_USE_RAW_API
+// Raw TCP connection state (replaces socket fd)
+typedef struct {
+    struct tcp_pcb *pcb;         // lwIP TCP protocol control block
+    struct pbuf *recv_chain;     // Pending received pbuf chain
+    uint16_t recv_offset;        // Read offset into current pbuf
+    uint32_t unacked_bytes;      // Bytes written but not yet acked
+    bool write_pending;          // tcp_write data waiting for output
+} raw_tcp_conn_t;
+#endif
+
 // Connection structure - naturally aligned for zero-penalty access on Xtensa
 // Fields ordered by alignment: 32-bit, 16-bit, 8-bit, bitfields
 // ~40 bytes per connection (vs ~36 packed), eliminates unaligned access traps
 typedef struct {
     // 32-bit aligned fields (24 bytes)
+#ifdef CONFIG_HTTPD_USE_RAW_API
+    raw_tcp_conn_t raw;          // Raw TCP connection state
+    int fd;                      // Compatibility: always -1 under raw API
+#else
     int fd;                      // Socket file descriptor
+#endif
     uint32_t content_length;     // Expected content length (supports up to 4GB)
     uint32_t bytes_received;     // Bytes received for current message
     uint32_t ws_mask_key;        // WebSocket masking key (when masked)
@@ -106,6 +131,7 @@ typedef struct {
 void connection_pool_init(connection_pool_t* pool);
 connection_t* connection_accept(connection_pool_t* pool, int listen_fd);
 connection_t* connection_find(connection_pool_t* pool, int fd);
+connection_t* connection_alloc_slot(connection_pool_t* pool);
 connection_t* connection_get(connection_pool_t* pool, int index);
 int connection_get_index(connection_pool_t* pool, connection_t* conn);
 void connection_close(connection_pool_t* pool, connection_t* conn);
