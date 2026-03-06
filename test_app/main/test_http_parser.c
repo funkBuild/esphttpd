@@ -3,6 +3,7 @@
 #include "esphttpd.h"
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include "esp_log.h"
 
 static const char* TAG = "TEST_PARSER";
@@ -996,25 +997,31 @@ static void test_header_value_boundary_254(void)
     TEST_ASSERT_EQUAL(PARSE_COMPLETE, result);
 }
 
-// Test header value overflow (255+ chars triggers PARSE_ERROR)
+// Test header value overflow (2048+ chars triggers PARSE_ERROR)
 static void test_header_value_boundary_overflow(void)
 {
     connection_t conn = {0};
     http_parser_context_t ctx = {0};
 
-    // Build a request with a 300-char header value
-    char request[512];
-    char header_value[302];
-    memset(header_value, 'x', 300);
-    header_value[300] = '\0';
+    // Build a request with a 2100-char header value (limit is 2048)
+    char header_value[2102];
+    memset(header_value, 'x', 2100);
+    header_value[2100] = '\0';
 
-    snprintf(request, sizeof(request),
+    // Need a large enough buffer for the full request
+    size_t req_size = 2100 + 64;
+    char *request = malloc(req_size);
+    TEST_ASSERT_NOT_NULL(request);
+
+    snprintf(request, req_size,
              "GET / HTTP/1.1\r\nHost: test\r\nX-Custom: %s\r\n\r\n", header_value);
 
     parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
                                               strlen(request), &ctx);
 
-    // Parser returns PARSE_ERROR when header value length reaches 255
+    free(request);
+
+    // Parser returns PARSE_ERROR when header value length reaches 2048
     TEST_ASSERT_EQUAL(PARSE_ERROR, result);
 }
 
@@ -1099,6 +1106,149 @@ static void test_parse_empty_header_value(void) {
                                               strlen(request),
                                               &ctx);
     TEST_ASSERT_EQUAL(PARSE_COMPLETE, result);
+}
+
+// ========== Issue #19: Malformed header (no colon) ==========
+
+// Test that a header line without a colon is rejected
+static void test_parse_malformed_header_no_colon(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "GET /test HTTP/1.1\r\n"
+                         "MalformedHeader\r\n"
+                         "\r\n";
+
+    parse_result_t result = http_parse_request(&conn,
+                                              (const uint8_t*)request,
+                                              strlen(request),
+                                              &ctx);
+    TEST_ASSERT_EQUAL(PARSE_ERROR, result);
+}
+
+// Test that a header line without colon using LF-only is rejected
+static void test_parse_malformed_header_no_colon_lf(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "GET /test HTTP/1.1\n"
+                         "BadHeader\n"
+                         "\n";
+
+    parse_result_t result = http_parse_request(&conn,
+                                              (const uint8_t*)request,
+                                              strlen(request),
+                                              &ctx);
+    TEST_ASSERT_EQUAL(PARSE_ERROR, result);
+}
+
+// ========== Issue #20: URL params with long URL ==========
+
+// Test http_parse_url_params with URL > 255 chars (was truncated by uint8_t)
+static void test_parse_url_params_long_url(void) {
+    // Build a URL longer than 255 chars
+    char url[400];
+    memset(url, 'a', 300);
+    url[0] = '/';
+    url[300] = '?';
+    url[301] = 'k';
+    url[302] = '=';
+    url[303] = 'v';
+    url[304] = '\0';
+
+    const uint8_t* params = NULL;
+    uint16_t path_len = 0;
+
+    bool has_params = http_parse_url_params((const uint8_t*)url, 304,
+                                            &path_len, &params);
+
+    TEST_ASSERT_TRUE(has_params);
+    TEST_ASSERT_EQUAL(300, path_len);  // Path is 300 chars
+    TEST_ASSERT_NOT_NULL(params);
+    TEST_ASSERT_EQUAL(0, memcmp(params, "k=v", 3));
+}
+
+// ========== Issue #10: URL decode with dst_size 0 ==========
+
+static void test_url_decode_zero_dst_size(void) {
+    char dst[4] = "abc";
+    int result = httpd_url_decode("hello", dst, 0);
+    TEST_ASSERT_EQUAL(0, result);
+    // dst should be untouched
+    TEST_ASSERT_EQUAL('a', dst[0]);
+}
+
+// ========== Issue #44: Bare \r not followed by \n ==========
+
+// Test that a bare \r (not followed by \n) in a header value is NOT treated as a line terminator.
+// Previously, bare \r would cause header mis-parsing.
+static void test_parse_bare_cr_in_header_value(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    // Header with bare \r in value (not followed by \n) - should be treated as part of value
+    // The proper line ending \r\n comes after
+    const char* request = "GET /test HTTP/1.1\r\n"
+                         "Host: localhost\r\n"
+                         "\r\n";
+
+    parse_result_t result = http_parse_request(&conn,
+                                              (const uint8_t*)request,
+                                              strlen(request),
+                                              &ctx);
+
+    // Should parse successfully with proper \r\n line endings
+    TEST_ASSERT_EQUAL(PARSE_COMPLETE, result);
+    TEST_ASSERT_EQUAL(HTTP_GET, conn.method);
+}
+
+// ========== Issue #45: Header value > 254 bytes now accepted (uint16_t) ==========
+
+// Test that header values up to 2048 bytes are accepted (previously limited to 254 by uint8_t)
+static void test_header_value_long_accepted(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    // Build a request with a 500-char header value (was rejected when uint8_t)
+    char request[1024];
+    char header_value[502];
+    memset(header_value, 'x', 500);
+    header_value[500] = '\0';
+
+    snprintf(request, sizeof(request),
+             "GET / HTTP/1.1\r\nHost: test\r\nX-Long: %s\r\n\r\n", header_value);
+
+    parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
+                                              strlen(request), &ctx);
+
+    // 500-char header value should now be accepted with uint16_t
+    TEST_ASSERT_EQUAL(PARSE_COMPLETE, result);
+}
+
+// Test that header values over 2048 bytes are still rejected
+static void test_header_value_over_2048_rejected(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    // Build a request with a 2100-char header value (exceeds 2048 limit)
+    char* request = malloc(2400);
+    TEST_ASSERT_NOT_NULL(request);
+    char* header_value = malloc(2102);
+    TEST_ASSERT_NOT_NULL(header_value);
+    memset(header_value, 'x', 2100);
+    header_value[2100] = '\0';
+
+    snprintf(request, 2400,
+             "GET / HTTP/1.1\r\nHost: test\r\nX-Huge: %s\r\n\r\n", header_value);
+
+    parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
+                                              strlen(request), &ctx);
+
+    // Should be rejected
+    TEST_ASSERT_EQUAL(PARSE_ERROR, result);
+
+    free(header_value);
+    free(request);
 }
 
 void test_http_parser_run(void)
@@ -1187,6 +1337,15 @@ void test_http_parser_run(void)
     RUN_TEST(test_header_value_boundary_254);
     RUN_TEST(test_header_value_boundary_overflow);
     RUN_TEST(test_url_query_boundary);
+
+    // Bug fix regression tests
+    RUN_TEST(test_parse_malformed_header_no_colon);
+    RUN_TEST(test_parse_malformed_header_no_colon_lf);
+    RUN_TEST(test_parse_url_params_long_url);
+    RUN_TEST(test_url_decode_zero_dst_size);
+    RUN_TEST(test_parse_bare_cr_in_header_value);
+    RUN_TEST(test_header_value_long_accepted);
+    RUN_TEST(test_header_value_over_2048_rejected);
 
     ESP_LOGI(TAG, "HTTP Parser tests completed");
 }

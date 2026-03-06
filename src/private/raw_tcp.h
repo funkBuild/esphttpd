@@ -37,7 +37,8 @@ void raw_tcp_output(connection_t* conn);
 
 // Close a raw TCP connection
 // Clears all callbacks, closes PCB
-void raw_tcp_close(connection_t* conn);
+// Returns true if the PCB was aborted (caller must return ERR_ABRT to lwIP)
+bool raw_tcp_close(connection_t* conn);
 
 // Close the listening PCB and all active connections
 void raw_tcp_stop(event_loop_t* loop);

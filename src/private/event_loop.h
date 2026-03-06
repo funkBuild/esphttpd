@@ -27,6 +27,7 @@ typedef struct {
     uint32_t select_timeout_ms;     // Select timeout in milliseconds
     size_t io_buffer_size;          // I/O buffer size (typically 1024)
 #endif
+    uint16_t ws_close_timeout_ms;       // WebSocket close handshake timeout (0 = default 5s)
     bool nodelay;                   // TCP_NODELAY option
     bool reuseaddr;                 // SO_REUSEADDR option
 } event_loop_config_t;
@@ -42,6 +43,7 @@ typedef struct {
     event_loop_config_t config;     // Configuration
     uint32_t tick_count;            // Tick counter for timeouts
     uint32_t timeout_ticks;         // Precomputed timeout in ticks
+    uint32_t ws_close_timeout_ticks; // Precomputed WS close handshake timeout in ticks
 #ifndef CONFIG_HTTPD_USE_RAW_API
     struct timeval select_timeout;  // Precomputed select timeout struct
 #endif

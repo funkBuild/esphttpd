@@ -11,9 +11,10 @@
 static const char TAG[] = "WS_FRAME";
 static const char WS_GUID[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-// Send function callback - set by server to route through send_nonblocking().
-// When NULL, falls back to blocking write() (used in tests with mock fd=-1).
-static ws_send_func_t s_send_func = NULL;
+// Send function callback - set once by httpd_start() and cleared by httpd_stop().
+// No synchronization needed: writes occur only during server lifecycle transitions,
+// never concurrently with reads from the send path.
+static volatile ws_send_func_t s_send_func = NULL;
 
 void ws_set_send_func(ws_send_func_t func) {
     s_send_func = func;
@@ -102,6 +103,12 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
         uint8_t opcode = first_byte & 0x0F;
         bool fin = (first_byte & 0x80) != 0;
 
+        // RSV bits must be 0 (no extensions negotiated)
+        if (__builtin_expect(first_byte & 0x70, 0)) {
+            ESP_LOGE(TAG, "RSV bits set without extension: 0x%x", first_byte);
+            return WS_FRAME_ERROR;
+        }
+
         // Validate opcode
         if (__builtin_expect(opcode > WS_OPCODE_PONG ||
             (opcode >= 0x3 && opcode <= 0x7), 0)) {
@@ -129,6 +136,7 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
             conn->ws_payload_read = 0;
             ctx->payload_received = 0;
             i = 6;
+            ctx->state = WS_STATE_PAYLOAD;
             // Fall through to PAYLOAD state handling below
             goto fast_payload;
         }
@@ -140,6 +148,12 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
                 uint8_t first_byte = buffer[i];
                 conn->ws_fin = ws_is_final_frame(first_byte);
                 conn->ws_opcode = ws_get_opcode(first_byte);
+
+                // RSV bits must be 0 (no extensions negotiated)
+                if (__builtin_expect(first_byte & 0x70, 0)) {
+                    ESP_LOGE(TAG, "RSV bits set without extension: 0x%x", first_byte);
+                    return WS_FRAME_ERROR;
+                }
 
                 // Validate opcode (invalid opcodes are rare - use branch hint)
                 if (__builtin_expect(conn->ws_opcode > WS_OPCODE_PONG ||
@@ -284,16 +298,13 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
                                   conn->ws_mask_key, ctx->payload_received);
                 }
 
-                // Handle control frames immediately (they use the buffer directly)
                 if (is_control) {
-                    ws_frame_result_t result = ws_handle_control_frame(conn,
-                                                                      conn->ws_opcode,
-                                                                      &buffer[i],
-                                                                      to_process);
-                    if (result == WS_FRAME_CLOSE) {
-                        *bytes_consumed = i + to_process;
-                        return WS_FRAME_CLOSE;
+                    // Buffer control frame payload (max 125 bytes) to avoid
+                    // sending partial PONGs when payload splits across calls
+                    if (!ensure_payload_buffer(ctx, conn->ws_payload_len > 0 ? conn->ws_payload_len : 1)) {
+                        return WS_FRAME_ERROR;
                     }
+                    memcpy(ctx->payload_buffer + ctx->payload_received, &buffer[i], to_process);
                 } else {
                     // Copy unmasked data to payload buffer for data frames
                     memcpy(ctx->payload_buffer + ctx->payload_received, &buffer[i], to_process);
@@ -303,6 +314,15 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
                 i += to_process;
 
                 if (ctx->payload_received >= conn->ws_payload_len) {
+                    // Handle control frames only when fully received
+                    if (is_control) {
+                        ws_frame_result_t ctrl_result = ws_handle_control_frame(conn,
+                            conn->ws_opcode, ctx->payload_buffer, ctx->payload_received);
+                        if (ctrl_result == WS_FRAME_CLOSE || ctrl_result == WS_FRAME_ERROR) {
+                            *bytes_consumed = i;
+                            return ctrl_result;
+                        }
+                    }
                     // Frame complete - sync ws_payload_read only when needed
                     conn->ws_payload_read = ctx->payload_received;
                     ctx->state = WS_STATE_COMPLETE;
@@ -334,25 +354,29 @@ void ws_mask_payload(uint8_t* __restrict payload, size_t len, uint32_t mask_key,
     const uint8_t* mask_bytes = (const uint8_t*)&mask_key;
     size_t i = 0;
 
-    // Handle bytes until both payload pointer AND mask rotation are aligned
-    // We need (offset + i) % 4 == 0 AND payload + i aligned for the fast path
-    // Process byte-by-byte until BOTH are aligned (worst case: 7 bytes)
-    while (i < len && (((uintptr_t)(payload + i) & 3) != 0 || ((offset + i) & 3) != 0)) {
+    // Handle bytes until mask rotation is aligned to 4-byte boundary
+    // Once (offset + i) % 4 == 0, we can XOR with the full mask_key word
+    while (i < len && ((offset + i) & 3) != 0) {
         payload[i] ^= mask_bytes[(offset + i) & 3];
         i++;
     }
 
-    // Fast path: Process 8 bytes at a time (unrolled for better ILP)
-    // Now both pointer and mask rotation are aligned
-    for (; i + 8 <= len; i += 8) {
-        *(uint32_t*)(payload + i) ^= mask_key;
-        *(uint32_t*)(payload + i + 4) ^= mask_key;
-    }
+    // Check if payload pointer is 4-byte aligned for word-at-a-time XOR
+    bool aligned = ((uintptr_t)(payload + i) & 3) == 0;
 
-    // Handle remaining 4-byte chunk
-    if (i + 4 <= len) {
-        *(uint32_t*)(payload + i) ^= mask_key;
-        i += 4;
+    // Fast path: Process 8 bytes at a time (unrolled for better ILP)
+    // Only use word-at-a-time when payload pointer is aligned
+    if (aligned) {
+        for (; i + 8 <= len; i += 8) {
+            *(uint32_t*)(payload + i) ^= mask_key;
+            *(uint32_t*)(payload + i + 4) ^= mask_key;
+        }
+
+        // Handle remaining 4-byte chunk
+        if (i + 4 <= len) {
+            *(uint32_t*)(payload + i) ^= mask_key;
+            i += 4;
+        }
     }
 
     // Handle final 0-3 bytes with correct mask offset
@@ -408,6 +432,11 @@ int ws_send_frame(connection_t* conn, ws_opcode_internal_t opcode, const uint8_t
     }
 
     size_t total_len = header_len + payload_len;
+
+    // Guard against int return truncation
+    if (total_len > (size_t)INT32_MAX) {
+        return -1;
+    }
 
     // Build complete frame into a single buffer to ensure atomic send.
     // For small frames (<=256 bytes), use the stack. For larger frames,
@@ -480,7 +509,16 @@ ws_frame_result_t ws_handle_control_frame(connection_t* conn,
     if (!conn) return WS_FRAME_ERROR;
 
     switch (opcode) {
-        case WS_OPCODE_CLOSE:
+        case WS_OPCODE_CLOSE: {
+            // Validate close frame status code per RFC 6455 Section 7.4
+            if (payload_len >= 2) {
+                uint16_t code = ((uint16_t)payload[0] << 8) | payload[1];
+                if (code < 1000 || code == 1004 || code == 1005 ||
+                    code == 1006 || code == 1015 || code >= 5000) {
+                    ESP_LOGE(TAG, "Invalid close status code: %u", code);
+                    return WS_FRAME_ERROR;
+                }
+            }
             // Only echo close frame if this is a client-initiated close.
             // If we're in WS_CLOSING state, the server already sent a close
             // frame and this is the client's acknowledgment (RFC 6455 5.5.1).
@@ -488,6 +526,7 @@ ws_frame_result_t ws_handle_control_frame(connection_t* conn,
                 ws_send_close(conn, 0, NULL);
             }
             return WS_FRAME_CLOSE;
+        }
 
         case WS_OPCODE_PING:
             // Respond with pong
@@ -504,6 +543,8 @@ ws_frame_result_t ws_handle_control_frame(connection_t* conn,
 }
 
 int ws_compute_accept_key(const char* client_key, char* accept_key, size_t accept_key_size, size_t* out_len) {
+    if (!client_key || !accept_key) return -1;
+
     // Streaming SHA1: feed client key and GUID separately to avoid concat buffer
     size_t key_len = strlen(client_key);
 

@@ -402,6 +402,25 @@ static void test_router_on_error_null_router(void) {
     TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, err);
 }
 
+// ========== Issue #3: Method bounds check ==========
+
+static void test_router_route_invalid_method(void) {
+    httpd_router_t router = httpd_router_create();
+    TEST_ASSERT_NOT_NULL(router);
+
+    // HTTP_ANY + 1 is out of bounds
+    httpd_err_t err = httpd_router_route(router, "/test", (http_method_t)(HTTP_ANY + 1),
+                                          test_handler, NULL);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, err);
+
+    // Negative method
+    err = httpd_router_route(router, "/test", (http_method_t)(-1),
+                              test_handler, NULL);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, err);
+
+    httpd_router_destroy(router);
+}
+
 // ==================== Test Runner ====================
 
 void test_router_api_run(void) {
@@ -457,6 +476,9 @@ void test_router_api_run(void) {
     RUN_TEST(test_httpd_on_error_null_server);
     RUN_TEST(test_router_on_error);
     RUN_TEST(test_router_on_error_null_router);
+
+    // Bug fix regression tests
+    RUN_TEST(test_router_route_invalid_method);
 
     ESP_LOGI(TAG, "Router API tests completed");
 }

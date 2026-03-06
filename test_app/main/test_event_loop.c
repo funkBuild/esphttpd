@@ -364,6 +364,95 @@ static void test_websocket_fd_set(void) {
     TEST_ASSERT_TRUE(connection_is_ws_active(&pool, 0));
 }
 
+// ========== Issue #35: Config validation defaults ==========
+
+static void test_config_zero_timeout_gets_default(void) {
+    event_loop_t loop = {0};
+    connection_pool_t pool = {0};
+
+    event_loop_config_t config = {
+        .timeout_ms = 0,         // Zero should get default 30000
+        .backlog = 0,            // Zero should get default 5
+        .select_timeout_ms = 1000,
+        .io_buffer_size = 1024,
+    };
+
+    event_loop_init(&loop, &pool, &config);
+
+    TEST_ASSERT_EQUAL(30000, loop.config.timeout_ms);
+    TEST_ASSERT_EQUAL(5, loop.config.backlog);
+}
+
+// ========== Issue #43: WS close timeout configurable ==========
+
+static void test_ws_close_timeout_configurable(void) {
+    event_loop_t loop = {0};
+    connection_pool_t pool = {0};
+
+    event_loop_config_t config = {
+        .timeout_ms = 30000,
+        .select_timeout_ms = 1000,
+        .io_buffer_size = 1024,
+        .ws_close_timeout_ms = 10000,  // 10 second WS close timeout
+    };
+
+    event_loop_init(&loop, &pool, &config);
+
+    TEST_ASSERT_EQUAL(10000, loop.config.ws_close_timeout_ms);
+    // ws_close_timeout_ticks = 10000 / 1000 = 10
+    TEST_ASSERT_EQUAL(10, loop.ws_close_timeout_ticks);
+}
+
+static void test_ws_close_timeout_zero_gets_default(void) {
+    event_loop_t loop = {0};
+    connection_pool_t pool = {0};
+
+    event_loop_config_t config = {
+        .timeout_ms = 30000,
+        .select_timeout_ms = 1000,
+        .io_buffer_size = 1024,
+        .ws_close_timeout_ms = 0,  // Zero should get default 5000ms
+    };
+
+    event_loop_init(&loop, &pool, &config);
+
+    TEST_ASSERT_EQUAL(5000, loop.config.ws_close_timeout_ms);
+    // ws_close_timeout_ticks = 5000 / 1000 = 5
+    TEST_ASSERT_EQUAL(5, loop.ws_close_timeout_ticks);
+}
+
+// ========== Issue #43: WS close timeout used by check_timeouts ==========
+
+static void test_ws_closing_uses_shorter_timeout(void) {
+    event_loop_t loop = {0};
+    connection_pool_t pool = {0};
+
+    event_loop_config_t config = {
+        .timeout_ms = 30000,
+        .select_timeout_ms = 1000,
+        .io_buffer_size = 1024,
+        .ws_close_timeout_ms = 3000,  // 3 second WS close timeout
+    };
+
+    event_loop_init(&loop, &pool, &config);
+
+    // Set up a WS_CLOSING connection
+    connection_t* conn = &pool.connections[0];
+    conn->fd = 10;
+    conn->state = CONN_STATE_WS_CLOSING;
+    conn->last_activity = 0;
+    connection_mark_active(&pool, 0);
+    // WS_CLOSING should NOT be in ws_active_mask (so timeout check sees it)
+
+    // Advance tick_count past WS close timeout (3 ticks) but not general timeout (30 ticks)
+    loop.tick_count = 5;
+
+    event_loop_check_timeouts(&loop);
+
+    // Should have been timed out (5 > 3 ticks)
+    TEST_ASSERT_EQUAL(CONN_STATE_CLOSED, conn->state);
+}
+
 // ==================== TEST RUNNER ====================
 
 void test_event_loop_run(void) {
@@ -385,6 +474,12 @@ void test_event_loop_run(void) {
     RUN_TEST(test_handlers_null_safety);
     RUN_TEST(test_timeout_ticks);
     RUN_TEST(test_websocket_fd_set);
+
+    // Bug fix regression tests
+    RUN_TEST(test_config_zero_timeout_gets_default);
+    RUN_TEST(test_ws_close_timeout_configurable);
+    RUN_TEST(test_ws_close_timeout_zero_gets_default);
+    RUN_TEST(test_ws_closing_uses_shorter_timeout);
 
     ESP_LOGI(TAG, "Event Loop tests completed");
 }

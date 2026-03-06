@@ -865,6 +865,79 @@ static void test_start_file_replaces_existing(void)
     send_buffer_free(&sb);
 }
 
+// ========== Issue #61: send_buffer_space doesn't underflow if size == 0 ==========
+
+static void test_space_zero_size_no_underflow(void)
+{
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+
+    // Manually create inconsistent state: buffer non-NULL but size == 0
+    uint8_t dummy;
+    sb.buffer = &dummy;
+    sb.size = 0;
+
+    // Should return 0, not underflow to SIZE_MAX
+    size_t space = send_buffer_space(&sb);
+    TEST_ASSERT_EQUAL_MESSAGE(0, space,
+        "send_buffer_space should return 0 when size is 0, not underflow");
+
+    // Restore to valid state before any cleanup
+    sb.buffer = NULL;
+}
+
+// ========== Issue #41: send_buffer_queue NULL data check ==========
+
+static void test_queue_null_data(void)
+{
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+    send_buffer_alloc(&sb);
+
+    // Queue with NULL data should return -1
+    ssize_t result = send_buffer_queue(&sb, NULL, 10);
+    TEST_ASSERT_EQUAL_MESSAGE(-1, result,
+        "Queue with NULL data should return -1");
+
+    // Buffer should still be empty
+    TEST_ASSERT_FALSE(send_buffer_has_data(&sb));
+    TEST_ASSERT_EQUAL(0, send_buffer_pending(&sb));
+
+    send_buffer_free(&sb);
+}
+
+// ========== Issue #42: send_buffer_commit bounds check ==========
+
+static void test_commit_exceeds_space(void)
+{
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+    send_buffer_alloc(&sb);
+
+    // Get available space
+    size_t space = send_buffer_space(&sb);
+    TEST_ASSERT_GREATER_THAN(0, space);
+
+    // Try to commit more than available space - should be clamped
+    send_buffer_commit(&sb, space + 100);
+
+    // Pending should be clamped to available space, not overflow
+    size_t pending = send_buffer_pending(&sb);
+    TEST_ASSERT_LESS_OR_EQUAL_MESSAGE(space, pending,
+        "Commit should be clamped to available space");
+
+    send_buffer_free(&sb);
+}
+
+// ========== Issue #31: send_buffer_consume NULL safety ==========
+
+static void test_consume_null_sb(void)
+{
+    // Calling consume with NULL should not crash
+    send_buffer_consume(NULL, 10);
+    TEST_PASS();
+}
+
 void test_send_buffer_run(void)
 {
     // Basic functionality tests
@@ -907,5 +980,11 @@ void test_send_buffer_run(void)
     RUN_TEST(test_free_closes_file);
     RUN_TEST(test_start_file_replaces_existing);
 
-    ESP_LOGI(TAG, "Send buffer tests completed (32 tests)");
+    // Bug fix regression tests
+    RUN_TEST(test_queue_null_data);
+    RUN_TEST(test_commit_exceeds_space);
+    RUN_TEST(test_space_zero_size_no_underflow);
+    RUN_TEST(test_consume_null_sb);
+
+    ESP_LOGI(TAG, "Send buffer tests completed (36 tests)");
 }

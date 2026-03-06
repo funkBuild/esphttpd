@@ -48,8 +48,7 @@ typedef struct {
     // 1-byte fields (packed together, no padding)
     uint8_t method_len;
     uint8_t header_key_len;
-    uint8_t header_value_len;
-    bool expect_body;       // Expecting body based on method/headers
+    uint16_t header_value_len;
     // Arrays at end
     char ws_client_key[32]; // Per-parse WebSocket client key
 } http_parser_context_t;
@@ -82,20 +81,20 @@ parse_result_t http_parse_request(connection_t* conn,
 
 // Process a single header (called by parser)
 void http_process_header(connection_t* conn,
-                        const uint8_t* key, uint8_t key_len,
-                        const uint8_t* value, uint8_t value_len,
+                        const uint8_t* key, uint16_t key_len,
+                        const uint8_t* value, uint16_t value_len,
                         http_parser_context_t* parser_ctx);
 
 // Utility functions for header processing
-header_type_t http_identify_header(const uint8_t* key, uint8_t len);
+header_type_t http_identify_header(const uint8_t* key, uint16_t len);
 http_method_t http_parse_method(const uint8_t* method, uint8_t len);
 
 // Fast header value parsers
-uint32_t http_parse_content_length(const uint8_t* value, uint8_t len);
-bool http_parse_keep_alive(const uint8_t* value, uint8_t len);
+uint32_t http_parse_content_length(const uint8_t* value, uint16_t len);
+bool http_parse_keep_alive(const uint8_t* value, uint16_t len);
 
 // URL parsing utilities
-bool http_parse_url_params(const uint8_t* url, uint8_t len,
+bool http_parse_url_params(const uint8_t* url, uint16_t len,
                           uint16_t* path_len,
                           const uint8_t** params);
 
@@ -121,7 +120,7 @@ static inline bool is_whitespace(uint8_t c) {
 // Case-insensitive comparison for header names
 // Uses bitwise OR with 0x20 for fast ASCII lowercase conversion
 // Optimized: uses single index for both arrays, reducing register pressure
-static inline bool header_equals(const uint8_t* header, uint8_t len, const char* str) {
+static inline bool header_equals(const uint8_t* header, uint16_t len, const char* str) {
     size_t i = 0;
     while (str[i]) {
         if (__builtin_expect(i >= len, 0)) return false;

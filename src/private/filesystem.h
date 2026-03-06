@@ -67,6 +67,7 @@ typedef struct {
     char base_path[32];
     uint8_t base_path_len;           // Cached strlen(base_path) for fast path building
     uint8_t open_files;
+    uint8_t max_open_files;          // Maximum concurrent open files (0 = unlimited)
 } filesystem_t;
 
 // Initialize LittleFS with default configuration

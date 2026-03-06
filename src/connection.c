@@ -1,6 +1,9 @@
 #include "private/connection.h"
 #include <string.h>
 #include "esp_log.h"
+#ifdef CONFIG_HTTPD_USE_RAW_API
+#include "lwip/pbuf.h"
+#endif
 
 // Connection pool functions that aren't in event_loop.c
 // These are simple utility functions for connection management
@@ -28,9 +31,8 @@ void connection_cleanup_closed(connection_pool_t* pool)
     uint32_t mask = pool->active_mask;
     connection_t* base = pool->connections;  // Cache base pointer for efficient indexing
     while (mask) {
-        // Bit isolation: extract lowest set bit directly (1 cycle vs CTZ+shift)
-        uint32_t bit = mask & -mask;
-        int i = __builtin_ctz(bit);  // Get index from isolated bit
+        int i = __builtin_ctz(mask);
+        uint32_t bit = 1U << i;
         mask &= mask - 1;  // Clear lowest set bit
 
         connection_t* conn = base + i;
@@ -38,9 +40,14 @@ void connection_cleanup_closed(connection_pool_t* pool)
             // Selective field reset instead of expensive memset
             conn->fd = -1;
             conn->state = CONN_STATE_FREE;
+            conn->user_ctx = NULL;
 #ifdef CONFIG_HTTPD_USE_RAW_API
             conn->raw.pcb = NULL;
-            conn->raw.recv_chain = NULL;
+            if (conn->raw.recv_chain) {
+                struct pbuf* chain = conn->raw.recv_chain;
+                conn->raw.recv_chain = NULL;  // Clear before free to prevent double-free
+                pbuf_free(chain);
+            }
             conn->raw.recv_offset = 0;
             conn->raw.unacked_bytes = 0;
             conn->raw.write_pending = false;

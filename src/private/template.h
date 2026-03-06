@@ -36,6 +36,10 @@ typedef struct {
     uint8_t var_name_len;       // Current variable name length
     uint8_t delim_pos;          // Position in delimiter matching
     char var_name[32];          // Variable name buffer
+
+    // Owned copies of delimiter strings (config.start_delim/end_delim point here)
+    char start_delim_buf[8];
+    char end_delim_buf[8];
 } template_context_t;
 
 // Template processing results

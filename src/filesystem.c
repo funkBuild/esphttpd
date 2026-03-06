@@ -120,9 +120,11 @@ int filesystem_init(filesystem_t* fs, const filesystem_config_t* config) {
 
     // Store configuration
     strncpy(fs->base_path, config->base_path, sizeof(fs->base_path) - 1);
+    fs->base_path[sizeof(fs->base_path) - 1] = '\0';
     fs->base_path_len = (uint8_t)strlen(fs->base_path);
     fs->mounted = true;
     fs->open_files = 0;
+    fs->max_open_files = (config->max_open_files <= 255) ? (uint8_t)config->max_open_files : 255;
 
     // Get filesystem info
     size_t total = 0, used = 0;
@@ -231,7 +233,8 @@ bool filesystem_get_metadata(filesystem_t* fs,
         }
     }
 
-    metadata->size = st.st_size;
+    // Clamp file size to uint32_t range (files > 4GB not supported)
+    metadata->size = (st.st_size <= UINT32_MAX) ? (uint32_t)st.st_size : UINT32_MAX;
     metadata->mtime = st.st_mtime;
     metadata->is_directory = S_ISDIR(st.st_mode);
     metadata->is_gzipped = is_gzipped;
@@ -260,11 +263,16 @@ bool filesystem_validate_path(const char* path) {
         if (c == '.' && prev == '.') return false;
         if (c == '/' && prev == '/') return false;
         if (c == '%' && p[1] && p[2]) {
+            // Validate hex digits
+            char h1 = p[1], h2 = p[2];
+            bool valid_hex = ((h1 >= '0' && h1 <= '9') || ((h1 | 0x20) >= 'a' && (h1 | 0x20) <= 'f'))
+                          && ((h2 >= '0' && h2 <= '9') || ((h2 | 0x20) >= 'a' && (h2 | 0x20) <= 'f'));
+            if (!valid_hex) return false;
             // Check percent-encoded dangerous chars
-            char c1 = p[1], c2 = p[2] | 0x20;  // lowercase the second hex digit
+            char c1 = h1, c2 = h2 | 0x20;  // lowercase the second hex digit
             if ((c1 == '2' && (c2 == 'e' || c2 == 'f')) ||  // %2e=. %2f=/
                 (c1 == '5' && c2 == 'c') ||                  // %5c=backslash
-                (c1 == '0' && p[2] == '0')) return false;     // %00=null
+                (c1 == '0' && h2 == '0')) return false;       // %00=null
         }
         prev = c;
     }
@@ -275,6 +283,7 @@ int filesystem_serve_file(filesystem_t* fs,
                          connection_t* conn,
                          const char* path,
                          bool use_template) {
+    (void)use_template;  // TODO: template processing not yet implemented
     if (!fs->mounted) {
         return -1;
     }
@@ -320,9 +329,14 @@ int filesystem_send_file(filesystem_t* fs,
                         connection_t* conn,
                         const char* path,
                         file_metadata_t* metadata) {
-    (void)fs;    // No longer needed: path is pre-built in metadata
     (void)path;  // Path is now pre-built in metadata->full_path
     const char* full_path = metadata->full_path;
+
+    // Enforce max_open_files limit
+    if (fs->max_open_files > 0 && fs->open_files >= fs->max_open_files) {
+        ESP_LOGW(TAG, "Max open files limit reached (%u)", fs->max_open_files);
+        return -1;
+    }
 
     // Open file
     int file_fd = open(full_path, O_RDONLY);
@@ -330,6 +344,7 @@ int filesystem_send_file(filesystem_t* fs,
         ESP_LOGE(TAG, "Failed to open file: %s", full_path);
         return -1;
     }
+    if (fs->open_files < 255) fs->open_files++;
 
     // Send HTTP headers: memcpy static parts + dynamic mime_type and size
     char headers[512];
@@ -374,9 +389,11 @@ int filesystem_send_file(filesystem_t* fs,
         // Ownership of file_fd transfers to the stream function (it will close it).
         if (s_file_stream_func(conn, file_fd, metadata->size) < 0) {
             close(file_fd);
+            if (fs->open_files > 0) fs->open_files--;
             return -1;
         }
-        return (int)metadata->size;
+        if (fs->open_files > 0) fs->open_files--;
+        return (metadata->size <= (uint32_t)INT_MAX) ? (int)metadata->size : INT_MAX;
     }
 
     // Fallback: blocking read/send loop (for tests without server infrastructure)
@@ -386,6 +403,7 @@ int filesystem_send_file(filesystem_t* fs,
                                            buffer, sizeof(buffer));
 
     close(file_fd);
+    if (fs->open_files > 0) fs->open_files--;
     return total_sent;
 }
 
@@ -420,6 +438,6 @@ int filesystem_stream_file(int file_fd,
         total_sent += sent_from_buffer;
     }
 
-    return total_sent;
+    return (total_sent <= (size_t)INT_MAX) ? (int)total_sent : INT_MAX;
 }
 

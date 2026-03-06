@@ -79,7 +79,7 @@ static inline size_t send_buffer_pending(send_buffer_t* sb) {
 
 // Get available space
 static inline size_t send_buffer_space(send_buffer_t* sb) {
-    if (!sb->buffer) return 0;
+    if (!sb->buffer || sb->size == 0) return 0;
     return sb->size - send_buffer_pending(sb) - 1;  // -1 to distinguish full from empty
 }
 
@@ -100,6 +100,8 @@ static inline size_t send_buffer_write_ptr(send_buffer_t* sb, uint8_t** ptr) {
 // Commit written data (advance head after zero-copy write)
 // Uses bitmask since buffer size is enforced to be power of 2
 static inline void send_buffer_commit(send_buffer_t* sb, size_t len) {
+    size_t space = send_buffer_space(sb);
+    if (len > space) len = space;
     sb->head = (sb->head + len) & (sb->size - 1);
 }
 

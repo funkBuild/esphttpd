@@ -24,6 +24,7 @@ static const event_loop_config_t default_config = {
     .select_timeout_ms = 1000,   // 1 second select timeout
     .io_buffer_size = 1024,      // 1KB I/O buffer
 #endif
+    .ws_close_timeout_ms = 5000, // 5 second WS close handshake timeout
     .nodelay = true,             // Disable Nagle's algorithm
     .reuseaddr = true            // Allow address reuse
 };
@@ -36,15 +37,24 @@ void event_loop_init(event_loop_t* loop, connection_pool_t* pool, const event_lo
     memset(loop, 0, sizeof(event_loop_t));
     loop->pool = pool;
     loop->config = *config;
+    // Validate configuration
+    if (loop->config.timeout_ms == 0) loop->config.timeout_ms = 30000;
+    if (loop->config.backlog == 0) loop->config.backlog = 5;
+    if (loop->config.ws_close_timeout_ms == 0) loop->config.ws_close_timeout_ms = 5000;
 #ifdef CONFIG_HTTPD_USE_RAW_API
     loop->listen_pcb = NULL;
     // Compute timeout in poll intervals (each poll = CONFIG_HTTPD_RAW_POLL_INTERVAL * 500ms)
     uint32_t poll_interval_ms = CONFIG_HTTPD_RAW_POLL_INTERVAL * 500;
-    loop->timeout_ticks = config->timeout_ms / (poll_interval_ms > 0 ? poll_interval_ms : 1000);
+    uint32_t divisor = poll_interval_ms > 0 ? poll_interval_ms : 1000;
+    loop->timeout_ticks = config->timeout_ms / divisor;
+    loop->ws_close_timeout_ticks = loop->config.ws_close_timeout_ms / divisor;
 #else
     loop->listen_fd = -1;
     // Precompute timeout in ticks (avoid division in hot path)
-    loop->timeout_ticks = config->timeout_ms / config->select_timeout_ms;
+    loop->timeout_ticks = config->select_timeout_ms > 0
+        ? config->timeout_ms / config->select_timeout_ms : config->timeout_ms;
+    loop->ws_close_timeout_ticks = config->select_timeout_ms > 0
+        ? loop->config.ws_close_timeout_ms / config->select_timeout_ms : 5;
     // Precompute select timeout struct (avoid repeated struct construction)
     loop->select_timeout.tv_sec = config->select_timeout_ms / 1000;
     loop->select_timeout.tv_usec = (config->select_timeout_ms % 1000) * 1000;
@@ -110,6 +120,13 @@ int event_loop_create_listener(event_loop_t* loop) {
         return -1;
     }
 
+    // Reject listen fd that would overflow fd_set
+    if (fd >= FD_SETSIZE) {
+        ESP_LOGE(TAG, "Listen fd %d >= FD_SETSIZE (%d)", fd, FD_SETSIZE);
+        close(fd);
+        return -1;
+    }
+
     loop->listen_fd = fd;
     ESP_LOGI(TAG, "Server listening on port %d", loop->config.port);
     return fd;
@@ -124,6 +141,13 @@ static void handle_new_connection(event_loop_t* loop, const event_handlers_t* ha
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
             ESP_LOGE(TAG, "Accept failed: %s", strerror(errno));
         }
+        return;
+    }
+
+    // Reject fds that would overflow fd_set (FD_SET with fd >= FD_SETSIZE is UB)
+    if (client_fd >= FD_SETSIZE) {
+        ESP_LOGE(TAG, "Accepted fd %d >= FD_SETSIZE (%d), rejecting", client_fd, FD_SETSIZE);
+        close(client_fd);
         return;
     }
 
@@ -189,7 +213,15 @@ static void handle_connection_data(event_loop_t* loop, connection_t* conn,
             && handlers->on_ws_disconnect) {
             handlers->on_ws_disconnect(conn);
         }
+        // Mark closed immediately so next select() doesn't monitor this fd
         conn->state = CONN_STATE_CLOSED;
+        if (handlers->on_disconnect) {
+            handlers->on_disconnect(conn);
+        }
+        close(conn->fd);
+        connection_mark_inactive(loop->pool, conn->pool_index);
+        connection_mark_write_pending(loop->pool, conn->pool_index, false);
+        connection_mark_ws_inactive(loop->pool, conn->pool_index);
         return;
     }
 
@@ -202,7 +234,10 @@ static void handle_connection_data(event_loop_t* loop, connection_t* conn,
             if (handlers->on_http_request) {
                 handlers->on_http_request(conn, buffer, bytes);
             }
-            loop->total_requests++;
+            // Only count new requests, not continuation segments
+            if (conn->state != CONN_STATE_HTTP_HEADERS) {
+                loop->total_requests++;
+            }
             break;
 
         case CONN_STATE_HTTP_BODY:
@@ -230,9 +265,6 @@ static void handle_connection_data(event_loop_t* loop, connection_t* conn,
     }
 }
 
-// WebSocket close handshake timeout: 5 ticks (~5 seconds with default 1s select timeout)
-#define WS_CLOSE_TIMEOUT_TICKS 5
-
 void event_loop_check_timeouts(event_loop_t* loop) {
     // Use precomputed timeout_ticks (avoid division in hot path)
     uint32_t timeout_ticks = loop->timeout_ticks;
@@ -250,7 +282,7 @@ void event_loop_check_timeouts(event_loop_t* loop) {
 
         // Use shorter timeout for WebSocket close handshake (RFC 6455)
         uint32_t effective_timeout = (conn->state == CONN_STATE_WS_CLOSING)
-            ? WS_CLOSE_TIMEOUT_TICKS : timeout_ticks;
+            ? loop->ws_close_timeout_ticks : timeout_ticks;
 
         if (loop->tick_count - conn->last_activity > effective_timeout) {
             ESP_LOGD(TAG, "Connection [%d] timed out%s", i,
@@ -292,7 +324,8 @@ int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, u
             }
             close(conn->fd);
             connection_mark_inactive(loop->pool, i);
-            connection_mark_write_pending(loop->pool, i, false);  // Clear write pending
+            connection_mark_write_pending(loop->pool, i, false);
+            connection_mark_ws_inactive(loop->pool, i);
             ESP_LOGD(TAG, "Connection [%d] closed", i);
             continue;
         }
@@ -323,10 +356,12 @@ int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, u
         return -1;
     }
 
+    // Always increment tick_count and check timeouts, even when there's activity.
+    // Otherwise connections are never timed out under sustained load (slow-loris).
+    loop->tick_count++;
+    event_loop_check_timeouts(loop);
+
     if (activity == 0) {
-        // Timeout - check connection timeouts
-        loop->tick_count++;
-        event_loop_check_timeouts(loop);
         return 0;
     }
 
@@ -388,6 +423,12 @@ void event_loop_run(event_loop_t* loop, const event_handlers_t* handlers) {
 
     while (loop->running) {
         event_loop_iteration(loop, handlers, loop->io_buffer);
+    }
+
+    // Close listening socket
+    if (loop->listen_fd >= 0) {
+        close(loop->listen_fd);
+        loop->listen_fd = -1;
     }
 
     // Free I/O buffer when loop stops

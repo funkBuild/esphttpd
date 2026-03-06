@@ -62,7 +62,7 @@ void send_buffer_reset(send_buffer_t* sb) {
 }
 
 ssize_t send_buffer_queue(send_buffer_t* __restrict sb, const void* __restrict data, size_t len) {
-    if (!sb->buffer || len == 0) {
+    if (!sb->buffer || !data || len == 0) {
         return -1;
     }
 
@@ -110,7 +110,7 @@ size_t send_buffer_peek(send_buffer_t* sb, const uint8_t** data) {
 }
 
 void send_buffer_consume(send_buffer_t* sb, size_t len) {
-    if (len == 0) return;
+    if (!sb || !sb->buffer || len == 0) return;
 
     size_t pending = send_buffer_pending(sb);
     if (len > pending) {
@@ -132,13 +132,19 @@ bool send_buffer_start_file(send_buffer_t* sb, int file_fd, size_t file_size) {
         return false;
     }
 
+    // Clamp file_size to uint32_t capacity
+    if (file_size > UINT32_MAX) {
+        ESP_LOGW(TAG, "File size %zu exceeds uint32_t, clamping", file_size);
+        file_size = UINT32_MAX;
+    }
+
     // Close any existing file
     if (sb->file_fd >= 0) {
         close(sb->file_fd);
     }
 
     sb->file_fd = file_fd;
-    sb->file_remaining = file_size;
+    sb->file_remaining = (uint32_t)file_size;
     sb->streaming = 1;
 
     ESP_LOGD(TAG, "Started file stream: fd=%d, size=%zu", file_fd, file_size);

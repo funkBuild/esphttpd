@@ -207,7 +207,7 @@ typedef struct {
     const char* key;                 ///< Parameter name (e.g., "id")
     const char* value;               ///< Parameter value (e.g., "123")
     uint8_t key_len;
-    uint8_t value_len;
+    uint16_t value_len;
 } httpd_param_t;
 
 /**

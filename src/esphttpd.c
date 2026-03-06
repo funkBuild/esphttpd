@@ -85,8 +85,8 @@ static const char TAG[] = "ESPHTTPD";
 typedef struct {
     uint16_t key_offset;
     uint16_t value_offset;
-    uint8_t key_len;
-    uint8_t value_len;
+    uint16_t key_len;
+    uint16_t value_len;
 } req_header_entry_t;
 
 // HTTP route entry (new API)
@@ -109,7 +109,7 @@ typedef struct {
 // Mounted router entry
 typedef struct {
     const char* prefix;
-    uint8_t prefix_len;
+    uint16_t prefix_len;
     httpd_router_t router;  // httpd_router_t is already a pointer type
 } mounted_router_t;
 
@@ -187,7 +187,10 @@ struct httpd_server {
 
     // State
     bool initialized;
-    bool running;
+    volatile bool running;     // Read/written from different tasks
+#ifndef CONFIG_HTTPD_USE_RAW_API
+    volatile bool task_exited;  // Set by server_task before vTaskDelete
+#endif
 };
 
 // Free channel hash table if allocated
@@ -323,18 +326,18 @@ static send_buffer_t* preallocated_send_buffers;
 // Global server instance (for now - could be made multi-instance later)
 static struct httpd_server server_instance;
 #ifdef CONFIG_ESPHTTPD_TEST_MODE
-struct httpd_server* g_server = NULL;  // Non-static for test access
+struct httpd_server* volatile g_server = NULL;  // Non-static for test access
 void* g_test_request_contexts = NULL;  // Non-static for test access
 void* g_test_send_buffers = NULL;      // Non-static for test access
 #else
-static struct httpd_server* g_server = NULL;
+static struct httpd_server* volatile g_server = NULL;
 #endif
 static filesystem_t fs_instance;
 
 // Forward declarations
 static request_context_t* get_request_context(connection_t* conn);
-static void store_header_in_req(request_context_t* ctx, const uint8_t* key, uint8_t key_len,
-                                const uint8_t* value, uint8_t value_len);
+static void store_header_in_req(request_context_t* ctx, const uint8_t* key, uint16_t key_len,
+                                const uint8_t* value, uint16_t value_len);
 
 // ============================================================================
 // Forward Declarations
@@ -389,6 +392,11 @@ static void file_io_worker_task(void* pvParameters) {
             continue;
         }
 
+        // Sentinel: file_fd == -1 means stop the worker
+        if (req.file_fd < 0) {
+            break;
+        }
+
         file_io_result_t result = {
             .pool_index = req.pool_index,
             .bytes_read = read(req.file_fd, req.dest, req.max_len)
@@ -417,6 +425,9 @@ static void file_io_worker_task(void* pvParameters) {
         }
         HTTPD_UNLOCK_TCPIP();
     }
+
+    // Worker received stop sentinel - self-delete
+    vTaskDelete(NULL);
 }
 
 static void file_io_worker_start(void) {
@@ -430,8 +441,16 @@ static void file_io_worker_start(void) {
 }
 
 static void file_io_worker_stop(void) {
-    if (s_file_io_task) {
-        vTaskDelete(s_file_io_task);
+    if (s_file_io_task && s_file_io_request_queue) {
+        // Send sentinel to tell the worker to exit gracefully
+        file_io_request_t stop_req = { .file_fd = -1 };
+        xQueueSend(s_file_io_request_queue, &stop_req, pdMS_TO_TICKS(100));
+
+        // Wait for the task to delete itself (up to 1 second)
+        for (int i = 0; i < 100 && s_file_io_task; i++) {
+            if (eTaskGetState(s_file_io_task) == eDeleted) break;
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
         s_file_io_task = NULL;
     }
     if (s_file_io_request_queue) {
@@ -695,13 +714,19 @@ static const char* get_status_line(int status, char* fallback_buf, size_t fallba
         case 500: *out_len = sizeof(status_line_500) - 1; return status_line_500;
         default: {
             static const char prefix[] = "HTTP/1.1 ";
+            // Clamp status to valid HTTP range to prevent buffer overflow
+            unsigned int safe_status = (status >= 100 && status <= 999)
+                ? (unsigned int)status : 500;
             char* p = fallback_buf;
             memcpy(p, prefix, sizeof(prefix) - 1);
             p += sizeof(prefix) - 1;
-            p += format_uint(p, (size_t)status);
+            p += format_uint(p, safe_status);
             *p++ = ' ';
             const char* text = httpd_status_text(status);
             size_t text_len = strlen(text);
+            if (text_len > fallback_size - (size_t)(p - fallback_buf) - 2) {
+                text_len = fallback_size - (size_t)(p - fallback_buf) - 2;
+            }
             memcpy(p, text, text_len);
             p += text_len;
             *p++ = '\r'; *p++ = '\n';
@@ -803,6 +828,7 @@ static inline int8_t hex_val(char c) {
 
 // Length-bounded URL decode for non-null-terminated substrings (e.g., query parameter values)
 static int httpd_url_decode_n(const char* src, size_t src_len, char* dst, size_t dst_size) {
+    if (dst_size == 0) return 0;
     size_t dst_idx = 0;
 
     for (size_t i = 0; i < src_len && dst_idx < dst_size - 1; i++) {
@@ -977,8 +1003,8 @@ static void init_request_context(request_context_t* ctx, connection_t* conn) {
 
 // Store header in request context (called from http_parser via extern)
 void esphttpd_store_header(connection_t* conn,
-                           const uint8_t* key, uint8_t key_len,
-                           const uint8_t* value, uint8_t value_len) {
+                           const uint8_t* key, uint16_t key_len,
+                           const uint8_t* value, uint16_t value_len) {
     if (!conn || !g_server) return;
 
     request_context_t* ctx = get_request_context(conn);
@@ -989,12 +1015,13 @@ void esphttpd_store_header(connection_t* conn,
 
 // New header storage that works with request context
 // Dynamically allocates and grows header buffer as needed
-static void store_header_in_req(request_context_t* ctx, const uint8_t* key, uint8_t key_len,
-                                const uint8_t* value, uint8_t value_len) {
+static void store_header_in_req(request_context_t* ctx, const uint8_t* key, uint16_t key_len,
+                                const uint8_t* value, uint16_t value_len) {
     if (ctx->req.header_count >= MAX_REQ_HEADERS) return;
 
-    size_t needed = key_len + 1 + value_len + 1;
+    size_t needed = (size_t)key_len + 1 + (size_t)value_len + 1;
     size_t required = ctx->req.header_buf_used + needed;
+    if (required < needed) return;  // Overflow check
 
     // Allocate or grow header buffer if needed
     if (required > ctx->req.header_buf_size) {
@@ -1182,6 +1209,7 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
     ESP_LOGI(TAG, "Server started in raw TCP API mode (no server task)");
 #else
     // Start the server task
+    server->task_exited = false;
     BaseType_t ret = xTaskCreate(server_task, "httpd",
                                   cfg.stack_size, server,
                                   cfg.task_priority, NULL);
@@ -1226,6 +1254,12 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
 #else
     event_loop_stop(&server->event_loop);
 
+#ifndef CONFIG_ESPHTTPD_TEST_MODE
+    // Wait for server task to finish its current iteration and exit
+    while (!server->task_exited) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
     // Close all active connections
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         if (connection_is_active(&server->connection_pool, i)) {
@@ -1234,16 +1268,21 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
         }
     }
 #endif
+#endif
 
     // Free per-connection dynamic sub-buffers
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
 
         // Free dynamically-allocated sub-buffers within pre-allocated contexts
         if (request_contexts[i]) {
-            free(request_contexts[i]->uri_buf);
+            if (request_contexts[i]->uri_buf_is_heap) {
+                free(request_contexts[i]->uri_buf);
+            }
             free(request_contexts[i]->header_buf);
             free(request_contexts[i]->body_buf);
-            free(request_contexts[i]->recv_buf);
+            if (request_contexts[i]->recv_buf_is_heap) {
+                free(request_contexts[i]->recv_buf);
+            }
             request_contexts[i] = NULL;
         }
 
@@ -1296,6 +1335,12 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
     // Clear WebSocket send callback
     ws_set_send_func(NULL);
 
+    // Unmount filesystem if enabled
+    if (server->filesystem_enabled && server->filesystem) {
+        filesystem_unmount(server->filesystem);
+        server->filesystem_enabled = false;
+    }
+
     // Clear filesystem send callbacks
     fs_set_send_func(NULL);
     fs_set_file_stream_func(NULL);
@@ -1321,6 +1366,7 @@ static void server_task(void* pvParameters) {
     struct httpd_server* server = (struct httpd_server*)pvParameters;
     event_loop_run(&server->event_loop, &server->handlers);
     server->running = false;
+    server->task_exited = true;
     vTaskDelete(NULL);
 }
 #endif
@@ -1465,6 +1511,9 @@ static httpd_err_t send_cors_preflight(httpd_req_t* req, connection_t* conn, con
     memcpy(resp_buf + pos, acao_prefix, sizeof(acao_prefix) - 1);
     pos += sizeof(acao_prefix) - 1;
     size_t origin_len = strlen(cors_origin);
+    // Clamp origin to prevent buffer overflow
+    size_t max_origin = sizeof(resp_buf) - pos - sizeof(cors_headers) - 2;
+    if (origin_len > max_origin) origin_len = max_origin;
     memcpy(resp_buf + pos, cors_origin, origin_len);
     pos += origin_len;
     resp_buf[pos++] = '\r';
@@ -1583,8 +1632,8 @@ int httpd_req_recv(httpd_req_t* req, void* buf, size_t len) {
     if (!conn) return -1;
 
     // Check if we have remaining content to receive
+    if (req->body_received >= req->content_length) return 0;
     size_t remaining = req->content_length - req->body_received;
-    if (remaining == 0) return 0;
 
     // Get the request context (which contains pre-received body data)
     request_context_t* ctx = (request_context_t*)((char*)req - offsetof(request_context_t, req));
@@ -1620,7 +1669,8 @@ int httpd_req_recv(httpd_req_t* req, void* buf, size_t len) {
     // - Raw API: only pre-buffered body data is available (no socket to recv from).
     //   Callers must use deferred or continuation handling for large bodies.
     // - Socket API: do a single non-blocking recv from socket.
-    remaining = req->content_length - req->body_received;
+    remaining = (req->body_received < req->content_length)
+              ? req->content_length - req->body_received : 0;
 #ifdef CONFIG_HTTPD_USE_RAW_API
     // Under raw API, all body data arrives via recv_cb and is placed in body_buf.
     // If body_buf is exhausted, caller must use httpd_req_defer() or continuation.
@@ -1961,6 +2011,10 @@ httpd_err_t httpd_resp_send_error(httpd_req_t* req, int status, const char* mess
     req->status_code = status;
     const char* msg = message ? message : httpd_status_text(status);
     size_t msg_len = strlen(msg);
+
+    // Clamp message length to fit in response buffer
+    // Header overhead: ~100 bytes (status line + content-type + content-length + CRLF)
+    if (msg_len > 256) msg_len = 256;
 
     // Build entire error response in a single buffer to avoid multiple send calls.
     // Format: status_line + Content-Type + Content-Length + blank line + body
@@ -2729,6 +2783,9 @@ httpd_err_t httpd_resp_send_auth_challenge(httpd_req_t* req, const char* realm) 
     static const char auth_prefix[] = "Basic realm=\"";
     memcpy(auth_value, auth_prefix, sizeof(auth_prefix) - 1);
     size_t realm_len = strlen(actual_realm);
+    // Clamp realm_len to prevent buffer overflow (prefix + realm + closing quote + null)
+    size_t max_realm = sizeof(auth_value) - sizeof(auth_prefix) - 1;  // -1 for closing quote
+    if (realm_len > max_realm) realm_len = max_realm;
     memcpy(auth_value + sizeof(auth_prefix) - 1, actual_realm, realm_len);
     auth_value[sizeof(auth_prefix) - 1 + realm_len] = '"';
     auth_value[sizeof(auth_prefix) + realm_len] = '\0';
@@ -2973,6 +3030,10 @@ static int find_or_create_channel(const char* channel) {
                 return -1;
             }
 
+            if (strlen(channel) >= sizeof(entry->name)) {
+                ESP_LOGW(TAG, "Channel name '%s' truncated to %d chars",
+                         channel, (int)(sizeof(entry->name) - 1));
+            }
             strncpy(entry->name, channel, sizeof(entry->name) - 1);
             entry->name[sizeof(entry->name) - 1] = '\0';
             entry->index = g_server->channel_count++;
@@ -3539,7 +3600,7 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
             if (param_count > 0) {
                 memcpy(ctx->req.params, match.params, param_count * sizeof(httpd_param_t));
             }
-            ctx->req.param_count = match.param_count;
+            ctx->req.param_count = param_count;
 
             // Build middleware chain: server global only (no router middleware for legacy routes)
             uint8_t mw_count = g_server->middleware_count;
@@ -3574,7 +3635,7 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
         if (param_count > 0) {
             memcpy(ctx->req.params, match.params, param_count * sizeof(httpd_param_t));
         }
-        ctx->req.param_count = match.param_count;
+        ctx->req.param_count = param_count;
 
         // Build middleware chain: server global + router + route using memcpy
         uint8_t mw_count = 0;
@@ -3676,7 +3737,7 @@ static void on_http_body(connection_t* conn, uint8_t* buffer, size_t len) {
             ESP_LOGW(TAG, "Continuation handler returned error: %d", err);
             ctx->continuation.active = false;
             conn->continuation = 0;
-            conn->state = CONN_STATE_CLOSING;
+            conn->state = CONN_STATE_CLOSED;
         } else if (err == HTTPD_OK) {
             // Handler finished successfully
             ctx->continuation.active = false;
@@ -3689,9 +3750,10 @@ static void on_http_body(connection_t* conn, uint8_t* buffer, size_t len) {
     // Handle deferred body reception
     if (!ctx->defer.active) return;
 
-    // Skip if paused (flow control)
+    // Skip if paused (flow control) - still track bytes to avoid hanging on content-length
     if (ctx->defer.paused) {
-        ESP_LOGD(TAG, "Deferred body paused, ignoring %zu bytes", len);
+        ESP_LOGW(TAG, "Deferred body paused, discarding %zu bytes", len);
+        ctx->req.body_received += len;
         return;
     }
 
@@ -3706,7 +3768,7 @@ static void on_http_body(connection_t* conn, uint8_t* buffer, size_t len) {
             }
             ctx->defer.active = false;
             conn->deferred = 0;
-            conn->state = CONN_STATE_CLOSING;
+            conn->state = CONN_STATE_CLOSED;
             return;
         }
     }
@@ -3835,7 +3897,9 @@ static void on_ws_disconnect(connection_t* conn) {
 
     ws_ctx->route->handler(&ws_ctx->ws, &event);
     ws_ctx->ws.connected = false;
-    ws_ctx->channel_mask = 0;  // Clear all channel subscriptions
+
+    // Decrement subscriber_count for each channel before clearing mask
+    httpd_ws_leave_all(&ws_ctx->ws);
 
     // Clear active WebSocket flag - O(1) using pool_index
     if (g_server) {

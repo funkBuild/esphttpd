@@ -144,8 +144,9 @@ static radix_node_t* radix_find_static_child_internal(radix_node_t* node, const 
     if (__builtin_expect(!node || !segment || segment_len == 0, 0)) return NULL;
 
     // Unified binary search - single loop reduces I-cache pressure
+    if (node->child_count == 0) return NULL;
     int left = 0;
-    int right = node->child_count - 1;
+    int right = (int)node->child_count - 1;
 
     while (left <= right) {
         int mid = (left + right) >> 1;  // Bit shift faster than division
@@ -190,7 +191,8 @@ httpd_err_t radix_insert_static_child(radix_node_t* node, radix_node_t* child) {
 
     // Grow children array if needed
     if (node->child_count >= node->child_capacity) {
-        uint8_t new_capacity = node->child_capacity == 0 ? 4 : node->child_capacity * 2;
+        uint8_t new_capacity = node->child_capacity == 0 ? 4
+            : (node->child_capacity <= 127 ? node->child_capacity * 2 : 255);
         radix_node_t** new_children = (radix_node_t**)realloc(
             node->children, new_capacity * sizeof(radix_node_t*));
         if (!new_children) {
@@ -239,6 +241,7 @@ httpd_err_t radix_insert(radix_tree_t* tree, const char* pattern,
                          void* user_ctx, httpd_middleware_t* middlewares,
                          uint8_t middleware_count) {
     if (!tree || !pattern || !handler) return HTTPD_ERR_INVALID_ARG;
+    if (method < 0 || method > HTTP_ANY) return HTTPD_ERR_INVALID_ARG;
 
     ESP_LOGD(TAG, "Inserting route: pattern='%s', method=%d", pattern, method);
 
@@ -293,7 +296,7 @@ httpd_err_t radix_insert(radix_tree_t* tree, const char* pattern,
             child = node->wildcard_child;
         } else {
             // Static child
-            child = radix_find_static_child(node, seg_start, seg_len);
+            child = radix_find_static_child_internal(node, seg_start, seg_len, tree->case_sensitive);
             if (!child) {
                 child = radix_node_create(seg_start, seg_len, type);
                 if (!child) return HTTPD_ERR_NO_MEM;
@@ -351,6 +354,10 @@ httpd_err_t radix_insert(radix_tree_t* tree, const char* pattern,
         if (!node->middlewares) {
             node->middlewares = (httpd_middleware_t*)malloc(
                 middleware_count * sizeof(httpd_middleware_t));
+            if (!node->middlewares) {
+                ESP_LOGE(TAG, "Failed to allocate middleware array");
+                return HTTPD_ERR_NO_MEM;
+            }
         } else {
             // Merge with existing middleware
             uint8_t new_count = node->middleware_count + middleware_count;
@@ -359,9 +366,13 @@ httpd_err_t radix_insert(radix_tree_t* tree, const char* pattern,
             }
             httpd_middleware_t* new_mw = (httpd_middleware_t*)realloc(
                 node->middlewares, new_count * sizeof(httpd_middleware_t));
-            if (new_mw) {
-                node->middlewares = new_mw;
+            if (!new_mw) {
+                ESP_LOGE(TAG, "Failed to realloc middleware array");
+                return HTTPD_ERR_NO_MEM;
             }
+            node->middlewares = new_mw;
+            // Clamp actual copy count to available space
+            middleware_count = new_count - node->middleware_count;
         }
 
         if (node->middlewares) {
@@ -426,7 +437,7 @@ httpd_err_t radix_insert_ws(radix_tree_t* tree, const char* pattern,
             }
             child = node->wildcard_child;
         } else {
-            child = radix_find_static_child(node, seg_start, seg_len);
+            child = radix_find_static_child_internal(node, seg_start, seg_len, tree->case_sensitive);
             if (!child) {
                 child = radix_node_create(seg_start, seg_len, type);
                 if (!child) return HTTPD_ERR_NO_MEM;
@@ -462,13 +473,15 @@ httpd_err_t radix_insert_ws(radix_tree_t* tree, const char* pattern,
         if (!node->middlewares) {
             node->middlewares = (httpd_middleware_t*)malloc(
                 middleware_count * sizeof(httpd_middleware_t));
+            if (!node->middlewares) {
+                ESP_LOGE(TAG, "Failed to allocate WS middleware array");
+                return HTTPD_ERR_NO_MEM;
+            }
         }
 
-        if (node->middlewares) {
-            memcpy(node->middlewares, middlewares,
-                   middleware_count * sizeof(httpd_middleware_t));
-            node->middleware_count = middleware_count;
-        }
+        memcpy(node->middlewares, middlewares,
+               middleware_count * sizeof(httpd_middleware_t));
+        node->middleware_count = middleware_count;
     }
 
     tree->route_count++;
@@ -484,10 +497,8 @@ void radix_lookup(radix_tree_t* tree, const char* path,
                   http_method_t method, bool is_websocket,
                   radix_match_t* result,
                   httpd_middleware_t* mw_out, uint8_t* mw_count_out) {
-    // Initialize result fields for early-return safety
-    result->matched = false;
-    result->handler = NULL;
-    result->param_count = 0;
+    // Initialize all result fields for early-return safety
+    memset(result, 0, sizeof(radix_match_t));
 
     if (mw_count_out) *mw_count_out = 0;
 
@@ -530,7 +541,8 @@ void radix_lookup(radix_tree_t* tree, const char* path,
                 node = node->wildcard_child;
                 // Collect middleware from wildcard node directly into caller's buffer
                 if (mw_out && node->middleware_count > 0) {
-                    uint8_t avail = CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE - mw_count;
+                    uint8_t avail = (mw_count < CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE)
+                          ? CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE - mw_count : 0;
                     uint8_t to_copy = node->middleware_count < avail ? node->middleware_count : avail;
                     memcpy(&mw_out[mw_count], node->middlewares, to_copy * sizeof(httpd_middleware_t));
                     mw_count += to_copy;
@@ -605,7 +617,8 @@ void radix_lookup(radix_tree_t* tree, const char* path,
     collect_middleware:
         // Collect middleware from this node directly into caller's buffer
         if (mw_out && node->middleware_count > 0) {
-            uint8_t avail = CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE - mw_count;
+            uint8_t avail = (mw_count < CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE)
+                          ? CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE - mw_count : 0;
             uint8_t to_copy = node->middleware_count < avail ? node->middleware_count : avail;
             memcpy(&mw_out[mw_count], node->middlewares, to_copy * sizeof(httpd_middleware_t));
             mw_count += to_copy;
@@ -620,10 +633,13 @@ void radix_lookup(radix_tree_t* tree, const char* path,
         // Note: param is not added to result->params since it wasn't provided
         // Collect middleware from this node directly into caller's buffer
         if (mw_out && node->middleware_count > 0) {
-            uint8_t avail = CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE - mw_count;
+            uint8_t avail = (mw_count < CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE)
+                          ? CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE - mw_count : 0;
             uint8_t to_copy = node->middleware_count < avail ? node->middleware_count : avail;
-            memcpy(&mw_out[mw_count], node->middlewares, to_copy * sizeof(httpd_middleware_t));
-            mw_count += to_copy;
+            if (to_copy > 0) {
+                memcpy(&mw_out[mw_count], node->middlewares, to_copy * sizeof(httpd_middleware_t));
+                mw_count += to_copy;
+            }
         }
     }
 
@@ -646,7 +662,7 @@ void radix_lookup(radix_tree_t* tree, const char* path,
             result->ws_user_ctx = node->handlers->ws_user_ctx;
             result->is_websocket = true;
             ESP_LOGD(TAG, "Matched WebSocket route");
-        } else if (!is_websocket) {
+        } else if (!is_websocket && method >= 0 && method < 8) {
             // Direct chain check - non-null chain implies method is supported
             handler_node_t* chain = node->handlers->http_chains[method];
             if (chain) {

@@ -64,8 +64,8 @@ typedef enum {
 // Raw TCP connection state (replaces socket fd)
 typedef struct {
     struct tcp_pcb *pcb;         // lwIP TCP protocol control block
-    struct pbuf *recv_chain;     // Pending received pbuf chain
-    uint16_t recv_offset;        // Read offset into current pbuf
+    struct pbuf *recv_chain;     // Pending received pbuf chain (reserved for future buffered recv)
+    uint16_t recv_offset;        // Read offset into current pbuf (reserved for future buffered recv)
     uint32_t unacked_bytes;      // Bytes written but not yet acked
     bool write_pending;          // tcp_write data waiting for output
 } raw_tcp_conn_t;
@@ -97,8 +97,8 @@ typedef struct {
     uint16_t url_len;            // URL length
 
     // 8-bit fields (1 byte)
-    uint8_t pool_index;          // Index in connection pool (0-63) for O(1) context lookup
-                                 // Note: effective max is 32 due to uint32_t bitmasks (enforced by _Static_assert)
+    uint8_t pool_index;          // Index in connection pool (0-31) for O(1) context lookup
+                                 // Max is 32 due to uint32_t bitmasks (enforced by _Static_assert)
 
     // State and flags bitfields (1 byte)
     uint8_t state : 3;           // Connection state (3 bits)

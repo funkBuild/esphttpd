@@ -467,31 +467,30 @@ static void test_mask_payload_null_ptr(void)
 
 // Test frame with RSV bits set
 // NOTE: RSV bit validation is not implemented per RFC 6455 - frames are accepted
-// This test documents current behavior (RSV bits are ignored)
+// Issue #36: RSV bits must be rejected per RFC 6455 (no extensions negotiated)
 static void test_frame_rsv_bits_set(void)
 {
     connection_t conn = {0};
     ws_frame_context_t ctx = {0};
     size_t consumed;
 
-    // RSV1 bit set (0x40) - currently accepted (RSV validation not implemented)
+    // RSV1 bit set (0x40) - must be rejected
     uint8_t frame_rsv1[] = {0xC1, 0x00}; // FIN + RSV1 + TEXT, len=0
     ws_frame_result_t result = ws_process_frame(&conn, frame_rsv1,
                                                 sizeof(frame_rsv1), &ctx, &consumed);
-    // RSV bits are currently ignored, frame completes with zero payload
-    TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
+    TEST_ASSERT_EQUAL(WS_FRAME_ERROR, result);
 
     // RSV2 bit set (0x20)
     ctx.state = WS_STATE_OPCODE;
     uint8_t frame_rsv2[] = {0xA1, 0x00}; // FIN + RSV2 + TEXT, len=0
     result = ws_process_frame(&conn, frame_rsv2, sizeof(frame_rsv2), &ctx, &consumed);
-    TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
+    TEST_ASSERT_EQUAL(WS_FRAME_ERROR, result);
 
     // RSV3 bit set (0x10)
     ctx.state = WS_STATE_OPCODE;
     uint8_t frame_rsv3[] = {0x91, 0x00}; // FIN + RSV3 + TEXT, len=0
     result = ws_process_frame(&conn, frame_rsv3, sizeof(frame_rsv3), &ctx, &consumed);
-    TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
+    TEST_ASSERT_EQUAL(WS_FRAME_ERROR, result);
 }
 
 // Test frame with zero-length payload
@@ -726,6 +725,181 @@ static void test_ws_accept_key_uniqueness(void)
     TEST_ASSERT_NOT_EQUAL_MESSAGE(0, strcmp(accept1, accept3), "accept1 and accept3 should differ");
 }
 
+// ========== Issue #17: Fast-path goto must set ctx->state ==========
+
+// Test that fast-path partial receive correctly resumes parsing
+static void test_fast_path_partial_payload(void) {
+    connection_t conn = {0};
+    ws_frame_context_t ctx = {0};
+    size_t consumed;
+
+    // Build a masked frame with 20 bytes payload, but only provide header + 5 bytes
+    // This forces the fast path to start, but not complete, so ctx->state must be WS_STATE_PAYLOAD
+    uint8_t frame_part1[11];
+    frame_part1[0] = 0x81;         // FIN=1, TEXT
+    frame_part1[1] = 0x80 | 20;    // MASK=1, len=20
+    frame_part1[2] = 0x01;         // Mask key byte 0
+    frame_part1[3] = 0x02;         // Mask key byte 1
+    frame_part1[4] = 0x03;         // Mask key byte 2
+    frame_part1[5] = 0x04;         // Mask key byte 3
+    // Only 5 payload bytes (need 20 total)
+    memset(&frame_part1[6], 0xAA, 5);
+
+    ws_frame_result_t result = ws_process_frame(&conn, frame_part1, 11, &ctx, &consumed);
+
+    // Should need more data since only 5 of 20 payload bytes provided
+    TEST_ASSERT_EQUAL(WS_FRAME_NEED_MORE, result);
+    TEST_ASSERT_EQUAL(11, consumed);
+    // ctx->state MUST be WS_STATE_PAYLOAD so next call resumes correctly
+    TEST_ASSERT_EQUAL(WS_STATE_PAYLOAD, ctx.state);
+
+    // Now provide the remaining 15 bytes
+    uint8_t frame_part2[15];
+    memset(frame_part2, 0xBB, 15);
+
+    result = ws_process_frame(&conn, frame_part2, 15, &ctx, &consumed);
+
+    TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
+    TEST_ASSERT_EQUAL(15, consumed);
+    TEST_ASSERT_EQUAL(20, conn.ws_payload_len);
+
+    // Clean up
+    if (ctx.payload_buffer) free(ctx.payload_buffer);
+}
+
+// ========== Issue #36: RSV bits rejected in fast path ==========
+static void test_rsv_bits_fast_path_rejected(void)
+{
+    connection_t conn = {0};
+    ws_frame_context_t ctx = {0};
+    size_t consumed;
+
+    // Fast path: masked frame with RSV1 set (6+ bytes available)
+    uint8_t frame[] = {
+        0xC1, 0x82,             // FIN + RSV1 + TEXT, MASK=1, len=2
+        0x00, 0x00, 0x00, 0x00, // Mask key
+        0x41, 0x42              // Payload
+    };
+
+    ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
+                                                &ctx, &consumed);
+    TEST_ASSERT_EQUAL(WS_FRAME_ERROR, result);
+}
+
+// ========== Issue #34: Split PING payload should not send partial PONGs ==========
+static void test_split_ping_payload(void)
+{
+    connection_t conn = {0};
+    conn.fd = -1;  // Prevent actual send attempts
+    ws_frame_context_t ctx = {0};
+    size_t consumed;
+
+    // PING frame with 4-byte payload, split across two calls
+    // First part: header (opcode + length) but only 2 bytes of payload
+    uint8_t part1[] = {0x89, 0x04, 'P', 'I'};  // PING, len=4, partial payload
+
+    ws_frame_result_t result = ws_process_frame(&conn, part1, sizeof(part1),
+                                                &ctx, &consumed);
+    // Should need more data (payload not complete)
+    TEST_ASSERT_EQUAL(WS_FRAME_NEED_MORE, result);
+
+    // Second part: remaining 2 bytes of payload
+    uint8_t part2[] = {'N', 'G'};
+    result = ws_process_frame(&conn, part2, sizeof(part2), &ctx, &consumed);
+
+    // Should complete the frame and handle the control frame
+    TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
+
+    if (ctx.payload_buffer) free(ctx.payload_buffer);
+}
+
+// ========== Issue #37: NULL client_key should not crash ==========
+static void test_compute_accept_key_null(void)
+{
+    char accept[32];
+    size_t out_len;
+
+    int ret = ws_compute_accept_key(NULL, accept, sizeof(accept), &out_len);
+    TEST_ASSERT_NOT_EQUAL(0, ret);  // Should return error, not crash
+
+    ret = ws_compute_accept_key("key", NULL, 32, &out_len);
+    TEST_ASSERT_NOT_EQUAL(0, ret);
+}
+
+// ========== Issue #60: Invalid close status codes rejected ==========
+
+static void test_close_frame_invalid_status_codes(void)
+{
+    // Test code 999 (below valid range 1000-4999)
+    {
+        connection_t conn = {0};
+        ws_frame_context_t ctx = {0};
+        size_t consumed;
+        // Close frame with status code 999 (0x03E7)
+        uint8_t frame[] = {0x88, 0x02, 0x03, 0xE7};
+        ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
+                                                    &ctx, &consumed);
+        TEST_ASSERT_EQUAL_MESSAGE(WS_FRAME_ERROR, result,
+            "Close with code 999 should be rejected");
+        if (ctx.payload_buffer) free(ctx.payload_buffer);
+    }
+
+    // Test code 1004 (reserved)
+    {
+        connection_t conn = {0};
+        ws_frame_context_t ctx = {0};
+        size_t consumed;
+        uint8_t frame[] = {0x88, 0x02, 0x03, 0xEC};  // 1004
+        ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
+                                                    &ctx, &consumed);
+        TEST_ASSERT_EQUAL_MESSAGE(WS_FRAME_ERROR, result,
+            "Close with code 1004 should be rejected");
+        if (ctx.payload_buffer) free(ctx.payload_buffer);
+    }
+
+    // Test code 5000 (above valid range)
+    {
+        connection_t conn = {0};
+        ws_frame_context_t ctx = {0};
+        size_t consumed;
+        uint8_t frame[] = {0x88, 0x02, 0x13, 0x88};  // 5000
+        ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
+                                                    &ctx, &consumed);
+        TEST_ASSERT_EQUAL_MESSAGE(WS_FRAME_ERROR, result,
+            "Close with code 5000 should be rejected");
+        if (ctx.payload_buffer) free(ctx.payload_buffer);
+    }
+}
+
+static void test_close_frame_valid_status_codes(void)
+{
+    // Test code 1000 (normal closure) - should be accepted
+    {
+        connection_t conn = {0};
+        ws_frame_context_t ctx = {0};
+        size_t consumed;
+        uint8_t frame[] = {0x88, 0x02, 0x03, 0xE8};  // 1000
+        ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
+                                                    &ctx, &consumed);
+        TEST_ASSERT_EQUAL_MESSAGE(WS_FRAME_CLOSE, result,
+            "Close with code 1000 should be accepted");
+        if (ctx.payload_buffer) free(ctx.payload_buffer);
+    }
+
+    // Test code 4999 (private use, max valid) - should be accepted
+    {
+        connection_t conn = {0};
+        ws_frame_context_t ctx = {0};
+        size_t consumed;
+        uint8_t frame[] = {0x88, 0x02, 0x13, 0x87};  // 4999
+        ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
+                                                    &ctx, &consumed);
+        TEST_ASSERT_EQUAL_MESSAGE(WS_FRAME_CLOSE, result,
+            "Close with code 4999 should be accepted");
+        if (ctx.payload_buffer) free(ctx.payload_buffer);
+    }
+}
+
 void test_websocket_frame_run(void)
 {
     // Core functionality tests
@@ -775,6 +949,14 @@ void test_websocket_frame_run(void)
     RUN_TEST(test_compute_accept_key_small_buffer);
     RUN_TEST(test_compute_accept_key_empty);
     RUN_TEST(test_ws_accept_key_uniqueness);
+
+    // Bug fix regression tests
+    RUN_TEST(test_fast_path_partial_payload);
+    RUN_TEST(test_rsv_bits_fast_path_rejected);
+    RUN_TEST(test_split_ping_payload);
+    RUN_TEST(test_compute_accept_key_null);
+    RUN_TEST(test_close_frame_invalid_status_codes);
+    RUN_TEST(test_close_frame_valid_status_codes);
 
     ESP_LOGI(TAG, "WebSocket frame tests completed");
 }

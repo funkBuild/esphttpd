@@ -86,7 +86,7 @@ typedef struct {
 
     // State
     bool initialized;
-    bool running;
+    volatile bool running;
 } esphttpd_server_t;
 
 // Global server instance accessible to tests

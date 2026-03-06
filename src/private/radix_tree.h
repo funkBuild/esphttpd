@@ -100,8 +100,8 @@ struct radix_node {
     node_handlers_t* handlers;            // NULL if no route terminates here
     httpd_middleware_t* middlewares;       // Per-route middleware
 
-    // All uint8_t/bool fields packed (7 bytes + 1 padding)
-    uint8_t segment_len;
+    // Compact fields
+    uint16_t segment_len;
     uint8_t type;                         // radix_node_type_t, stored as uint8_t
     uint8_t param_name_len;
     uint8_t child_count;
@@ -136,7 +136,7 @@ typedef struct {
     const char* key;                 // Parameter name (e.g., "id")
     const char* value;               // Parameter value (e.g., "123")
     uint8_t key_len;
-    uint8_t value_len;
+    uint16_t value_len;
 } radix_param_t;
 
 /**

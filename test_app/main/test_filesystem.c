@@ -289,6 +289,28 @@ static void test_mime_type_double_extension(void) {
     TEST_ASSERT_EQUAL_STRING("application/gzip", filesystem_get_mime_type("/file.tar.gz"));
 }
 
+// ========== Issue #32: Invalid hex digits in percent-encoding ==========
+
+static void test_validate_path_percent_invalid_hex_g(void) {
+    // %GG has invalid hex digits - should be rejected
+    TEST_ASSERT_FALSE(filesystem_validate_path("/file%GG.txt"));
+}
+
+static void test_validate_path_percent_invalid_hex_zz(void) {
+    // %ZZ has invalid hex digits
+    TEST_ASSERT_FALSE(filesystem_validate_path("/path/%ZZ/file"));
+}
+
+static void test_validate_path_percent_valid_hex_uppercase(void) {
+    // %41 = 'A', valid hex - should pass
+    TEST_ASSERT_TRUE(filesystem_validate_path("/file%41.txt"));
+}
+
+static void test_validate_path_percent_valid_hex_lowercase(void) {
+    // %61 = 'a', valid hex - should pass
+    TEST_ASSERT_TRUE(filesystem_validate_path("/file%61.txt"));
+}
+
 // ============================================================================
 // Test Runner
 // ============================================================================
@@ -367,6 +389,12 @@ void test_filesystem_run(void) {
     RUN_TEST(test_mime_type_case_insensitive_html);
     RUN_TEST(test_mime_type_case_insensitive_js);
     RUN_TEST(test_mime_type_nested_path);
+
+    // Invalid hex percent-encoding tests (Issue #32)
+    RUN_TEST(test_validate_path_percent_invalid_hex_g);
+    RUN_TEST(test_validate_path_percent_invalid_hex_zz);
+    RUN_TEST(test_validate_path_percent_valid_hex_uppercase);
+    RUN_TEST(test_validate_path_percent_valid_hex_lowercase);
 
     // Additional MIME type coverage
     RUN_TEST(test_mime_type_xml);

@@ -1,5 +1,6 @@
 #include "private/template.h"
 #include <string.h>
+#include <limits.h>
 #include <unistd.h>
 #include "esp_log.h"
 
@@ -30,7 +31,27 @@ void template_init(template_context_t* ctx,
                   const template_config_t* config,
                   template_var_callback_t callback,
                   void* user_data) {
+    if (!ctx || !config) return;
     memcpy(&ctx->config, config, sizeof(template_config_t));
+
+    // Copy delimiter strings into owned buffers to prevent dangling pointers
+    if (config->start_delim && config->delim_len_start > 0) {
+        size_t len = config->delim_len_start < sizeof(ctx->start_delim_buf) - 1
+                   ? config->delim_len_start : sizeof(ctx->start_delim_buf) - 1;
+        memcpy(ctx->start_delim_buf, config->start_delim, len);
+        ctx->start_delim_buf[len] = '\0';
+        ctx->config.start_delim = ctx->start_delim_buf;
+        ctx->config.delim_len_start = len;
+    }
+    if (config->end_delim && config->delim_len_end > 0) {
+        size_t len = config->delim_len_end < sizeof(ctx->end_delim_buf) - 1
+                   ? config->delim_len_end : sizeof(ctx->end_delim_buf) - 1;
+        memcpy(ctx->end_delim_buf, config->end_delim, len);
+        ctx->end_delim_buf[len] = '\0';
+        ctx->config.end_delim = ctx->end_delim_buf;
+        ctx->config.delim_len_end = len;
+    }
+
     ctx->callback = callback;
     ctx->user_data = user_data;
     ctx->state = TEMPLATE_STATE_TEXT;
@@ -51,6 +72,14 @@ int template_process(template_context_t* ctx,
     const char* end_delim = ctx->config.end_delim;
     uint8_t delim_len_start = ctx->config.delim_len_start;
     uint8_t delim_len_end = ctx->config.delim_len_end;
+
+    // Guard against invalid delimiter config
+    if (!start_delim || !end_delim || delim_len_start == 0 || delim_len_end == 0) {
+        size_t to_copy = input_len < output_size ? input_len : output_size;
+        memcpy(output, input, to_copy);
+        return to_copy;
+    }
+
     char first_delim_char = start_delim[0];
 
     // Fast path: if in TEXT state with no partial delimiter match,
@@ -101,8 +130,14 @@ int template_process(template_context_t* ctx,
                 } else if (__builtin_expect(ctx->delim_pos > 0, 0)) {
                     // Partial delimiter match failed, output buffered chars using memcpy
                     size_t to_copy = ctx->delim_pos;
-                    if (out_pos + to_copy > output_size) {
-                        to_copy = output_size - out_pos;
+                    size_t avail = output_size - out_pos;
+                    if (to_copy > avail) {
+                        // Not enough space - output what we can, keep remainder buffered
+                        memcpy(output + out_pos, start_delim, avail);
+                        out_pos += avail;
+                        // Shift remaining delimiter chars (rare path)
+                        ctx->delim_pos -= avail;
+                        break;  // Output full, exit loop
                     }
                     memcpy(output + out_pos, start_delim, to_copy);
                     out_pos += to_copy;
@@ -125,12 +160,32 @@ int template_process(template_context_t* ctx,
 
                         // Call variable callback
                         if (ctx->callback) {
-                            int written = ctx->callback(ctx->var_name,
-                                                       output + out_pos,
-                                                       output_size - out_pos,
-                                                       ctx->user_data);
-                            if (written > 0) {
-                                out_pos += written;
+                            size_t avail = output_size - out_pos;
+                            if (ctx->config.escape_html) {
+                                // Write to temp buffer, then escape into output
+                                uint8_t tmp[128];
+                                size_t tmp_avail = sizeof(tmp) < avail ? sizeof(tmp) : avail;
+                                int written = ctx->callback(ctx->var_name,
+                                                           tmp, tmp_avail,
+                                                           ctx->user_data);
+                                if (written > 0) {
+                                    size_t src_len = ((size_t)written <= tmp_avail) ? (size_t)written : tmp_avail;
+                                    int escaped = template_escape_html(tmp, src_len,
+                                                                      output + out_pos, avail);
+                                    if (escaped > 0) out_pos += escaped;
+                                } else if (written < 0) {
+                                    ESP_LOGW(TAG, "Variable callback error for '%s'", ctx->var_name);
+                                }
+                            } else {
+                                int written = ctx->callback(ctx->var_name,
+                                                           output + out_pos,
+                                                           avail,
+                                                           ctx->user_data);
+                                if (written > 0) {
+                                    out_pos += ((size_t)written <= avail) ? (size_t)written : avail;
+                                } else if (written < 0) {
+                                    ESP_LOGW(TAG, "Variable callback error for '%s'", ctx->var_name);
+                                }
                             }
                         }
 
@@ -167,7 +222,7 @@ int template_process(template_context_t* ctx,
     // Don't null terminate - let caller handle it
     // The function should return the number of bytes written
     // without including null terminator
-    return out_pos;
+    return (out_pos <= (size_t)INT_MAX) ? (int)out_pos : INT_MAX;
 }
 
 int template_flush(template_context_t* ctx,
@@ -197,6 +252,14 @@ int template_flush(template_context_t* ctx,
             if (var_to_copy > output_size - out_pos) var_to_copy = output_size - out_pos;
             memcpy(output + out_pos, ctx->var_name, var_to_copy);
             out_pos += var_to_copy;
+        }
+
+        // Issue #51: Output partially-matched end-delimiter characters
+        if (out_pos < output_size && ctx->delim_pos > 0) {
+            size_t end_to_copy = ctx->delim_pos;
+            if (end_to_copy > output_size - out_pos) end_to_copy = output_size - out_pos;
+            memcpy(output + out_pos, ctx->config.end_delim, end_to_copy);
+            out_pos += end_to_copy;
         }
 
         // Reset state
@@ -233,12 +296,32 @@ int template_process_file(template_context_t* ctx,
                                               out_buffer,
                                               half_size);
         if (bytes_processed > 0) {
-            if (write(out_fd, out_buffer, bytes_processed) != bytes_processed) {
-                ESP_LOGE(TAG, "Failed to write output");
-                return -1;
+            ssize_t written = 0;
+            while (written < bytes_processed) {
+                ssize_t w = write(out_fd, out_buffer + written, bytes_processed - written);
+                if (w <= 0) {
+                    ESP_LOGE(TAG, "Failed to write output");
+                    return -1;
+                }
+                written += w;
             }
             total_written += bytes_processed;
         }
+    }
+
+    // Flush any trailing partial content from the state machine
+    int flushed = template_flush(ctx, out_buffer, half_size);
+    if (flushed > 0) {
+        ssize_t written = 0;
+        while (written < flushed) {
+            ssize_t w = write(out_fd, out_buffer + written, flushed - written);
+            if (w <= 0) {
+                ESP_LOGE(TAG, "Failed to write flush output");
+                return -1;
+            }
+            written += w;
+        }
+        total_written += flushed;
     }
 
     return total_written;

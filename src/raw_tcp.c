@@ -22,8 +22,9 @@
 static const char TAG[] = "RAW_TCP";
 
 // Store handlers and loop pointers for use in callbacks
-static event_loop_t* s_loop = NULL;
-static const event_handlers_t* s_handlers = NULL;
+// Volatile: written in raw_tcp_listen/raw_tcp_stop, read from lwIP callbacks
+static event_loop_t* volatile s_loop = NULL;
+static const event_handlers_t* volatile s_handlers = NULL;
 
 #ifdef CONFIG_ESPHTTPD_TEST_MODE
 static raw_tcp_write_mock_t s_write_mock = NULL;
@@ -135,13 +136,30 @@ static err_t raw_recv_cb(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t 
 
     // NULL pbuf means connection closed by remote
     if (!p) {
+        // Guard against double-disconnect
+        if (conn->state == CONN_STATE_CLOSED || conn->state == CONN_STATE_FREE) {
+            return ERR_OK;
+        }
+
         // Call WebSocket disconnect handler if applicable
         if ((conn->state == CONN_STATE_WEBSOCKET || conn->state == CONN_STATE_WS_CLOSING)
             && s_handlers->on_ws_disconnect) {
             s_handlers->on_ws_disconnect(conn);
         }
         conn->state = CONN_STATE_CLOSED;
-        return ERR_OK;
+
+        // Call disconnect handler and clean up (matching raw_err_cb behavior)
+        if (s_handlers->on_disconnect) {
+            s_handlers->on_disconnect(conn);
+        }
+
+        bool aborted = raw_tcp_close(conn);
+        if (s_loop && s_loop->pool) {
+            connection_mark_inactive(s_loop->pool, conn->pool_index);
+            connection_mark_write_pending(s_loop->pool, conn->pool_index, false);
+            connection_mark_ws_inactive(s_loop->pool, conn->pool_index);
+        }
+        return aborted ? ERR_ABRT : ERR_OK;
     }
 
     if (err != ERR_OK) {
@@ -164,7 +182,7 @@ static err_t raw_recv_cb(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t 
         // Multi-segment - linearize into contiguous buffer
         buffer = (uint8_t*)malloc(p->tot_len);
         if (!buffer) {
-            ESP_LOGE(TAG, "Failed to allocate linearize buffer (%d bytes)", p->tot_len);
+            ESP_LOGE(TAG, "Failed to allocate linearize buffer (%u bytes)", (unsigned)p->tot_len);
             pbuf_free(p);
             conn->state = CONN_STATE_CLOSED;
             return ERR_MEM;
@@ -182,7 +200,10 @@ static err_t raw_recv_cb(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t 
             if (s_handlers->on_http_request) {
                 s_handlers->on_http_request(conn, buffer, total_len);
             }
-            s_loop->total_requests++;
+            // Only count new requests, not continuation segments
+            if (conn->state != CONN_STATE_HTTP_HEADERS) {
+                s_loop->total_requests++;
+            }
             break;
 
         case CONN_STATE_HTTP_BODY:
@@ -212,9 +233,12 @@ static err_t raw_recv_cb(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t 
         free(buffer);
     }
 
-    // Acknowledge received data to lwIP (skip if connection is closing/closed)
-    if (conn->state != CONN_STATE_CLOSING && conn->state != CONN_STATE_CLOSED) {
-        tcp_recved(tpcb, total_len);
+    // Acknowledge received data to lwIP (skip if connection was closed by handler)
+    // Use conn->raw.pcb instead of local tpcb to avoid stale pointer if handler closed the PCB
+    if (conn->raw.pcb && conn->state != CONN_STATE_CLOSING
+                      && conn->state != CONN_STATE_CLOSED
+                      && conn->state != CONN_STATE_FREE) {
+        tcp_recved(conn->raw.pcb, (u16_t)((total_len <= UINT16_MAX) ? total_len : UINT16_MAX));
     }
     pbuf_free(p);
 
@@ -232,7 +256,10 @@ static err_t raw_sent_cb(void* arg, struct tcp_pcb* tpcb, u16_t len) {
         conn->raw.unacked_bytes = 0;
     }
 
-    conn->raw.write_pending = false;
+    // Only clear write_pending when all data has been acknowledged
+    if (conn->raw.unacked_bytes == 0) {
+        conn->raw.write_pending = false;
+    }
 
     // Notify upper layer that send buffer space is available
     if (s_handlers->on_write_ready) {
@@ -256,6 +283,12 @@ static void raw_err_cb(void* arg, err_t err) {
         return;
     }
 
+    // Call WebSocket disconnect handler if this was a WebSocket connection
+    if ((conn->state == CONN_STATE_WEBSOCKET || conn->state == CONN_STATE_WS_CLOSING)
+        && s_handlers->on_ws_disconnect) {
+        s_handlers->on_ws_disconnect(conn);
+    }
+
     conn->state = CONN_STATE_CLOSED;
 
     // Call disconnect handler
@@ -271,21 +304,20 @@ static void raw_err_cb(void* arg, err_t err) {
     }
 }
 
-// WS close handshake timeout: ~10 seconds (5 polls at 2s interval)
-#define RAW_WS_CLOSE_TIMEOUT_POLLS 5
-
 static err_t raw_poll_cb(void* arg, struct tcp_pcb* tpcb) {
     connection_t* conn = (connection_t*)arg;
     if (!conn || !s_loop) return ERR_OK;
 
-    s_loop->tick_count++;
+    // Note: tick_count is NOT incremented here. It is per-connection, which would
+    // cause timeouts to fire N-times faster with N connections. The caller or a
+    // dedicated timer should increment tick_count once per poll interval instead.
 
     // Check for connection timeout
     uint32_t timeout_ticks = s_loop->timeout_ticks;
 
-    // Use shorter timeout for WebSocket close handshake
+    // Use shorter timeout for WebSocket close handshake (configurable)
     if (conn->state == CONN_STATE_WS_CLOSING) {
-        timeout_ticks = RAW_WS_CLOSE_TIMEOUT_POLLS;
+        timeout_ticks = s_loop->ws_close_timeout_ticks;
     }
 
     // Skip timeout for active WebSocket connections
@@ -308,12 +340,14 @@ static err_t raw_poll_cb(void* arg, struct tcp_pcb* tpcb) {
             s_handlers->on_disconnect(conn);
         }
 
-        raw_tcp_close(conn);
+        bool aborted = raw_tcp_close(conn);
         if (s_loop->pool) {
             connection_mark_inactive(s_loop->pool, conn->pool_index);
             connection_mark_write_pending(s_loop->pool, conn->pool_index, false);
             connection_mark_ws_inactive(s_loop->pool, conn->pool_index);
         }
+        // Must return ERR_ABRT if PCB was aborted so lwIP doesn't access freed PCB
+        if (aborted) return ERR_ABRT;
     }
 
     return ERR_OK;
@@ -335,8 +369,10 @@ ssize_t raw_tcp_write(connection_t* conn, const void* data, size_t len, bool mor
     size_t sndbuf = tcp_sndbuf(pcb);
     if (sndbuf == 0) return 0;  // No space available
 
-    // Limit to available space
+    // Limit to available space and u16_t max (tcp_write takes u16_t len)
+    // Caller must check return value and retry for remaining data
     size_t to_write = (len <= sndbuf) ? len : sndbuf;
+    if (to_write > UINT16_MAX) to_write = UINT16_MAX;
 
     uint8_t flags = TCP_WRITE_FLAG_COPY;
     if (more) {
@@ -374,11 +410,11 @@ void raw_tcp_output(connection_t* conn) {
     }
 }
 
-void raw_tcp_close(connection_t* conn) {
-    if (!conn) return;
+bool raw_tcp_close(connection_t* conn) {
+    if (!conn) return false;
 
     struct tcp_pcb* pcb = conn->raw.pcb;
-    if (!pcb) return;
+    if (!pcb) return false;
 
     // Clear all callbacks first
     tcp_arg(pcb, NULL);
@@ -394,16 +430,19 @@ void raw_tcp_close(connection_t* conn) {
     }
 
     // Try graceful close first, abort if it fails
+    bool aborted = false;
     err_t err = tcp_close(pcb);
     if (err != ERR_OK) {
         ESP_LOGW(TAG, "tcp_close failed (%d), aborting", err);
         tcp_abort(pcb);
+        aborted = true;
     }
 
     conn->raw.pcb = NULL;
     conn->raw.recv_offset = 0;
     conn->raw.unacked_bytes = 0;
     conn->raw.write_pending = false;
+    return aborted;
 }
 
 void raw_tcp_recved(connection_t* conn, uint16_t len) {

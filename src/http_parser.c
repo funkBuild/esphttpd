@@ -6,8 +6,8 @@ static const char TAG[] = "HTTP_PARSER";
 
 // External function to store headers (defined in esphttpd.c)
 extern void esphttpd_store_header(connection_t* conn,
-                                  const uint8_t* key, uint8_t key_len,
-                                  const uint8_t* value, uint8_t value_len);
+                                  const uint8_t* key, uint16_t key_len,
+                                  const uint8_t* value, uint16_t value_len);
 
 http_method_t http_parse_method(const uint8_t* method, uint8_t len) {
     // Guard against NULL or zero length
@@ -41,7 +41,7 @@ http_method_t http_parse_method(const uint8_t* method, uint8_t len) {
     return HTTP_ANY;  // HTTP_ANY serves as unknown/any
 }
 
-header_type_t http_identify_header(const uint8_t* key, uint8_t len) {
+header_type_t http_identify_header(const uint8_t* key, uint16_t len) {
     // Guard against NULL or zero length
     if (key == NULL || len == 0) {
         return HEADER_UNKNOWN;
@@ -122,7 +122,7 @@ header_type_t http_identify_header(const uint8_t* key, uint8_t len) {
     return HEADER_UNKNOWN;
 }
 
-uint32_t http_parse_content_length(const uint8_t* value, uint8_t len) {
+uint32_t http_parse_content_length(const uint8_t* value, uint16_t len) {
     // Guard against NULL or zero length
     if (value == NULL || len == 0) {
         return 0;
@@ -150,7 +150,7 @@ uint32_t http_parse_content_length(const uint8_t* value, uint8_t len) {
     return (uint32_t)result;
 }
 
-bool http_parse_keep_alive(const uint8_t* value, uint8_t len) {
+bool http_parse_keep_alive(const uint8_t* value, uint16_t len) {
     // Guard against NULL or zero length - default to keep-alive
     if (value == NULL || len == 0) {
         return true;
@@ -164,7 +164,7 @@ bool http_parse_keep_alive(const uint8_t* value, uint8_t len) {
     }
 
     // Fallback: search for embedded values (e.g., "keep-alive, upgrade")
-    for (uint8_t i = 0; i < len; i++) {
+    for (uint16_t i = 0; i < len; i++) {
         uint8_t c = value[i] | 0x20;  // Fast lowercase
         if (c == 'k' && i + 10 <= len) {
             if (header_equals(value + i, 10, "keep-alive")) {
@@ -180,8 +180,8 @@ bool http_parse_keep_alive(const uint8_t* value, uint8_t len) {
 }
 
 void http_process_header(connection_t* conn,
-                        const uint8_t* key, uint8_t key_len,
-                        const uint8_t* value, uint8_t value_len,
+                        const uint8_t* key, uint16_t key_len,
+                        const uint8_t* value, uint16_t value_len,
                         http_parser_context_t* parser_ctx) {
     // Store all headers for user access (pass connection for per-connection storage)
     esphttpd_store_header(conn, key, key_len, value, value_len);
@@ -205,7 +205,7 @@ void http_process_header(connection_t* conn,
 
         case HEADER_SEC_WEBSOCKET_KEY:
             // Store WebSocket key in parser context (per-parse, no global race)
-            if (value_len < sizeof(parser_ctx->ws_client_key)) {
+            if (value_len < sizeof(parser_ctx->ws_client_key) - 1) {
                 memcpy(parser_ctx->ws_client_key, value, value_len);
                 parser_ctx->ws_client_key[value_len] = '\0';
                 conn->is_websocket = 1;
@@ -267,10 +267,10 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                     if (__builtin_expect(cr != NULL || lf != NULL, 0)) {
                         return PARSE_ERROR;
                     }
-                    ctx->url_len += span;
-                    if (__builtin_expect(ctx->url_len >= 2048, 0)) {
+                    if (__builtin_expect(span > 2048 || (size_t)ctx->url_len + span >= 2048, 0)) {
                         return PARSE_ERROR;
                     }
+                    ctx->url_len += span;
                     if (__builtin_expect(ctx->url_len == 0, 0)) {
                         return PARSE_ERROR;
                     }
@@ -286,10 +286,10 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                         return PARSE_ERROR;
                     }
                     // Consume remaining buffer
-                    ctx->url_len += remaining;
-                    if (__builtin_expect(ctx->url_len >= 2048, 0)) {
+                    if (__builtin_expect(remaining > 2048 || (size_t)ctx->url_len + remaining >= 2048, 0)) {
                         return PARSE_ERROR;
                     }
+                    ctx->url_len += remaining;
                     i = buffer_len;
                     continue;
                 }
@@ -315,13 +315,18 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
             case PARSE_STATE_HEADER_KEY:
                 // Most common: regular header character (not \r, \n, or :)
                 if (__builtin_expect(c == '\r', 0)) {
-                    // Empty line, headers complete
+                    // Empty line = headers complete; non-empty key without colon = malformed
                     if (ctx->header_key_len == 0) {
                         ctx->state = PARSE_STATE_HEADERS_COMPLETE;
+                    } else {
+                        return PARSE_ERROR;
                     }
-                } else if (__builtin_expect(c == '\n' && ctx->header_key_len == 0, 0)) {
-                    // Headers complete
-                    ctx->state = PARSE_STATE_HEADERS_COMPLETE;
+                } else if (__builtin_expect(c == '\n', 0)) {
+                    if (ctx->header_key_len == 0) {
+                        ctx->state = PARSE_STATE_HEADERS_COMPLETE;
+                    } else {
+                        return PARSE_ERROR;
+                    }
                 } else if (c == ':') {
                     if (__builtin_expect(ctx->header_key_len == 0, 0)) {
                         return PARSE_ERROR;
@@ -367,20 +372,18 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                         break;
                     }
                 }
-                // Bulk scan: find \r or \n to end the header value
-                const uint8_t* cr = (const uint8_t*)memchr(&buffer[i], '\r', buffer_len - i);
+                // Bulk scan: find \r\n or bare \n to end the header value
+                // Bare \r not followed by \n is treated as part of the value
                 const uint8_t* lf = (const uint8_t*)memchr(&buffer[i], '\n', buffer_len - i);
-                // Find earliest line terminator
                 const uint8_t* end = NULL;
-                if (cr && lf) {
-                    end = (cr < lf) ? cr : lf;
-                } else {
-                    end = cr ? cr : lf;
+                if (lf) {
+                    // Check for preceding \r (CRLF)
+                    end = (lf > &buffer[i] && *(lf - 1) == '\r') ? lf - 1 : lf;
                 }
                 if (end) {
                     size_t span = end - &buffer[i];
-                    // Check overflow before truncating to uint8_t
-                    if (__builtin_expect((size_t)ctx->header_value_len + span >= 255, 0)) {
+                    // Check overflow: reject excessively long header values
+                    if (__builtin_expect((size_t)ctx->header_value_len + span >= 2048, 0)) {
                         return PARSE_ERROR;
                     }
                     ctx->header_value_len += span;
@@ -408,8 +411,8 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                 } else {
                     // No terminator found - consume remaining buffer
                     size_t span = buffer_len - i;
-                    // Check overflow before truncating to uint8_t
-                    if (__builtin_expect((size_t)ctx->header_value_len + span >= 255, 0)) {
+                    // Check overflow: reject excessively long header values
+                    if (__builtin_expect((size_t)ctx->header_value_len + span >= 2048, 0)) {
                         return PARSE_ERROR;
                     }
                     ctx->header_value_len += span;
@@ -464,7 +467,7 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
     return PARSE_NEED_MORE;
 }
 
-bool http_parse_url_params(const uint8_t* url, uint8_t len,
+bool http_parse_url_params(const uint8_t* url, uint16_t len,
                           uint16_t* path_len,
                           const uint8_t** params) {
     // Use memchr for O(n) with optimized byte scanning

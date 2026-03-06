@@ -86,21 +86,25 @@ httpd_err_t httpd_router_all(httpd_router_t router, const char* pattern,
                              httpd_handler_t handler) {
     if (!router || !pattern || !handler) return HTTPD_ERR_INVALID_ARG;
 
-    // Register for all HTTP methods
-    httpd_err_t err;
+    // Register for all HTTP methods. Continue on failure to avoid
+    // partial registration (some methods registered, others not).
+    httpd_err_t first_err = HTTPD_OK;
     for (int method = HTTP_GET; method <= HTTP_PATCH; method++) {
-        err = radix_insert(router->tree, pattern, (http_method_t)method,
+        httpd_err_t err = radix_insert(router->tree, pattern, (http_method_t)method,
                           handler, NULL, NULL, 0);
-        if (err != HTTPD_OK) return err;
+        if (err != HTTPD_OK && first_err == HTTPD_OK) {
+            first_err = err;
+        }
     }
 
-    return HTTPD_OK;
+    return first_err;
 }
 
 httpd_err_t httpd_router_route(httpd_router_t router, const char* pattern,
                                http_method_t method, httpd_handler_t handler,
                                void* user_ctx) {
     if (!router || !pattern || !handler) return HTTPD_ERR_INVALID_ARG;
+    if (method < 0 || method > HTTP_ANY) return HTTPD_ERR_INVALID_ARG;
     return radix_insert(router->tree, pattern, method, handler, user_ctx, NULL, 0);
 }
 

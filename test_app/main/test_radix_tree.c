@@ -1182,6 +1182,24 @@ static void test_radix_mixed_param_wildcard(void) {
     radix_tree_destroy(tree);
 }
 
+// ========== Issue #3: Method bounds check in radix_insert ==========
+
+static void test_radix_insert_invalid_method(void) {
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    // Out-of-range method should return error
+    httpd_err_t err = radix_insert(tree, "/test", (http_method_t)(HTTP_ANY + 1),
+                                    test_handler_1, NULL, NULL, 0);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, err);
+
+    err = radix_insert(tree, "/test", (http_method_t)(-1),
+                        test_handler_1, NULL, NULL, 0);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, err);
+
+    radix_tree_destroy(tree);
+}
+
 // ============================================================================
 // Test Runner
 // ============================================================================
@@ -1241,4 +1259,7 @@ void test_radix_tree_run(void) {
     RUN_TEST(test_radix_null_inputs);
     RUN_TEST(test_radix_param_with_static_suffix);
     RUN_TEST(test_radix_mixed_param_wildcard);
+
+    // Bug fix regression tests
+    RUN_TEST(test_radix_insert_invalid_method);
 }
