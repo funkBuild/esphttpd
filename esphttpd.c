@@ -858,10 +858,7 @@ void webserver_accept_ws(ws_ctx* ctx) {
 }
 
 static void webserver_ws_task(void* pvParameter) {
-  xSemaphoreTake(ws_task_count_semaphore, portMAX_DELAY);
-  active_ws_task_count++;
-  xSemaphoreGive(ws_task_count_semaphore);
-
+  // Count was pre-incremented by webserver_handle_ws before xTaskCreate.
   ws_ctx* ctx = (ws_ctx*)pvParameter;
 
   struct netbuf* buf;
@@ -1114,7 +1111,22 @@ static void webserver_handle_ws(http_req* req) {
     // Acquire reference for this task before creating the task
     __atomic_add_fetch(&ctx->ref_count, 1, __ATOMIC_SEQ_CST);
 
-    xTaskCreate(webserver_ws_task, "webserver_ws_task", 3072, (void*)ctx, tskIDLE_PRIORITY, &ctx->task_handle);
+    // Pre-increment count before xTaskCreate so webserver_stop() never sees a
+    // zero count while a task has been created but not yet scheduled.
+    xSemaphoreTake(ws_task_count_semaphore, portMAX_DELAY);
+    active_ws_task_count++;
+    xSemaphoreGive(ws_task_count_semaphore);
+
+    if (xTaskCreate(webserver_ws_task, "webserver_ws_task", 3072, (void*)ctx, tskIDLE_PRIORITY, &ctx->task_handle) != pdPASS) {
+      ESP_LOGE(TAG, "Failed to create WS task");
+      xSemaphoreTake(ws_task_count_semaphore, portMAX_DELAY);
+      active_ws_task_count--;
+      xSemaphoreGive(ws_task_count_semaphore);
+      __atomic_sub_fetch(&ctx->ref_count, 1, __ATOMIC_SEQ_CST);
+      vRingbufferDelete(ctx->send_queue);
+      free(ctx);
+      return;
+    }
   } else {
     webserver_send_not_found(req);
     netconn_close(ctx->conn);
@@ -1406,9 +1418,19 @@ void webserver_start(int port) {
 
   ESP_LOGI(TAG, "Starting webserver on port %d", port);
 
-  ws_connection_semaphore = xSemaphoreCreateMutex();
-  ws_task_count_semaphore = xSemaphoreCreateMutex();
-  esphttpd_event_group = xEventGroupCreate();
+  // Create semaphores and event group once and never delete — they are used
+  // across task boundaries and must outlive any individual webserver
+  // start/stop cycle. The event group in particular must remain valid as long
+  // as webserver_task may still be alive after a stop timeout.
+  if (ws_connection_semaphore == NULL) {
+    ws_connection_semaphore = xSemaphoreCreateMutex();
+  }
+  if (ws_task_count_semaphore == NULL) {
+    ws_task_count_semaphore = xSemaphoreCreateMutex();
+  }
+  if (esphttpd_event_group == NULL) {
+    esphttpd_event_group = xEventGroupCreate();
+  }
 
   xEventGroupClearBits(esphttpd_event_group, TASK_SHUTDOWN_BIT | TASK_REQUEST_SHUTDOWN_BIT);
 
@@ -1431,6 +1453,18 @@ void webserver_stop() {
   // Wait for shutdown (bounded — avoid infinite hang if webserver task is stuck)
   xEventGroupWaitBits(esphttpd_event_group, TASK_SHUTDOWN_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(30000));
 
+  // Force-close all open WS connections so tasks blocked in netconn_recv()
+  // get an error and exit their loops promptly instead of hanging until the
+  // network stack tears down (e.g. esp_wifi_stop) *after* we have already
+  // freed the semaphores.
+  xSemaphoreTake(ws_connection_semaphore, portMAX_DELAY);
+  for (int i = 0; i < MAX_WS_CONNECTIONS; i++) {
+    if (ws_connections[i] != NULL && ws_connections[i]->conn != NULL) {
+      netconn_close(ws_connections[i]->conn);
+    }
+  }
+  xSemaphoreGive(ws_connection_semaphore);
+
   // Wait for WebSocket tasks to finish (bounded to 10s)
   for (int i = 0; i < 100; i++) {
     xSemaphoreTake(ws_task_count_semaphore, pdMS_TO_TICKS(1000));
@@ -1442,14 +1476,12 @@ void webserver_stop() {
     vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 
-  vEventGroupDelete(esphttpd_event_group);
-  esphttpd_event_group = NULL;
-
-  vSemaphoreDelete(ws_connection_semaphore);
-  vSemaphoreDelete(ws_task_count_semaphore);
-
-  ws_connection_semaphore = NULL;
-  ws_task_count_semaphore = NULL;
+  // Do NOT delete esphttpd_event_group, ws_connection_semaphore, or
+  // ws_task_count_semaphore. They are used across task boundaries and must
+  // outlive any individual start/stop cycle. If webserver_task is still
+  // alive after the stop timeout, it will keep polling the event group;
+  // deleting it here causes a NULL-handle assert (the crash we observed).
+  // These are created once and persist for the process lifetime.
 
   esphttpd_task_handle = NULL;
 }
