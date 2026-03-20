@@ -1,4 +1,5 @@
 #include "private/template.h"
+#include <stdlib.h>
 #include <string.h>
 #include <limits.h>
 #include <unistd.h>
@@ -9,9 +10,7 @@ static const char TAG[] = "TEMPLATE";
 // Template parser states
 enum {
     TEMPLATE_STATE_TEXT,        // Processing normal text
-    TEMPLATE_STATE_DELIM_START, // Matching start delimiter
     TEMPLATE_STATE_VAR_NAME,    // Reading variable name
-    TEMPLATE_STATE_DELIM_END    // Matching end delimiter
 };
 
 void template_init_default(template_context_t* ctx,
@@ -57,6 +56,8 @@ void template_init(template_context_t* ctx,
     ctx->state = TEMPLATE_STATE_TEXT;
     ctx->var_name_len = 0;
     ctx->delim_pos = 0;
+    ctx->flush_pending = 0;
+    ctx->flush_offset = 0;
 }
 
 int template_process(template_context_t* ctx,
@@ -82,23 +83,41 @@ int template_process(template_context_t* ctx,
 
     char first_delim_char = start_delim[0];
 
+    // Drain any pending flush from a previous call that ran out of output space
+    if (__builtin_expect(ctx->flush_pending > 0, 0)) {
+        size_t avail = output_size - out_pos;
+        size_t to_flush = ctx->flush_pending;
+        if (to_flush > avail) to_flush = avail;
+        memcpy(output + out_pos, start_delim + ctx->flush_offset, to_flush);
+        out_pos += to_flush;
+        ctx->flush_pending -= to_flush;
+        ctx->flush_offset += to_flush;
+        if (ctx->flush_pending > 0) {
+            // Still can't flush everything - return what we have
+            return (out_pos <= (size_t)INT_MAX) ? (int)out_pos : INT_MAX;
+        }
+        ctx->flush_offset = 0;
+    }
+
     // Fast path: if in TEXT state with no partial delimiter match,
     // scan for first delimiter char using memchr and copy plain text in bulk
     if (ctx->state == TEMPLATE_STATE_TEXT && ctx->delim_pos == 0) {
         const uint8_t* delim_start = (const uint8_t*)memchr(input, first_delim_char, input_len);
         if (!delim_start) {
             // No delimiter found - copy entire input
-            size_t to_copy = input_len < output_size ? input_len : output_size;
-            memcpy(output, input, to_copy);
-            return to_copy;
+            size_t avail = output_size - out_pos;
+            size_t to_copy = input_len < avail ? input_len : avail;
+            memcpy(output + out_pos, input, to_copy);
+            return (out_pos + to_copy > (size_t)INT_MAX) ? INT_MAX : (int)(out_pos + to_copy);
         }
         // Copy text before delimiter
         size_t plain_len = delim_start - input;
         if (plain_len > 0) {
-            size_t to_copy = plain_len < output_size ? plain_len : output_size;
-            memcpy(output, input, to_copy);
+            size_t avail = output_size - out_pos;
+            size_t to_copy = plain_len < avail ? plain_len : avail;
+            memcpy(output + out_pos, input, to_copy);
             in_pos = plain_len;
-            out_pos = to_copy;
+            out_pos += to_copy;
         }
     }
 
@@ -132,11 +151,12 @@ int template_process(template_context_t* ctx,
                     size_t to_copy = ctx->delim_pos;
                     size_t avail = output_size - out_pos;
                     if (to_copy > avail) {
-                        // Not enough space - output what we can, keep remainder buffered
+                        // Not enough space - output what we can, save remainder for next call
                         memcpy(output + out_pos, start_delim, avail);
                         out_pos += avail;
-                        // Shift remaining delimiter chars (rare path)
-                        ctx->delim_pos -= avail;
+                        ctx->flush_pending = ctx->delim_pos - avail;
+                        ctx->flush_offset = avail;
+                        ctx->delim_pos = 0;
                         break;  // Output full, exit loop
                     }
                     memcpy(output + out_pos, start_delim, to_copy);
@@ -162,9 +182,25 @@ int template_process(template_context_t* ctx,
                         if (ctx->callback) {
                             size_t avail = output_size - out_pos;
                             if (ctx->config.escape_html) {
-                                // Write to temp buffer, then escape into output
-                                uint8_t tmp[128];
-                                size_t tmp_avail = sizeof(tmp) < avail ? sizeof(tmp) : avail;
+                                // Write callback output to a temp buffer, then
+                                // HTML-escape into the output buffer.
+                                // Use a stack buffer for small values, heap for large.
+                                uint8_t stack_tmp[128];
+                                uint8_t* tmp = stack_tmp;
+                                size_t tmp_size = sizeof(stack_tmp);
+                                bool tmp_allocated = false;
+
+                                if (avail > sizeof(stack_tmp)) {
+                                    uint8_t* heap_tmp = malloc(avail);
+                                    if (heap_tmp) {
+                                        tmp = heap_tmp;
+                                        tmp_size = avail;
+                                        tmp_allocated = true;
+                                    }
+                                    // Fall back to stack buffer on alloc failure
+                                }
+
+                                size_t tmp_avail = tmp_size < avail ? tmp_size : avail;
                                 int written = ctx->callback(ctx->var_name,
                                                            tmp, tmp_avail,
                                                            ctx->user_data);
@@ -176,6 +212,8 @@ int template_process(template_context_t* ctx,
                                 } else if (written < 0) {
                                     ESP_LOGW(TAG, "Variable callback error for '%s'", ctx->var_name);
                                 }
+
+                                if (tmp_allocated) free(tmp);
                             } else {
                                 int written = ctx->callback(ctx->var_name,
                                                            output + out_pos,
@@ -230,21 +268,33 @@ int template_flush(template_context_t* ctx,
                   size_t output_size) {
     size_t out_pos = 0;
 
+    // Drain any pending flush from a previous partial delimiter mismatch
+    if (ctx->flush_pending > 0) {
+        size_t to_flush = ctx->flush_pending;
+        if (to_flush > output_size) to_flush = output_size;
+        memcpy(output, ctx->config.start_delim + ctx->flush_offset, to_flush);
+        out_pos += to_flush;
+        ctx->flush_pending -= to_flush;
+        ctx->flush_offset = (ctx->flush_pending > 0) ? ctx->flush_offset + to_flush : 0;
+    }
+
     // Flush any partial delimiter when processing is complete
     if (ctx->state == TEMPLATE_STATE_TEXT && ctx->delim_pos > 0) {
         // Output the partial delimiter using memcpy (faster than byte-by-byte)
         size_t to_copy = ctx->delim_pos;
-        if (to_copy > output_size) to_copy = output_size;
-        memcpy(output, ctx->config.start_delim, to_copy);
-        out_pos = to_copy;
+        size_t avail = output_size - out_pos;
+        if (to_copy > avail) to_copy = avail;
+        memcpy(output + out_pos, ctx->config.start_delim, to_copy);
+        out_pos += to_copy;
         ctx->delim_pos = 0;
     } else if (ctx->state == TEMPLATE_STATE_VAR_NAME) {
         // We were in the middle of reading a variable name
         // Output the start delimiter using memcpy
         size_t delim_to_copy = ctx->config.delim_len_start;
-        if (delim_to_copy > output_size) delim_to_copy = output_size;
-        memcpy(output, ctx->config.start_delim, delim_to_copy);
-        out_pos = delim_to_copy;
+        size_t avail = output_size - out_pos;
+        if (delim_to_copy > avail) delim_to_copy = avail;
+        memcpy(output + out_pos, ctx->config.start_delim, delim_to_copy);
+        out_pos += delim_to_copy;
 
         // Output variable name using memcpy
         if (out_pos < output_size && ctx->var_name_len > 0) {
@@ -309,6 +359,12 @@ int template_process_file(template_context_t* ctx,
         }
     }
 
+    // Check for read error (read() returned -1)
+    if (bytes_read < 0) {
+        ESP_LOGE(TAG, "Failed to read input");
+        return -1;
+    }
+
     // Flush any trailing partial content from the state machine
     int flushed = template_flush(ctx, out_buffer, half_size);
     if (flushed > 0) {
@@ -369,7 +425,7 @@ int template_escape_html(const uint8_t* input,
 int template_var_env(const char* var_name, uint8_t* output,
                     size_t output_size, void* user_data) {
     // Skip "env." prefix if present
-    if (memcmp(var_name, "env.", 4) == 0) {
+    if (strncmp(var_name, "env.", 4) == 0) {
         var_name += 4;
     }
 

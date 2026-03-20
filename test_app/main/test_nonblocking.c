@@ -18,7 +18,8 @@ static httpd_handle_t test_handle = NULL;
 static void start_test_server(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.port = 80;
-    httpd_start(&test_handle, &config);
+    httpd_err_t err = httpd_start(&test_handle, &config);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
 }
 
 static void stop_test_server(void) {
@@ -267,7 +268,7 @@ static httpd_err_t test_continuation_handler(httpd_req_t* req, const void* data,
 
     if (data && len > 0) {
         cont_bytes_received += len;
-        cont->received_bytes += len;
+        // Note: cont->received_bytes is updated automatically by the server
     }
 
     // Simulate processing - complete after 100 bytes
@@ -435,6 +436,148 @@ static void test_deferred_continuation_exclusive(void)
 }
 
 // ============================================================================
+// PARTIAL CHUNK FAILURE TESTS
+// ============================================================================
+
+// Test that a partial chunk send marks the connection as CLOSED.
+// When the chunk header is sent/queued but the chunk data send fails,
+// the stream is irrecoverably corrupted, so the connection must be closed.
+static void test_partial_chunk_send_marks_conn_closed(void)
+{
+    start_test_server();
+    TEST_ASSERT_NOT_NULL(g_server);
+
+    // Get connection and send buffer from the server's pool
+    int idx = 0;
+    connection_t* conn = connection_get(&g_server->connection_pool, idx);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    send_buffer_t** bufs = (send_buffer_t**)g_test_send_buffers;
+    TEST_ASSERT_NOT_NULL(bufs);
+    send_buffer_t* sb = bufs[idx];
+    TEST_ASSERT_NOT_NULL(sb);
+
+    // Initialize connection for test
+    conn->fd = -1;  // Invalid fd so drain/send fails
+    conn->state = CONN_STATE_HTTP_BODY;
+    conn->pool_index = idx;
+
+    // Allocate and seed the send buffer so send_nonblocking takes the queue path
+    // (skips send() syscall, queues directly)
+    send_buffer_init(sb);
+    TEST_ASSERT_TRUE(send_buffer_alloc(sb));
+    uint8_t dummy = 0;
+    send_buffer_queue(sb, &dummy, 1);
+
+    // Set up request with body_started=true so it skips header finalization
+    httpd_req_t req;
+    memset(&req, 0, sizeof(req));
+    req._internal = conn;
+    req.status_code = 200;
+    req.body_started = true;
+    req.headers_sent = true;
+    sb->chunked = 1;
+
+    // Create a large chunk that will overflow the send buffer.
+    // Buffer is SEND_BUFFER_SIZE bytes, 1 byte seeded, space = SIZE-2.
+    // Chunk header queues OK, but data exceeds remaining space.
+    // send_nonblocking will fail trying to queue the data portion,
+    // triggering the partial-chunk-on-wire protection.
+    size_t chunk_len = SEND_BUFFER_SIZE - 6;
+    char* large_chunk = malloc(chunk_len);
+    TEST_ASSERT_NOT_NULL(large_chunk);
+    memset(large_chunk, 'A', chunk_len);
+
+    httpd_err_t err = httpd_resp_send_chunk(&req, large_chunk, (ssize_t)chunk_len);
+
+    // Should return IO error
+    TEST_ASSERT_EQUAL(HTTPD_ERR_IO, err);
+
+    // Connection must be marked CLOSED because partial chunk data was queued
+    // (header was queued successfully before data send failed)
+    TEST_ASSERT_EQUAL(CONN_STATE_CLOSED, conn->state);
+
+    ESP_LOGI(TAG, "Partial chunk send correctly marked connection as CLOSED");
+
+    free(large_chunk);
+
+    // Clean up - reset connection state
+    conn->state = CONN_STATE_FREE;
+    conn->fd = -1;
+    send_buffer_free(sb);
+    send_buffer_init(sb);
+
+    stop_test_server();
+}
+
+// Test that when the first send (chunk header) fails, conn state is NOT changed.
+// Nothing is on the wire yet, so the stream is not corrupted.
+static void test_chunk_header_fail_no_close(void)
+{
+    start_test_server();
+    TEST_ASSERT_NOT_NULL(g_server);
+
+    int idx = 0;
+    connection_t* conn = connection_get(&g_server->connection_pool, idx);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    send_buffer_t** bufs = (send_buffer_t**)g_test_send_buffers;
+    send_buffer_t* sb = bufs[idx];
+    TEST_ASSERT_NOT_NULL(sb);
+
+    conn->fd = -1;
+    conn->state = CONN_STATE_HTTP_BODY;
+    conn->pool_index = idx;
+
+    // Allocate send buffer and fill it almost completely so even the
+    // chunk header (5-6 bytes) cannot be queued.
+    send_buffer_init(sb);
+    TEST_ASSERT_TRUE(send_buffer_alloc(sb));
+
+    // Fill buffer to capacity (leave only 1 byte of space, which is the
+    // minimum gap to distinguish full from empty).
+    size_t space = send_buffer_space(sb);
+    char* filler = malloc(space);
+    TEST_ASSERT_NOT_NULL(filler);
+    memset(filler, 'X', space);
+    send_buffer_queue(sb, filler, space);
+    free(filler);
+
+    // Verify buffer is full
+    TEST_ASSERT_EQUAL(0, send_buffer_space(sb));
+
+    // Set up request
+    httpd_req_t req;
+    memset(&req, 0, sizeof(req));
+    req._internal = conn;
+    req.status_code = 200;
+    req.body_started = true;
+    req.headers_sent = true;
+    sb->chunked = 1;
+
+    // Try to send a large chunk - the header send should fail
+    // because the buffer is full and drain fails (fd=-1).
+    char data[300];
+    memset(data, 'B', sizeof(data));
+
+    httpd_err_t err = httpd_resp_send_chunk(&req, data, sizeof(data));
+    TEST_ASSERT_EQUAL(HTTPD_ERR_IO, err);
+
+    // Connection should NOT be marked CLOSED - nothing was sent/queued
+    TEST_ASSERT_NOT_EQUAL(CONN_STATE_CLOSED, conn->state);
+
+    ESP_LOGI(TAG, "Chunk header failure correctly left connection state unchanged");
+
+    // Clean up
+    conn->state = CONN_STATE_FREE;
+    conn->fd = -1;
+    send_buffer_free(sb);
+    send_buffer_init(sb);
+
+    stop_test_server();
+}
+
+// ============================================================================
 // TEST RUNNER
 // ============================================================================
 
@@ -461,6 +604,11 @@ void test_nonblocking_run(void)
     RUN_TEST(test_continuation_data_accumulation);
     RUN_TEST(test_continuation_phase_tracking);
     RUN_TEST(test_continuation_with_server);
+
+    // Partial chunk failure tests
+    ESP_LOGI(TAG, "Partial chunk failure tests...");
+    RUN_TEST(test_partial_chunk_send_marks_conn_closed);
+    RUN_TEST(test_chunk_header_fail_no_close);
 
     // Integration tests
     ESP_LOGI(TAG, "Integration tests...");

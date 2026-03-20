@@ -58,12 +58,23 @@ static httpd_err_t handle_api_status(httpd_req_t* req) {
 
 // Handle POST /api/data
 static httpd_err_t handle_api_data(httpd_req_t* req) {
-    // Read request body
+    // Read request body, handling new error return values.
+    // Note: For large bodies, prefer httpd_req_defer() or httpd_req_continue()
+    // to avoid blocking the event loop.
     char body[256];
     int received = httpd_req_recv(req, body, sizeof(body) - 1);
     if (received > 0) {
         body[received] = '\0';
         ESP_LOGI(TAG, "Received POST data: %s", body);
+    } else if (received == HTTPD_ERR_WOULD_BLOCK) {
+        // No data available yet on non-blocking socket.
+        // For a simple handler this is unlikely with small bodies,
+        // but for robustness treat as empty body.
+        ESP_LOGW(TAG, "No body data available (EAGAIN)");
+        received = 0;
+    } else if (received < 0) {
+        ESP_LOGE(TAG, "Body read error: %d", received);
+        return httpd_resp_send_error(req, 500, "Body read error");
     }
 
     const char* response = "{\"result\":\"data received\"}";

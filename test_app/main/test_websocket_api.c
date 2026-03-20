@@ -22,7 +22,8 @@ static void start_test_server(void) {
     if (test_server) return;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.port = 80;
-    httpd_start(&test_server, &config);
+    httpd_err_t err = httpd_start(&test_server, &config);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
 }
 
 // Helper to stop test server

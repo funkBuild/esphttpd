@@ -12,37 +12,13 @@
 #include "private/template.h"
 #include "private/filesystem.h"
 #include "private/send_buffer.h"
-#ifdef CONFIG_HTTPD_USE_RAW_API
-#include "private/raw_tcp.h"
-#include "lwip/tcpip.h"
-#include "freertos/semphr.h"
-#include "freertos/queue.h"
-// In test mode, tcpip_thread isn't running so LOCK/UNLOCK are no-ops
-#ifdef CONFIG_ESPHTTPD_TEST_MODE
-#define HTTPD_LOCK_TCPIP()   do {} while(0)
-#define HTTPD_UNLOCK_TCPIP() do {} while(0)
-#else
-#define HTTPD_LOCK_TCPIP()   LOCK_TCPIP_CORE()
-#define HTTPD_UNLOCK_TCPIP() UNLOCK_TCPIP_CORE()
-#endif
-#endif
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
+#include <inttypes.h>
 #include <unistd.h>
-#ifndef CONFIG_HTTPD_USE_RAW_API
 #include <sys/socket.h>
-#else
-// Define socket flags used as send_nonblocking parameters
-// Under raw API these are translated to raw_tcp_write flags
-#ifndef MSG_MORE
-#define MSG_MORE 0x8000
-#endif
-#ifndef MSG_DONTWAIT
-#define MSG_DONTWAIT 0x40
-#endif
-#endif
 #include <errno.h>
 #include <sys/stat.h>
 #include "freertos/FreeRTOS.h"
@@ -188,9 +164,7 @@ struct httpd_server {
     // State
     bool initialized;
     volatile bool running;     // Read/written from different tasks
-#ifndef CONFIG_HTTPD_USE_RAW_API
     volatile bool task_exited;  // Set by server_task before vTaskDelete
-#endif
 };
 
 // Free channel hash table if allocated
@@ -235,8 +209,8 @@ static inline void init_channel_hash(struct httpd_server* server) {
 typedef struct {
     const char* key;
     const char* value;
-    uint8_t key_len;
-    uint8_t value_len;
+    uint16_t key_len;
+    uint16_t value_len;
 } query_param_entry_t;
 
 // Per-connection request context
@@ -264,6 +238,7 @@ typedef struct {
     bool uri_buf_is_heap;                 // true if uri_buf was malloc'd (needs free)
     uint8_t query_param_count;
     bool query_parsed;
+    bool continue_sent;                   // true after 100 Continue has been sent
     // Deferred (async) body handling
     struct {
         httpd_body_cb_t on_body;          // Body data callback
@@ -351,136 +326,12 @@ static void on_ws_connect(connection_t* conn);
 static void on_ws_disconnect(connection_t* conn);
 static void on_disconnect(connection_t* conn);
 static void on_write_ready(connection_t* conn);
-#ifndef CONFIG_HTTPD_USE_RAW_API
 static void server_task(void* pvParameters);
-#endif
 
 // Get send buffer for connection (returns NULL if not allocated)
 static inline __attribute__((always_inline)) send_buffer_t* get_send_buffer(connection_t* conn) {
     return connection_send_buffers[conn->pool_index];
 }
-
-// ============================================================================
-// File I/O Worker (raw API mode only)
-// ============================================================================
-#ifdef CONFIG_HTTPD_USE_RAW_API
-
-// File read request sent to the worker task
-typedef struct {
-    uint8_t pool_index;      // Connection pool index
-    int file_fd;             // File descriptor to read from
-    uint8_t* dest;           // Destination buffer (inside send_buffer ring)
-    size_t max_len;          // Maximum bytes to read
-} file_io_request_t;
-
-// File read result returned from worker
-typedef struct {
-    uint8_t pool_index;      // Connection pool index
-    ssize_t bytes_read;      // Bytes read, or -1 on error
-} file_io_result_t;
-
-static QueueHandle_t s_file_io_request_queue = NULL;
-static QueueHandle_t s_file_io_result_queue = NULL;
-static TaskHandle_t s_file_io_task = NULL;
-
-// Worker task: reads file data outside tcpip_thread
-static void file_io_worker_task(void* pvParameters) {
-    file_io_request_t req;
-
-    for (;;) {
-        if (xQueueReceive(s_file_io_request_queue, &req, portMAX_DELAY) != pdTRUE) {
-            continue;
-        }
-
-        // Sentinel: file_fd == -1 means stop the worker
-        if (req.file_fd < 0) {
-            break;
-        }
-
-        file_io_result_t result = {
-            .pool_index = req.pool_index,
-            .bytes_read = read(req.file_fd, req.dest, req.max_len)
-        };
-
-        // Post result back and trigger on_write_ready via tcpip callback
-        xQueueSend(s_file_io_result_queue, &result, portMAX_DELAY);
-
-        // Signal tcpip_thread to process the result
-        HTTPD_LOCK_TCPIP();
-        if (g_server) {
-            connection_t* conn = connection_get(&g_server->connection_pool, req.pool_index);
-            if (conn && connection_is_active(&g_server->connection_pool, req.pool_index)) {
-                send_buffer_t* sb = get_send_buffer(conn);
-                if (sb && result.bytes_read > 0) {
-                    send_buffer_commit(sb, result.bytes_read);
-                    sb->file_remaining -= result.bytes_read;
-                    if (sb->file_remaining == 0) {
-                        send_buffer_stop_file(sb);
-                    }
-                } else if (result.bytes_read < 0) {
-                    if (sb) send_buffer_stop_file(sb);
-                }
-                on_write_ready(conn);
-            }
-        }
-        HTTPD_UNLOCK_TCPIP();
-    }
-
-    // Worker received stop sentinel - self-delete
-    vTaskDelete(NULL);
-}
-
-static void file_io_worker_start(void) {
-    if (s_file_io_task) return;  // Already running
-
-    s_file_io_request_queue = xQueueCreate(4, sizeof(file_io_request_t));
-    s_file_io_result_queue = xQueueCreate(4, sizeof(file_io_result_t));
-
-    xTaskCreate(file_io_worker_task, "httpd_fio", 2048, NULL, 5, &s_file_io_task);
-    ESP_LOGI(TAG, "File I/O worker task started");
-}
-
-static void file_io_worker_stop(void) {
-    if (s_file_io_task && s_file_io_request_queue) {
-        // Send sentinel to tell the worker to exit gracefully
-        file_io_request_t stop_req = { .file_fd = -1 };
-        xQueueSend(s_file_io_request_queue, &stop_req, pdMS_TO_TICKS(100));
-
-        // Wait for the task to delete itself (up to 1 second)
-        for (int i = 0; i < 100 && s_file_io_task; i++) {
-            if (eTaskGetState(s_file_io_task) == eDeleted) break;
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-        s_file_io_task = NULL;
-    }
-    if (s_file_io_request_queue) {
-        vQueueDelete(s_file_io_request_queue);
-        s_file_io_request_queue = NULL;
-    }
-    if (s_file_io_result_queue) {
-        vQueueDelete(s_file_io_result_queue);
-        s_file_io_result_queue = NULL;
-    }
-}
-
-// Submit a file read to the worker task (non-blocking)
-static bool file_io_submit_read(uint8_t pool_index, int file_fd, uint8_t* dest, size_t max_len) {
-    if (!s_file_io_request_queue) {
-        file_io_worker_start();
-    }
-    if (!s_file_io_request_queue) return false;
-
-    file_io_request_t req = {
-        .pool_index = pool_index,
-        .file_fd = file_fd,
-        .dest = dest,
-        .max_len = max_len
-    };
-
-    return xQueueSend(s_file_io_request_queue, &req, 0) == pdTRUE;
-}
-
-#endif // CONFIG_HTTPD_USE_RAW_API
 
 // ============================================================================
 // Utility Functions
@@ -497,12 +348,6 @@ static bool drain_send_buffer(connection_t* conn) {
         size_t len = send_buffer_peek(sb, &data);
         if (len == 0) break;
 
-#ifdef CONFIG_HTTPD_USE_RAW_API
-        ssize_t sent = raw_tcp_write(conn, data, len, false);
-        if (sent <= 0) {
-            return false;  // No space or error
-        }
-#else
         ssize_t sent = send(conn->fd, data, len, MSG_DONTWAIT);
         if (sent < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -511,7 +356,6 @@ static bool drain_send_buffer(connection_t* conn) {
             ESP_LOGE(TAG, "drain_send_buffer failed: %s", strerror(errno));
             return false;
         }
-#endif
         send_buffer_consume(sb, sent);
     }
 
@@ -547,18 +391,6 @@ static ssize_t send_nonblocking(connection_t* __restrict conn, const void* __res
 
     // Try to send directly (fast path)
     while (remaining > 0) {
-#ifdef CONFIG_HTTPD_USE_RAW_API
-        bool more = (flags & MSG_MORE) != 0;
-        ssize_t sent = raw_tcp_write(conn, ptr, remaining, more);
-        if (sent <= 0) {
-            if (sent == 0) {
-                // No space available, queue remaining data
-                goto queue_data;
-            }
-            ESP_LOGE(TAG, "send_nonblocking failed: raw_tcp_write error");
-            return -1;
-        }
-#else
         ssize_t sent = send(conn->fd, ptr, remaining, flags | MSG_DONTWAIT);
         if (sent < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -568,7 +400,6 @@ static ssize_t send_nonblocking(connection_t* __restrict conn, const void* __res
             ESP_LOGE(TAG, "send_nonblocking failed: %s", strerror(errno));
             return -1;
         }
-#endif
         ptr += sent;
         remaining -= sent;
     }
@@ -626,7 +457,8 @@ static ssize_t fs_send_callback(connection_t* conn, const void* data, size_t len
 
 // Filesystem file stream callback - starts non-blocking file streaming via send_buffer
 // Ownership of file_fd transfers to send_buffer (it will close it when streaming completes)
-static int fs_file_stream_callback(connection_t* conn, int file_fd, size_t file_size) {
+static int fs_file_stream_callback(connection_t* conn, int file_fd, size_t file_size,
+                                   send_buffer_file_close_cb_t on_close, void* on_close_arg) {
     send_buffer_t* sb = get_send_buffer(conn);
     if (!sb) return -1;
 
@@ -639,7 +471,8 @@ static int fs_file_stream_callback(connection_t* conn, int file_fd, size_t file_
     }
 
     // Start file streaming - send_buffer takes ownership of file_fd
-    if (!send_buffer_start_file(sb, file_fd, file_size)) {
+    // on_close callback is invoked when the file is actually closed (streaming done or error)
+    if (!send_buffer_start_file(sb, file_fd, file_size, on_close, on_close_arg)) {
         return -1;
     }
 
@@ -1094,10 +927,8 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
         .port = cfg.port,
         .backlog = cfg.backlog,
         .timeout_ms = cfg.timeout_ms,
-#ifndef CONFIG_HTTPD_USE_RAW_API
         .select_timeout_ms = 1000,
         .io_buffer_size = cfg.recv_buffer_size,
-#endif
         .nodelay = true,
         .reuseaddr = true
     };
@@ -1186,27 +1017,6 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
     server->event_loop.running = true;
     server->running = true;
     ESP_LOGI(TAG, "Server started in TEST MODE (no task created)");
-#elif defined(CONFIG_HTTPD_USE_RAW_API)
-    // Raw API mode: start listening via lwIP raw callbacks (no server task needed)
-    HTTPD_LOCK_TCPIP();
-    int raw_ret = raw_tcp_listen(&server->event_loop, &server->handlers);
-    HTTPD_UNLOCK_TCPIP();
-    if (raw_ret < 0) {
-        server->initialized = false;
-        g_server = NULL;
-        free(preallocated_request_contexts);
-        free(preallocated_ws_contexts);
-        free(preallocated_send_buffers);
-        preallocated_request_contexts = NULL;
-        preallocated_ws_contexts = NULL;
-        preallocated_send_buffers = NULL;
-        memset(request_contexts, 0, sizeof(request_contexts));
-        memset(ws_contexts, 0, sizeof(ws_contexts));
-        memset(connection_send_buffers, 0, sizeof(connection_send_buffers));
-        return HTTPD_ERR_IO;
-    }
-    server->running = true;
-    ESP_LOGI(TAG, "Server started in raw TCP API mode (no server task)");
 #else
     // Start the server task
     server->task_exited = false;
@@ -1241,17 +1051,6 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
 
     ESP_LOGI(TAG, "Stopping server");
 
-#ifdef CONFIG_HTTPD_USE_RAW_API
-    // Stop file I/O worker if running
-    file_io_worker_stop();
-
-#ifndef CONFIG_ESPHTTPD_TEST_MODE
-    // Raw API: close all connections and listen PCB under tcpip lock
-    HTTPD_LOCK_TCPIP();
-    raw_tcp_stop(&server->event_loop);
-    HTTPD_UNLOCK_TCPIP();
-#endif
-#else
     event_loop_stop(&server->event_loop);
 
 #ifndef CONFIG_ESPHTTPD_TEST_MODE
@@ -1259,16 +1058,26 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
     while (!server->task_exited) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+#endif
 
-    // Close all active connections
+    // Call disconnect handlers for all active connections before closing sockets
+    // or freeing resources. This notifies user code (WS handlers, deferred
+    // callbacks, etc.) so they can release their own allocations while server
+    // state is still valid.
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         if (connection_is_active(&server->connection_pool, i)) {
             connection_t* conn = &server->connection_pool.connections[i];
+            on_disconnect(conn);
+#ifndef CONFIG_ESPHTTPD_TEST_MODE
+            shutdown(conn->fd, SHUT_RDWR);
             close(conn->fd);
+#endif
+            connection_mark_inactive(&server->connection_pool, i);
+            connection_mark_write_pending(&server->connection_pool, i, false);
+            connection_mark_ws_inactive(&server->connection_pool, i);
+            connection_mark_read_paused(&server->connection_pool, i, false);
         }
     }
-#endif
-#endif
 
     // Free per-connection dynamic sub-buffers
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
@@ -1361,7 +1170,6 @@ bool httpd_is_running(httpd_handle_t handle) {
     return server && server->running;
 }
 
-#ifndef CONFIG_HTTPD_USE_RAW_API
 static void server_task(void* pvParameters) {
     struct httpd_server* server = (struct httpd_server*)pvParameters;
     event_loop_run(&server->event_loop, &server->handlers);
@@ -1369,7 +1177,6 @@ static void server_task(void* pvParameters) {
     server->task_exited = true;
     vTaskDelete(NULL);
 }
-#endif
 
 // ============================================================================
 // Route Management
@@ -1665,17 +1472,9 @@ int httpd_req_recv(httpd_req_t* req, void* buf, size_t len) {
         }
     }
 
-    // If we need more data:
-    // - Raw API: only pre-buffered body data is available (no socket to recv from).
-    //   Callers must use deferred or continuation handling for large bodies.
-    // - Socket API: do a single non-blocking recv from socket.
+    // If we need more data, do a single non-blocking recv from socket.
     remaining = (req->body_received < req->content_length)
               ? req->content_length - req->body_received : 0;
-#ifdef CONFIG_HTTPD_USE_RAW_API
-    // Under raw API, all body data arrives via recv_cb and is placed in body_buf.
-    // If body_buf is exhausted, caller must use httpd_req_defer() or continuation.
-    (void)remaining;  // No additional recv possible
-#else
     if (remaining > 0 && total_received < len) {
         size_t to_recv = (len - total_received) < remaining ? (len - total_received) : remaining;
 
@@ -1685,21 +1484,24 @@ int httpd_req_recv(httpd_req_t* req, void* buf, size_t len) {
             req->body_received += received;
             total_received += received;
         } else if (received == 0) {
-            // Connection closed
-            if (total_received == 0) return -1;
+            // Peer closed connection mid-body
+            if (total_received == 0) return HTTPD_ERR_CONN_CLOSED;
         } else {
             // received < 0
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // No data available right now - return what we have so far
-                // (which may be 0 if no pre-buffered data either)
+                // No data available right now
+                if (total_received == 0) {
+                    // Nothing pre-buffered either - signal would-block
+                    return HTTPD_ERR_WOULD_BLOCK;
+                }
+                // Have pre-buffered data - fall through to return it
             } else {
-                // Real error
+                // Real I/O error
                 ESP_LOGE(TAG, "recv error: %s", strerror(errno));
-                if (total_received == 0) return -1;
+                if (total_received == 0) return HTTPD_ERR_IO;
             }
         }
     }
-#endif
 
     return (int)total_received;
 }
@@ -1718,12 +1520,18 @@ void httpd_req_set_user_data(httpd_req_t* req, void* data) {
 
 httpd_err_t httpd_resp_set_status(httpd_req_t* req, int status) {
     if (!req) return HTTPD_ERR_INVALID_ARG;
+    if (status < 100 || status > 999) return HTTPD_ERR_INVALID_ARG;
     req->status_code = status;
     return HTTPD_OK;
 }
 
 httpd_err_t httpd_resp_set_header(httpd_req_t* req, const char* key, const char* value) {
     if (!req || !key || !value) return HTTPD_ERR_INVALID_ARG;
+
+    if (req->body_started) {
+        ESP_LOGW(TAG, "Cannot set header after body has started");
+        return HTTPD_ERR_INVALID_ARG;
+    }
 
     connection_t* conn = (connection_t*)req->_internal;
     if (!conn) return HTTPD_ERR_CONN_CLOSED;
@@ -1961,13 +1769,14 @@ httpd_err_t httpd_resp_send_chunk(httpd_req_t* req, const char* chunk, ssize_t l
                     return HTTPD_ERR_IO;
                 }
 
-                // Send data
+                // Partial chunk data on wire, stream is irrecoverable
                 if (send_nonblocking(conn, chunk, chunk_len, MSG_MORE) < 0) {
+                    conn->state = CONN_STATE_CLOSED;
                     return HTTPD_ERR_IO;
                 }
 
-                // Send terminator
                 if (send_nonblocking(conn, "\r\n", 2, 0) < 0) {
+                    conn->state = CONN_STATE_CLOSED;
                     return HTTPD_ERR_IO;
                 }
             } else {
@@ -1987,9 +1796,13 @@ httpd_err_t httpd_resp_send_chunk(httpd_req_t* req, const char* chunk, ssize_t l
                                                   conn->pool_index, true);
                 } else {
                     // Contiguous space not enough (wrap-around) - use queue
-                    if (send_buffer_queue(sb, size_header, header_len) < 0 ||
-                        send_buffer_queue(sb, chunk, chunk_len) < 0 ||
+                    if (send_buffer_queue(sb, size_header, header_len) < 0) {
+                        return HTTPD_ERR_IO;
+                    }
+                    // Partial chunk data in buffer, stream is irrecoverable
+                    if (send_buffer_queue(sb, chunk, chunk_len) < 0 ||
                         send_buffer_queue(sb, "\r\n", 2) < 0) {
+                        conn->state = CONN_STATE_CLOSED;
                         return HTTPD_ERR_IO;
                     }
                     connection_mark_write_pending(&g_server->connection_pool,
@@ -2007,6 +1820,15 @@ httpd_err_t httpd_resp_send_error(httpd_req_t* req, int status, const char* mess
 
     connection_t* conn = (connection_t*)req->_internal;
     if (!conn) return HTTPD_ERR_CONN_CLOSED;
+
+    // If headers have already been sent, we cannot send a new HTTP status line
+    // without producing malformed output (two status lines in one stream).
+    // Close the connection to prevent further damage.
+    if (req->headers_sent) {
+        ESP_LOGW(TAG, "Cannot send error %d after headers already committed; closing connection", status);
+        conn->state = CONN_STATE_CLOSED;
+        return HTTPD_ERR_IO;
+    }
 
     req->status_code = status;
     const char* msg = message ? message : httpd_status_text(status);
@@ -2262,6 +2084,8 @@ httpd_err_t httpd_resp_send_async(httpd_req_t* req, const char* body, ssize_t le
         }
     }
 
+    req->body_started = true;
+
     // Queue body
     if (body && body_len > 0) {
         if (send_nonblocking(conn, body, body_len, 0) < 0) {
@@ -2416,26 +2240,48 @@ ssize_t httpd_req_pipe_to_file(httpd_req_t* req, const char* path) {
         return HTTPD_ERR_IO;
     }
 
+    // NOTE: This function blocks the event loop while receiving the body.
+    // For production use with large uploads, prefer httpd_req_defer_to_file()
+    // which handles body reception asynchronously via the event loop.
     char buf[PIPE_BUFFER_SIZE];
     ssize_t total_written = 0;
     int received;
+    int eagain_retries = 0;
+    static const int MAX_EAGAIN_RETRIES = 500;  // 500 * 10ms = 5 seconds max
 
-    while ((received = httpd_req_recv(req, buf, sizeof(buf))) > 0) {
-        size_t written = fwrite(buf, 1, received, fp);
-        if (written != (size_t)received) {
-            ESP_LOGE(TAG, "Failed to write to file: %s", path);
+    for (;;) {
+        received = httpd_req_recv(req, buf, sizeof(buf));
+        if (received > 0) {
+            eagain_retries = 0;  // Reset retry counter on successful recv
+            size_t written = fwrite(buf, 1, received, fp);
+            if (written != (size_t)received) {
+                ESP_LOGE(TAG, "Failed to write to file: %s", path);
+                fclose(fp);
+                return HTTPD_ERR_IO;
+            }
+            total_written += written;
+        } else if (received == 0) {
+            // All body data received (EOF / content_length reached)
+            break;
+        } else if (received == HTTPD_ERR_WOULD_BLOCK) {
+            // No data available yet - retry with a small delay
+            eagain_retries++;
+            if (eagain_retries >= MAX_EAGAIN_RETRIES) {
+                ESP_LOGE(TAG, "Timed out waiting for body data after %d retries",
+                         eagain_retries);
+                fclose(fp);
+                return HTTPD_ERR_TIMEOUT;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        } else {
+            // Other error (HTTPD_ERR_CONN_CLOSED, HTTPD_ERR_IO, etc.)
+            ESP_LOGE(TAG, "Error receiving request body: %d", received);
             fclose(fp);
-            return HTTPD_ERR_IO;
+            return received;  // Propagate the specific error code
         }
-        total_written += written;
     }
 
     fclose(fp);
-
-    if (received < 0) {
-        ESP_LOGE(TAG, "Error receiving request body");
-        return HTTPD_ERR_IO;
-    }
 
     ESP_LOGI(TAG, "Piped %zd bytes to file: %s", total_written, path);
     return total_written;
@@ -2447,12 +2293,17 @@ httpd_err_t httpd_resp_send_continue(httpd_req_t* req) {
     connection_t* conn = (connection_t*)req->_internal;
     if (!conn) return HTTPD_ERR_CONN_CLOSED;
 
+    // Prevent duplicate 100 Continue sends (e.g. user calls this then pipe_to_file)
+    request_context_t* ctx = get_req_context(req);
+    if (ctx && ctx->continue_sent) return HTTPD_OK;
+
     // Use compile-time constant length instead of runtime strlen()
     static const char response[] = "HTTP/1.1 100 Continue\r\n\r\n";
     if (send_nonblocking(conn, response, sizeof(response) - 1, 0) < 0) {
         return HTTPD_ERR_IO;
     }
 
+    if (ctx) ctx->continue_sent = true;
     return HTTPD_OK;
 }
 
@@ -2538,8 +2389,9 @@ httpd_err_t httpd_req_defer(httpd_req_t* req, httpd_body_cb_t on_body, httpd_don
         ctx->body_buf_pos = 0;
     }
 
-    // Check if body is already complete (small POST that fit in header buffer)
-    if (req->content_length > 0 && req->body_received >= req->content_length) {
+    // Check if body is already complete (small POST that fit in header buffer,
+    // or Content-Length: 0 where no body is expected at all)
+    if (req->body_received >= req->content_length) {
         ESP_LOGD(TAG, "Body already complete, calling on_done");
         on_done(req, HTTPD_OK);
         ctx->defer.active = false;
@@ -2566,6 +2418,7 @@ httpd_err_t httpd_req_defer_pause(httpd_req_t* req) {
 
     ctx->defer.paused = true;
     conn->defer_paused = 1;
+    connection_mark_read_paused(&g_server->connection_pool, conn->pool_index, true);
     ESP_LOGD(TAG, "Deferred request paused");
     return HTTPD_OK;
 }
@@ -2587,6 +2440,7 @@ httpd_err_t httpd_req_defer_resume(httpd_req_t* req) {
 
     ctx->defer.paused = false;
     conn->defer_paused = 0;
+    connection_mark_read_paused(&g_server->connection_pool, conn->pool_index, false);
     ESP_LOGD(TAG, "Deferred request resumed");
     return HTTPD_OK;
 }
@@ -2681,7 +2535,7 @@ httpd_err_t httpd_req_continue(httpd_req_t* req, httpd_continuation_t handler,
     if (err == HTTPD_ERR_WOULD_BLOCK) {
         // Handler wants to wait for more data - this is expected
         // Check if body is already complete
-        if (req->content_length > 0 && req->body_received >= req->content_length) {
+        if (req->body_received >= req->content_length) {
             ESP_LOGD(TAG, "Body already complete, calling handler with completion");
             // Call handler one more time to signal completion
             err = handler(req, NULL, 0, &ctx->continuation.cont);
@@ -2724,11 +2578,13 @@ bool httpd_req_is_continuation(httpd_req_t* req) {
  * Always compares the full length regardless of where differences occur.
  */
 static bool constant_time_compare_n(const char* a, size_t len_a, const char* b, size_t len_b) {
-    // Use len_b to avoid leaking length of 'a' (the secret)
+    if (len_a == 0 || len_b == 0) {
+        return len_a == len_b;  // Equal only if both empty
+    }
     volatile uint8_t result = len_a ^ len_b;
-    size_t len = len_a < len_b ? len_a : len_b;
-    for (size_t i = 0; i < len; i++) {
-        result |= (uint8_t)(a[i] ^ b[i]);
+    size_t max_len = len_a > len_b ? len_a : len_b;
+    for (size_t i = 0; i < max_len; i++) {
+        result |= a[i % len_a] ^ b[i % len_b];
     }
     return result == 0;
 }
@@ -2848,13 +2704,7 @@ httpd_err_t httpd_ws_send(httpd_ws_t* ws, const void* data, size_t len, ws_type_
     connection_t* conn = (connection_t*)ws->_internal;
     if (!conn) return HTTPD_ERR_CONN_CLOSED;
 
-#ifdef CONFIG_HTTPD_USE_RAW_API
-    HTTPD_LOCK_TCPIP();
-#endif
     int ret = ws_send_frame(conn, opcode, (const uint8_t*)data, len, false);
-#ifdef CONFIG_HTTPD_USE_RAW_API
-    HTTPD_UNLOCK_TCPIP();
-#endif
 
     if (ret < 0) {
         return HTTPD_ERR_IO;
@@ -2873,7 +2723,13 @@ int httpd_ws_broadcast(httpd_handle_t handle, const char* pattern,
     struct httpd_server* server = handle;
     if (!server || !pattern || !data) return -1;
 
-    ws_opcode_internal_t opcode = (type == WS_TYPE_BINARY) ? WS_OPCODE_BINARY : WS_OPCODE_TEXT;
+    ws_opcode_internal_t opcode;
+    switch (type) {
+        case WS_TYPE_BINARY: opcode = WS_OPCODE_BINARY; break;
+        case WS_TYPE_PING:   opcode = WS_OPCODE_PING; break;
+        case WS_TYPE_CLOSE:  opcode = WS_OPCODE_CLOSE; break;
+        default:             opcode = WS_OPCODE_TEXT; break;
+    }
     int sent = 0;
 
     // Resolve pattern to route_index once, then compare indices in the loop
@@ -2888,10 +2744,6 @@ int httpd_ws_broadcast(httpd_handle_t handle, const char* pattern,
         }
         if (target_index == UINT8_MAX) return 0;  // No matching route
     }
-
-#ifdef CONFIG_HTTPD_USE_RAW_API
-    HTTPD_LOCK_TCPIP();
-#endif
 
     // O(k) iteration where k = number of active WebSocket connections
     uint32_t mask = server->connection_pool.ws_active_mask;
@@ -2908,10 +2760,6 @@ int httpd_ws_broadcast(httpd_handle_t handle, const char* pattern,
             sent++;
         }
     }
-
-#ifdef CONFIG_HTTPD_USE_RAW_API
-    HTTPD_UNLOCK_TCPIP();
-#endif
 
     return sent;
 }
@@ -2935,10 +2783,6 @@ httpd_err_t httpd_ws_close(httpd_ws_t* ws, uint16_t code, const char* reason) {
 
     connection_t* conn = (connection_t*)ws->_internal;
 
-#ifdef CONFIG_HTTPD_USE_RAW_API
-    HTTPD_LOCK_TCPIP();
-#endif
-
     ws_send_frame(conn, WS_OPCODE_CLOSE, close_data, close_len, false);
 
     // Per RFC 6455 section 5.5.1: after sending a Close frame, wait for the
@@ -2952,10 +2796,6 @@ httpd_err_t httpd_ws_close(httpd_ws_t* ws, uint16_t code, const char* reason) {
         // Fallback: no connection context, close immediately
         ws->connected = false;
     }
-
-#ifdef CONFIG_HTTPD_USE_RAW_API
-    HTTPD_UNLOCK_TCPIP();
-#endif
 
     return HTTPD_OK;
 }
@@ -3142,10 +2982,6 @@ int httpd_ws_publish(httpd_handle_t handle, const char* channel,
         default: return 0;
     }
 
-#ifdef CONFIG_HTTPD_USE_RAW_API
-    HTTPD_LOCK_TCPIP();
-#endif
-
     // O(k) iteration where k = number of active WebSocket connections
     uint32_t ws_mask = server->connection_pool.ws_active_mask;
     while (ws_mask) {
@@ -3160,10 +2996,6 @@ int httpd_ws_publish(httpd_handle_t handle, const char* channel,
             }
         }
     }
-
-#ifdef CONFIG_HTTPD_USE_RAW_API
-    HTTPD_UNLOCK_TCPIP();
-#endif
 
     return sent;
 }
@@ -3306,6 +3138,7 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
         ESP_LOGE(TAG, "Request headers too large (%zu bytes)", new_total);
         ctx->parsing_in_progress = false;
         httpd_resp_send_error(&ctx->req, 431, "Request Header Fields Too Large");
+        conn->state = CONN_STATE_CLOSED;
         return;
     }
     if (!ctx->recv_buf) {
@@ -3321,6 +3154,7 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
                 ESP_LOGE(TAG, "Failed to allocate recv buffer");
                 ctx->parsing_in_progress = false;
                 httpd_resp_send_error(&ctx->req, 500, "Internal Server Error");
+                conn->state = CONN_STATE_CLOSED;
                 return;
             }
             ctx->recv_buf_capacity = len;
@@ -3339,6 +3173,7 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
                 ESP_LOGE(TAG, "Failed to grow recv buffer");
                 ctx->parsing_in_progress = false;
                 httpd_resp_send_error(&ctx->req, 500, "Internal Server Error");
+                conn->state = CONN_STATE_CLOSED;
                 return;
             }
             memcpy(new_buf, old_buf, ctx->recv_buf_len);
@@ -3349,6 +3184,7 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
                 ESP_LOGE(TAG, "Failed to grow recv buffer");
                 ctx->parsing_in_progress = false;
                 httpd_resp_send_error(&ctx->req, 500, "Internal Server Error");
+                conn->state = CONN_STATE_CLOSED;
                 return;
             }
         }
@@ -3384,6 +3220,7 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
     if (result == PARSE_ERROR) {
         ctx->parsing_in_progress = false;
         httpd_resp_send_error(&ctx->req, 400, "Bad Request");
+        conn->state = CONN_STATE_CLOSED;
         return;
     }
 
@@ -3434,6 +3271,7 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
         } else {
             ESP_LOGE(TAG, "Failed to allocate URI buffer");
             httpd_resp_send_error(&ctx->req, 500, "Internal Server Error");
+            conn->state = CONN_STATE_CLOSED;
             return;
         }
     }
@@ -3489,7 +3327,9 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
     // Send complete response in single write (avoids 5x snprintf + 5x send overhead)
     if (g_server->config.enable_cors && ctx->req.method == HTTP_OPTIONS) {
         const char* cors_origin = g_server->config.cors_origin ? g_server->config.cors_origin : "*";
-        send_cors_preflight(&ctx->req, conn, cors_origin);
+        if (send_cors_preflight(&ctx->req, conn, cors_origin) != HTTPD_OK) {
+            conn->state = CONN_STATE_CLOSED;
+        }
         return;
     }
 
@@ -3510,7 +3350,9 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
                 // Send WebSocket handshake response FIRST (HTTP 101 Switching Protocols)
                 // This MUST happen before the handler can send any WebSocket frames
                 if (ws_send_handshake_response(conn, ctx->req.ws_key) < 0) {
-                    // Handshake failed - close connection
+                    // Handshake failed - mark connection for cleanup by event loop
+                    ESP_LOGE(TAG, "WebSocket handshake failed for %.*s", (int)ctx->req.path_len, ctx->req.path);
+                    conn->state = CONN_STATE_CLOSED;
                     return;
                 }
                 conn->state = CONN_STATE_WEBSOCKET;
@@ -3618,9 +3460,12 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
             ctx->req._mw.final_user_ctx = match.user_ctx;
             ctx->req._mw.router = NULL;
 
+            // Set user_ctx before dispatch (needed when mw_count == 0 bypasses _middleware_next)
+            ctx->req.user_data = match.user_ctx;
+
             // Execute middleware chain
             httpd_err_t err = (mw_count > 0) ? _middleware_next(&ctx->req) : match.handler(&ctx->req);
-            if (err != HTTPD_OK) {
+            if (err != HTTPD_OK && conn->state != CONN_STATE_CLOSED) {
                 handle_error(err, &ctx->req);
             }
 
@@ -3681,9 +3526,12 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
             ctx->req._mw.final_handler = match.handler;
             ctx->req._mw.final_user_ctx = match.user_ctx;
 
+            // Set user_ctx before dispatch (needed when mw_count == 0 bypasses _middleware_next)
+            ctx->req.user_data = match.user_ctx;
+
             // Execute middleware chain
             httpd_err_t err = (mw_count > 0) ? _middleware_next(&ctx->req) : match.handler(&ctx->req);
-            if (err != HTTPD_OK) {
+            if (err != HTTPD_OK && conn->state != CONN_STATE_CLOSED) {
                 handle_error(err, &ctx->req);
             }
         }
@@ -3692,7 +3540,9 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
     }
 
     // No route found
-    handle_error(HTTPD_ERR_NOT_FOUND, &ctx->req);
+    if (conn->state != CONN_STATE_CLOSED) {
+        handle_error(HTTPD_ERR_NOT_FOUND, &ctx->req);
+    }
 }
 
 static void on_http_body(connection_t* conn, uint8_t* buffer, size_t len) {
@@ -3714,9 +3564,11 @@ static void on_http_body(connection_t* conn, uint8_t* buffer, size_t len) {
         httpd_err_t err = ctx->continuation.handler(&ctx->req, buffer, len,
                                                      &ctx->continuation.cont);
 
-        // Track received bytes
+        // Track received bytes (server handles this automatically —
+        // user continuation handlers should NOT increment received_bytes)
         ctx->req.body_received += len;
         ctx->continuation.cont.received_bytes += len;
+
 
         ESP_LOGD(TAG, "Continuation body: total %zu/%zu, handler returned %d",
                  ctx->req.body_received, ctx->req.content_length, err);
@@ -3750,10 +3602,9 @@ static void on_http_body(connection_t* conn, uint8_t* buffer, size_t len) {
     // Handle deferred body reception
     if (!ctx->defer.active) return;
 
-    // Skip if paused (flow control) - still track bytes to avoid hanging on content-length
+    // If we get here while paused, the event loop should have prevented it
     if (ctx->defer.paused) {
-        ESP_LOGW(TAG, "Deferred body paused, discarding %zu bytes", len);
-        ctx->req.body_received += len;
+        ESP_LOGE(TAG, "BUG: on_http_body called while paused, discarding %" PRIu32 " bytes", (uint32_t)len);
         return;
     }
 
@@ -3930,6 +3781,15 @@ static void on_disconnect(connection_t* conn) {
         }
     }
 
+    // Handle disconnect for active continuation
+    if (conn->continuation && ctx && ctx->continuation.active) {
+        ESP_LOGW(TAG, "Connection closed during active continuation");
+        // Notify the handler with data=NULL, len=0 so it can clean up user state
+        ctx->continuation.handler(&ctx->req, NULL, 0, &ctx->continuation.cont);
+        ctx->continuation.active = false;
+        conn->continuation = 0;
+    }
+
     // Handle disconnect for async send
     if (ctx && ctx->async_send.active) {
         httpd_send_cb_t callback = ctx->async_send.on_done;
@@ -4010,16 +3870,6 @@ static void on_write_ready(connection_t* conn) {
                 to_read = sb->file_remaining;
             }
 
-#ifdef CONFIG_HTTPD_USE_RAW_API
-            // Cannot block in tcpip_thread - submit to file I/O worker
-            // Worker will call on_write_ready again after read completes
-            if (!send_buffer_has_data(sb)) {
-                // Only submit if we don't already have data to send
-                file_io_submit_read(conn->pool_index, sb->file_fd, write_ptr, to_read);
-                return;  // Will resume when worker signals back
-            }
-            // If we have data to send, send it first - worker will refill later
-#else
             // Read directly into ring buffer - no intermediate copy
             ssize_t bytes_read = read(sb->file_fd, write_ptr, to_read);
             if (bytes_read > 0) {
@@ -4035,7 +3885,6 @@ static void on_write_ready(connection_t* conn) {
                 ESP_LOGE(TAG, "File read error: %s", strerror(errno));
                 send_buffer_stop_file(sb);
             }
-#endif
         }
     }
 
@@ -4102,27 +3951,6 @@ static void on_write_ready(connection_t* conn) {
         size_t len = send_buffer_peek(sb, &data);
         if (len == 0) break;
 
-#ifdef CONFIG_HTTPD_USE_RAW_API
-        ssize_t sent = raw_tcp_write(conn, data, len, false);
-        if (sent <= 0) {
-            if (sent == 0) {
-                // No send buffer space, will retry on next sent callback
-                return;
-            }
-            // Error
-            ESP_LOGE(TAG, "Send error on conn [%d]", conn->pool_index);
-            if (ctx && ctx->async_send.active) {
-                httpd_send_cb_t callback = ctx->async_send.on_done;
-                ctx->async_send.active = false;
-                ctx->async_send.on_done = NULL;
-                if (callback) {
-                    callback(&ctx->req, HTTPD_ERR_IO);
-                }
-            }
-            conn->state = CONN_STATE_CLOSED;
-            return;
-        }
-#else
         ssize_t sent = send(conn->fd, data, len, MSG_DONTWAIT);
         if (sent < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -4142,7 +3970,6 @@ static void on_write_ready(connection_t* conn) {
             conn->state = CONN_STATE_CLOSED;
             return;
         }
-#endif
 
         send_buffer_consume(sb, sent);
     }

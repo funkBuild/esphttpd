@@ -82,7 +82,11 @@ static httpd_err_t handle_api_echo(httpd_req_t* req) {
 
     // Read the request body - smaller buffer for stack safety
     char body[512];
-    size_t received = httpd_req_recv(req, body, sizeof(body) - 1);
+    int received = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (received < 0) {
+        ESP_LOGE(TAG, "httpd_req_recv failed: %d", received);
+        return httpd_resp_send_error(req, 500, "Body read error");
+    }
     body[received] = '\0';  // Null terminate
 
     httpd_resp_set_status(req, 200);
@@ -183,11 +187,15 @@ static httpd_err_t handle_api_update(httpd_req_t* req) {
 
     // Read the request body to get byte count - smaller buffer for stack safety
     char body[256];
-    size_t received = httpd_req_recv(req, body, sizeof(body) - 1);
+    int received = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (received < 0) {
+        ESP_LOGE(TAG, "httpd_req_recv failed: %d", received);
+        return httpd_resp_send_error(req, 500, "Body read error");
+    }
 
     char json[128];
     int len = snprintf(json, sizeof(json),
-             "{\"message\":\"Updated\",\"bytes_received\":%zu}",
+             "{\"message\":\"Updated\",\"bytes_received\":%d}",
              received);
 
     httpd_resp_set_status(req, 200);
@@ -442,13 +450,30 @@ static httpd_err_t handle_upload_continue(httpd_req_t* req) {
         httpd_resp_send_continue(req);
     }
 
-    // Read the body
+    // Read the body, handling EAGAIN with bounded retries
     char body[512];
     size_t total = 0;
     int received;
-    while ((received = httpd_req_recv(req, body + total, sizeof(body) - total - 1)) > 0) {
-        total += received;
-        if (total >= sizeof(body) - 1) break;
+    int eagain_retries = 0;
+    static const int MAX_RETRIES = 500;  // 500 * 10ms = 5 seconds max
+    while (total < sizeof(body) - 1) {
+        received = httpd_req_recv(req, body + total, sizeof(body) - total - 1);
+        if (received > 0) {
+            total += received;
+            eagain_retries = 0;
+        } else if (received == 0) {
+            break;  // All body data received
+        } else if (received == HTTPD_ERR_WOULD_BLOCK) {
+            eagain_retries++;
+            if (eagain_retries >= MAX_RETRIES) {
+                ESP_LOGE(TAG, "Timed out waiting for body data");
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        } else {
+            ESP_LOGE(TAG, "httpd_req_recv error: %d", received);
+            break;
+        }
     }
     body[total] = '\0';
 

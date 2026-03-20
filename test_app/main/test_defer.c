@@ -32,7 +32,8 @@ static void reset_test_state(void) {
 static void start_test_server(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.port = 80;
-    httpd_start(&test_handle, &config);
+    httpd_err_t err = httpd_start(&test_handle, &config);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
 }
 
 // Helper to stop server after tests
@@ -671,7 +672,7 @@ static void test_defer_null_body_callback(void) {
     stop_test_server();
 }
 
-// Test httpd_req_defer with zero content length
+// Test httpd_req_defer with zero content length (POST/PUT with Content-Length: 0)
 static void test_defer_zero_content_length(void) {
     start_test_server();
     reset_test_state();
@@ -709,12 +710,17 @@ static void test_defer_zero_content_length(void) {
     httpd_err_t err = httpd_req_defer(&ctx->req, test_body_callback, test_done_callback);
     TEST_ASSERT_EQUAL(HTTPD_OK, err);
 
-    // With zero content length, body is "complete" but condition checks content_length > 0
-    // So done callback should NOT be called immediately
-    TEST_ASSERT_FALSE(done_callback_called);
+    // With zero content length, no body is expected - on_done should fire immediately
+    TEST_ASSERT_TRUE(done_callback_called);
+    TEST_ASSERT_EQUAL(HTTPD_OK, done_callback_error);
 
-    // Should still be in deferred mode (waiting for end of stream)
-    TEST_ASSERT_TRUE(ctx->defer.active);
+    // No body data should have been delivered
+    TEST_ASSERT_EQUAL(0, body_callback_count);
+    TEST_ASSERT_EQUAL(0, body_bytes_received);
+
+    // Defer should be deactivated since it completed
+    TEST_ASSERT_FALSE(ctx->defer.active);
+    TEST_ASSERT_EQUAL(0, conn->deferred);
 
     stop_test_server();
 }
@@ -779,6 +785,147 @@ static void test_defer_resume_no_connection(void) {
     stop_test_server();
 }
 
+// Test httpd_req_defer_pause sets read_paused_mask on the connection pool
+static void test_defer_pause_sets_read_paused_mask(void) {
+    start_test_server();
+    reset_test_state();
+
+    TEST_ASSERT_NOT_NULL(g_server);
+    TEST_ASSERT_NOT_NULL(g_test_request_contexts);
+
+    connection_pool_t* pool = &g_server->connection_pool;
+    int idx = 2;  // Use a non-zero index to test bit positioning
+    connection_t* conn = connection_get(pool, idx);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    // Set up connection in deferred mode
+    conn->fd = 999;
+    conn->state = CONN_STATE_HTTP_BODY;
+    conn->deferred = 1;
+    conn->defer_paused = 0;
+    conn->pool_index = idx;
+    conn->content_length = 1000;
+    conn->bytes_received = 0;
+
+    // Set up request context in deferred mode
+    test_request_context_t* ctx = get_test_ctx(idx);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->req._internal = conn;
+    ctx->req.content_length = 1000;
+    ctx->defer.active = true;
+    ctx->defer.paused = false;
+    ctx->defer.on_body = test_body_callback;
+    ctx->defer.on_done = test_done_callback;
+
+    // Verify read_paused_mask is initially clear for this index
+    TEST_ASSERT_FALSE(connection_is_read_paused(pool, idx));
+
+    // Pause
+    httpd_err_t err = httpd_req_defer_pause(&ctx->req);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
+
+    // Verify read_paused_mask bit is set
+    TEST_ASSERT_TRUE(connection_is_read_paused(pool, idx));
+    TEST_ASSERT_TRUE((pool->read_paused_mask & (1U << idx)) != 0);
+
+    // Clean up
+    connection_mark_read_paused(pool, idx, false);
+
+    stop_test_server();
+}
+
+// Test httpd_req_defer_resume clears read_paused_mask on the connection pool
+static void test_defer_resume_clears_read_paused_mask(void) {
+    start_test_server();
+    reset_test_state();
+
+    TEST_ASSERT_NOT_NULL(g_server);
+    TEST_ASSERT_NOT_NULL(g_test_request_contexts);
+
+    connection_pool_t* pool = &g_server->connection_pool;
+    int idx = 3;
+    connection_t* conn = connection_get(pool, idx);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    // Set up connection in deferred mode
+    conn->fd = 999;
+    conn->state = CONN_STATE_HTTP_BODY;
+    conn->deferred = 1;
+    conn->defer_paused = 0;
+    conn->pool_index = idx;
+    conn->content_length = 1000;
+    conn->bytes_received = 0;
+
+    // Set up request context in deferred mode
+    test_request_context_t* ctx = get_test_ctx(idx);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->req._internal = conn;
+    ctx->req.content_length = 1000;
+    ctx->defer.active = true;
+    ctx->defer.paused = false;
+    ctx->defer.on_body = test_body_callback;
+    ctx->defer.on_done = test_done_callback;
+
+    // Pause first
+    httpd_err_t err = httpd_req_defer_pause(&ctx->req);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
+    TEST_ASSERT_TRUE(connection_is_read_paused(pool, idx));
+
+    // Resume
+    err = httpd_req_defer_resume(&ctx->req);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
+
+    // Verify read_paused_mask bit is cleared
+    TEST_ASSERT_FALSE(connection_is_read_paused(pool, idx));
+    TEST_ASSERT_TRUE((pool->read_paused_mask & (1U << idx)) == 0);
+
+    stop_test_server();
+}
+
+// Test that connection close/cleanup clears the read_paused_mask bit
+static void test_defer_pause_connection_close_clears_mask(void) {
+    start_test_server();
+    reset_test_state();
+
+    TEST_ASSERT_NOT_NULL(g_server);
+    TEST_ASSERT_NOT_NULL(g_test_request_contexts);
+
+    connection_pool_t* pool = &g_server->connection_pool;
+    int idx = 4;
+    connection_t* conn = connection_get(pool, idx);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    // Set up connection in deferred mode
+    conn->fd = 999;
+    conn->state = CONN_STATE_HTTP_BODY;
+    conn->deferred = 1;
+    conn->defer_paused = 1;
+    conn->pool_index = idx;
+    conn->content_length = 1000;
+    conn->bytes_received = 0;
+    connection_mark_active(pool, idx);
+
+    // Manually set read_paused_mask (as pause would)
+    connection_mark_read_paused(pool, idx, true);
+    TEST_ASSERT_TRUE(connection_is_read_paused(pool, idx));
+
+    // Close the connection
+    connection_close(pool, conn);
+
+    // read_paused_mask bit should be cleared by connection_close
+    TEST_ASSERT_FALSE(connection_is_read_paused(pool, idx));
+
+    // Clean up via cleanup_closed
+    connection_cleanup_closed(pool);
+    TEST_ASSERT_FALSE(connection_is_active(pool, idx));
+
+    stop_test_server();
+}
+
 // ==================== TEST RUNNER ====================
 
 void test_defer_run(void) {
@@ -812,6 +959,11 @@ void test_defer_run(void) {
     RUN_TEST(test_defer_no_connection);
     RUN_TEST(test_defer_pause_no_connection);
     RUN_TEST(test_defer_resume_no_connection);
+
+    // TCP backpressure (read_paused_mask) tests
+    RUN_TEST(test_defer_pause_sets_read_paused_mask);
+    RUN_TEST(test_defer_resume_clears_read_paused_mask);
+    RUN_TEST(test_defer_pause_connection_close_clears_mask);
 
     ESP_LOGI(TAG, "Defer tests completed");
 }

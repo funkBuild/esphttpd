@@ -1,5 +1,4 @@
 #include "private/event_loop.h"
-#ifndef CONFIG_HTTPD_USE_RAW_API
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -8,9 +7,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
-#endif
 #include <string.h>
 #include <stdlib.h>
+#include <inttypes.h>
 #include "esp_log.h"
 
 static const char TAG[] __attribute__((unused)) = "EVENT_LOOP";
@@ -20,10 +19,8 @@ static const event_loop_config_t default_config = {
     .port = 80,
     .backlog = 5,
     .timeout_ms = 30000,        // 30 second timeout
-#ifndef CONFIG_HTTPD_USE_RAW_API
     .select_timeout_ms = 1000,   // 1 second select timeout
     .io_buffer_size = 1024,      // 1KB I/O buffer
-#endif
     .ws_close_timeout_ms = 5000, // 5 second WS close handshake timeout
     .nodelay = true,             // Disable Nagle's algorithm
     .reuseaddr = true            // Allow address reuse
@@ -41,24 +38,16 @@ void event_loop_init(event_loop_t* loop, connection_pool_t* pool, const event_lo
     if (loop->config.timeout_ms == 0) loop->config.timeout_ms = 30000;
     if (loop->config.backlog == 0) loop->config.backlog = 5;
     if (loop->config.ws_close_timeout_ms == 0) loop->config.ws_close_timeout_ms = 5000;
-#ifdef CONFIG_HTTPD_USE_RAW_API
-    loop->listen_pcb = NULL;
-    // Compute timeout in poll intervals (each poll = CONFIG_HTTPD_RAW_POLL_INTERVAL * 500ms)
-    uint32_t poll_interval_ms = CONFIG_HTTPD_RAW_POLL_INTERVAL * 500;
-    uint32_t divisor = poll_interval_ms > 0 ? poll_interval_ms : 1000;
-    loop->timeout_ticks = config->timeout_ms / divisor;
-    loop->ws_close_timeout_ticks = loop->config.ws_close_timeout_ms / divisor;
-#else
+    if (loop->config.io_buffer_size == 0) loop->config.io_buffer_size = 1024;
+    if (loop->config.select_timeout_ms == 0) loop->config.select_timeout_ms = 1000;
     loop->listen_fd = -1;
     // Precompute timeout in ticks (avoid division in hot path)
-    loop->timeout_ticks = config->select_timeout_ms > 0
-        ? config->timeout_ms / config->select_timeout_ms : config->timeout_ms;
-    loop->ws_close_timeout_ticks = config->select_timeout_ms > 0
-        ? loop->config.ws_close_timeout_ms / config->select_timeout_ms : 5;
+    // Use validated loop->config values (not raw config->) so defaults take effect
+    loop->timeout_ticks = loop->config.timeout_ms / loop->config.select_timeout_ms;
+    loop->ws_close_timeout_ticks = loop->config.ws_close_timeout_ms / loop->config.select_timeout_ms;
     // Precompute select timeout struct (avoid repeated struct construction)
-    loop->select_timeout.tv_sec = config->select_timeout_ms / 1000;
-    loop->select_timeout.tv_usec = (config->select_timeout_ms % 1000) * 1000;
-#endif
+    loop->select_timeout.tv_sec = loop->config.select_timeout_ms / 1000;
+    loop->select_timeout.tv_usec = (loop->config.select_timeout_ms % 1000) * 1000;
     loop->running = false;
 
     // Initialize connection pool
@@ -72,7 +61,6 @@ void event_loop_stop(event_loop_t* loop) {
 // ============================================================================
 // Socket-based event loop (select mode)
 // ============================================================================
-#ifndef CONFIG_HTTPD_USE_RAW_API
 
 int event_loop_create_listener(event_loop_t* loop) {
     struct sockaddr_in server_addr;
@@ -82,6 +70,14 @@ int event_loop_create_listener(event_loop_t* loop) {
     fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         ESP_LOGE(TAG, "Failed to create socket: %s", strerror(errno));
+        return -1;
+    }
+
+    // Reject listen fd that would overflow fd_set (check early to avoid
+    // wasting resources on bind/listen for a socket we'd reject anyway)
+    if (fd >= FD_SETSIZE) {
+        ESP_LOGE(TAG, "Listen fd %d >= FD_SETSIZE (%d)", fd, FD_SETSIZE);
+        close(fd);
         return -1;
     }
 
@@ -108,7 +104,7 @@ int event_loop_create_listener(event_loop_t* loop) {
     server_addr.sin_port = htons(loop->config.port);
 
     if (bind(fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        ESP_LOGE(TAG, "Failed to bind to port %d: %s", loop->config.port, strerror(errno));
+        ESP_LOGE(TAG, "Failed to bind to port %" PRIu16 ": %s", loop->config.port, strerror(errno));
         close(fd);
         return -1;
     }
@@ -120,19 +116,31 @@ int event_loop_create_listener(event_loop_t* loop) {
         return -1;
     }
 
-    // Reject listen fd that would overflow fd_set
-    if (fd >= FD_SETSIZE) {
-        ESP_LOGE(TAG, "Listen fd %d >= FD_SETSIZE (%d)", fd, FD_SETSIZE);
-        close(fd);
-        return -1;
-    }
-
     loop->listen_fd = fd;
-    ESP_LOGI(TAG, "Server listening on port %d", loop->config.port);
+    ESP_LOGI(TAG, "Server listening on port %" PRIu16, loop->config.port);
     return fd;
 }
 
-static void handle_new_connection(event_loop_t* loop, const event_handlers_t* handlers) {
+/**
+ * Accept a single pending connection from the listen socket.
+ * Returns true if a connection was accepted, false if the backlog is
+ * drained (EAGAIN/EWOULDBLOCK) or the pool is full.
+ */
+static bool handle_new_connection(event_loop_t* loop, const event_handlers_t* handlers) {
+    // Check for a free slot before calling accept() so we don't accept a
+    // connection only to immediately close it when the pool is full.
+    uint32_t free_mask = ~loop->pool->active_mask;
+    if (free_mask == 0) {
+        ESP_LOGW(TAG, "No free connection slots, stop accepting");
+        return false;
+    }
+
+    int slot = __builtin_ctz(free_mask);
+    if (slot >= MAX_CONNECTIONS) {
+        ESP_LOGW(TAG, "No free connection slots, stop accepting");
+        return false;
+    }
+
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
 
@@ -141,42 +149,28 @@ static void handle_new_connection(event_loop_t* loop, const event_handlers_t* ha
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
             ESP_LOGE(TAG, "Accept failed: %s", strerror(errno));
         }
-        return;
+        return false;
     }
 
     // Reject fds that would overflow fd_set (FD_SET with fd >= FD_SETSIZE is UB)
     if (client_fd >= FD_SETSIZE) {
         ESP_LOGE(TAG, "Accepted fd %d >= FD_SETSIZE (%d), rejecting", client_fd, FD_SETSIZE);
         close(client_fd);
-        return;
+        return false;
     }
 
-    // Set non-blocking (single syscall - we only need O_NONBLOCK)
-    if (fcntl(client_fd, F_SETFL, O_NONBLOCK) < 0) {
+    // Set non-blocking (preserve existing flags)
+    int flags = fcntl(client_fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(client_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
         ESP_LOGE(TAG, "Failed to set client non-blocking: %s", strerror(errno));
         close(client_fd);
-        return;
+        return false;
     }
 
     // Set TCP_NODELAY if configured
     if (loop->config.nodelay) {
         int nodelay = 1;
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-    }
-
-    // Find free connection slot using O(1) bit manipulation
-    uint32_t free_mask = ~loop->pool->active_mask;
-    if (free_mask == 0) {
-        ESP_LOGW(TAG, "No free connection slots, rejecting connection");
-        close(client_fd);
-        return;
-    }
-
-    int slot = __builtin_ctz(free_mask);
-    if (slot >= MAX_CONNECTIONS) {
-        ESP_LOGW(TAG, "No free connection slots, rejecting connection");
-        close(client_fd);
-        return;
     }
 
     // Initialize connection using memset (faster than 18+ individual assignments)
@@ -190,12 +184,14 @@ static void handle_new_connection(event_loop_t* loop, const event_handlers_t* ha
     connection_mark_active(loop->pool, slot);
     loop->total_connections++;
 
-    ESP_LOGD(TAG, "New connection [%d] from %s:%d",
+    ESP_LOGD(TAG, "New connection [%d] from %s:%" PRIu16,
              slot, inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
     if (handlers->on_connect) {
         handlers->on_connect(conn);
     }
+
+    return true;
 }
 
 static void handle_connection_data(event_loop_t* loop, connection_t* conn,
@@ -218,10 +214,12 @@ static void handle_connection_data(event_loop_t* loop, connection_t* conn,
         if (handlers->on_disconnect) {
             handlers->on_disconnect(conn);
         }
+        shutdown(conn->fd, SHUT_RDWR);
         close(conn->fd);
         connection_mark_inactive(loop->pool, conn->pool_index);
         connection_mark_write_pending(loop->pool, conn->pool_index, false);
         connection_mark_ws_inactive(loop->pool, conn->pool_index);
+        connection_mark_read_paused(loop->pool, conn->pool_index, false);
         return;
     }
 
@@ -269,11 +267,12 @@ void event_loop_check_timeouts(event_loop_t* loop) {
     // Use precomputed timeout_ticks (avoid division in hot path)
     uint32_t timeout_ticks = loop->timeout_ticks;
 
-    // Only check non-WebSocket connections (bitmask arithmetic to skip WS)
+    // Only check non-WebSocket, non-read-paused connections (bitmask arithmetic)
     // This eliminates per-iteration branch for WebSocket check
     // Note: CONN_STATE_WS_CLOSING connections are removed from ws_active_mask
     // so they are included here and get a shorter timeout below.
-    uint32_t mask = loop->pool->active_mask & ~loop->pool->ws_active_mask;
+    // Read-paused connections are excluded since they are intentionally idle.
+    uint32_t mask = loop->pool->active_mask & ~loop->pool->ws_active_mask & ~loop->pool->read_paused_mask;
     while (mask) {
         int i = __builtin_ctz(mask);
         mask &= mask - 1;  // Clear lowest set bit
@@ -319,18 +318,27 @@ int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, u
 
         // Handle closed connections
         if (conn->state == CONN_STATE_CLOSED) {
+            // Call on_ws_disconnect for WebSocket connections (mirrors handle_connection_data)
+            if (conn->is_websocket && handlers->on_ws_disconnect) {
+                handlers->on_ws_disconnect(conn);
+            }
             if (handlers->on_disconnect) {
                 handlers->on_disconnect(conn);
             }
+            shutdown(conn->fd, SHUT_RDWR);
             close(conn->fd);
             connection_mark_inactive(loop->pool, i);
             connection_mark_write_pending(loop->pool, i, false);
             connection_mark_ws_inactive(loop->pool, i);
+            connection_mark_read_paused(loop->pool, i, false);
             ESP_LOGD(TAG, "Connection [%d] closed", i);
             continue;
         }
 
-        FD_SET(conn->fd, &read_fds);
+        // Skip read-paused connections (TCP backpressure for deferred pause)
+        if (!connection_is_read_paused(loop->pool, i)) {
+            FD_SET(conn->fd, &read_fds);
+        }
 
         // Monitor for write readiness if data pending
         if (has_write_pending && connection_has_write_pending(loop->pool, i)) {
@@ -350,6 +358,41 @@ int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, u
                      NULL, &timeout);
 
     if (activity < 0) {
+        if (errno == EBADF) {
+            // A stale fd in the fd_set caused select() to fail.
+            // Validate every active connection's fd and close any that are bad.
+            // Without this, the caller would spin-loop on the persistent error.
+            ESP_LOGW(TAG, "Select returned EBADF, scanning for stale fds");
+            uint32_t scan_mask = loop->pool->active_mask;
+            while (scan_mask) {
+                int i = __builtin_ctz(scan_mask);
+                scan_mask &= scan_mask - 1;
+
+                connection_t* conn = &loop->pool->connections[i];
+                if (fcntl(conn->fd, F_GETFD) == -1 && errno == EBADF) {
+                    ESP_LOGW(TAG, "Connection [%d] fd %d is stale, closing", i, conn->fd);
+                    if (conn->is_websocket && handlers->on_ws_disconnect) {
+                        handlers->on_ws_disconnect(conn);
+                    }
+                    conn->state = CONN_STATE_CLOSED;
+                    if (handlers->on_disconnect) {
+                        handlers->on_disconnect(conn);
+                    }
+                    // fd is already invalid — skip shutdown/close, just clean up pool state
+                    connection_mark_inactive(loop->pool, i);
+                    connection_mark_write_pending(loop->pool, i, false);
+                    connection_mark_ws_inactive(loop->pool, i);
+                    connection_mark_read_paused(loop->pool, i, false);
+                }
+            }
+            // Also check the listen fd
+            if (fcntl(loop->listen_fd, F_GETFD) == -1 && errno == EBADF) {
+                ESP_LOGE(TAG, "Listen fd %d is stale, stopping event loop", loop->listen_fd);
+                loop->listen_fd = -1;
+                loop->running = false;
+            }
+            return -1;
+        }
         if (errno != EINTR) {
             ESP_LOGE(TAG, "Select error: %s", strerror(errno));
         }
@@ -365,9 +408,12 @@ int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, u
         return 0;
     }
 
-    // Handle new connections
+    // Handle new connections — drain the entire accept backlog so that
+    // burst arrivals between select() iterations don't get ECONNREFUSED.
     if (FD_ISSET(loop->listen_fd, &read_fds)) {
-        handle_new_connection(loop, handlers);
+        while (handle_new_connection(loop, handlers)) {
+            // Keep accepting until EAGAIN (backlog drained) or pool full
+        }
     }
 
     // Handle writable connections first (drain pending data before reading more)
@@ -414,6 +460,8 @@ void event_loop_run(event_loop_t* loop, const event_handlers_t* handlers) {
     if (loop->listen_fd < 0) {
         if (event_loop_create_listener(loop) < 0) {
             ESP_LOGE(TAG, "Failed to create listener");
+            free(loop->io_buffer);
+            loop->io_buffer = NULL;
             return;
         }
     }
@@ -439,7 +487,5 @@ void event_loop_run(event_loop_t* loop, const event_handlers_t* handlers) {
 
     ESP_LOGI(TAG, "Event loop stopped");
 }
-
-#endif // !CONFIG_HTTPD_USE_RAW_API
 
 // Connection pool functions moved to connection.c to avoid duplication

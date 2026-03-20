@@ -1182,6 +1182,225 @@ static void test_radix_mixed_param_wildcard(void) {
     radix_tree_destroy(tree);
 }
 
+// ========== Case-insensitive binary search sort-order fix ==========
+
+static void test_case_insensitive_mixed_case_siblings(void) {
+    ESP_LOGI(TAG, "Test: Case-insensitive with mixed-case sibling segments");
+
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    radix_tree_set_case_sensitive(tree, false);
+
+    // Insert routes whose first segments sort differently under memcmp vs strncasecmp.
+    // memcmp order:  "Users" (U=0x55) < "api" (a=0x61) < "status" (s=0x73)
+    // strncasecmp order: "api" < "status" < "Users"
+    // If the sort used memcmp but lookup used strncasecmp, binary search would miss entries.
+    radix_insert(tree, "/api/data", HTTP_GET, test_handler_1, (void*)1, NULL, 0);
+    radix_insert(tree, "/Users/list", HTTP_GET, test_handler_2, (void*)2, NULL, 0);
+    radix_insert(tree, "/status/health", HTTP_GET, test_handler_3, (void*)3, NULL, 0);
+
+    // Lookup with different cases - all must succeed
+    radix_match_t m1;
+    radix_lookup(tree, "/users/list", HTTP_GET, false, &m1, NULL, NULL);
+    TEST_ASSERT_TRUE(m1.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_2, m1.handler);
+
+    radix_match_t m2;
+    radix_lookup(tree, "/API/data", HTTP_GET, false, &m2, NULL, NULL);
+    TEST_ASSERT_TRUE(m2.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_1, m2.handler);
+
+    radix_match_t m3;
+    radix_lookup(tree, "/STATUS/health", HTTP_GET, false, &m3, NULL, NULL);
+    TEST_ASSERT_TRUE(m3.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_3, m3.handler);
+
+    radix_tree_destroy(tree);
+}
+
+static void test_case_insensitive_no_duplicate_insertion(void) {
+    ESP_LOGI(TAG, "Test: Case-insensitive insertion reuses existing node");
+
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    radix_tree_set_case_sensitive(tree, false);
+
+    // Insert "/Users/list" first
+    radix_insert(tree, "/Users/list", HTTP_GET, test_handler_1, (void*)1, NULL, 0);
+    uint16_t count_after_first = tree->node_count;
+
+    // Insert "/users/list" - should reuse existing "Users" node, not create a new one
+    radix_insert(tree, "/users/list", HTTP_POST, test_handler_2, (void*)2, NULL, 0);
+    uint16_t count_after_second = tree->node_count;
+
+    // Node count should not increase (both segments already exist)
+    TEST_ASSERT_EQUAL(count_after_first, count_after_second);
+
+    // Both methods should match on the same path
+    radix_match_t m1;
+    radix_lookup(tree, "/users/list", HTTP_GET, false, &m1, NULL, NULL);
+    TEST_ASSERT_TRUE(m1.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_1, m1.handler);
+
+    radix_match_t m2;
+    radix_lookup(tree, "/Users/list", HTTP_POST, false, &m2, NULL, NULL);
+    TEST_ASSERT_TRUE(m2.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_2, m2.handler);
+
+    radix_tree_destroy(tree);
+}
+
+// ========== Issue #8: WS middleware merge (not overwrite) ==========
+
+static httpd_err_t mw_handler_ws_a(httpd_req_t* req) {
+    return HTTPD_OK;
+}
+
+static httpd_err_t mw_handler_ws_b(httpd_req_t* req) {
+    return HTTPD_OK;
+}
+
+static void test_ws_middleware_merge(void) {
+    ESP_LOGI(TAG, "Test: WS middleware merges with existing HTTP middleware");
+
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    // Register HTTP route on "/api" with one middleware
+    httpd_middleware_t mw_a = (httpd_middleware_t)mw_handler_ws_a;
+    httpd_err_t err = radix_insert(tree, "/api", HTTP_GET, test_handler_1,
+                                   NULL, &mw_a, 1);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
+
+    // Find the node and verify initial middleware state
+    radix_match_t match;
+    radix_lookup(tree, "/api", HTTP_GET, false, &match, NULL, NULL);
+    TEST_ASSERT_TRUE(match.matched);
+
+    // Register WS route on same path "/api" with a different middleware
+    httpd_middleware_t mw_b = (httpd_middleware_t)mw_handler_ws_b;
+    err = radix_insert_ws(tree, "/api", (httpd_ws_handler_t)test_handler_2,
+                          NULL, 0, &mw_b, 1);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
+
+    // Look up the node via WS to verify WS handler is set
+    radix_match_t ws_match;
+    radix_lookup(tree, "/api", HTTP_GET, true, &ws_match, NULL, NULL);
+    TEST_ASSERT_TRUE(ws_match.matched);
+    TEST_ASSERT_TRUE(ws_match.is_websocket);
+
+    // Directly inspect the node's middleware via the tree structure.
+    // Walk the tree to find the "/api" node.
+    radix_node_t* api_node = NULL;
+    for (uint8_t i = 0; i < tree->root->child_count; i++) {
+        if (tree->root->children[i]->segment_len == 3 &&
+            memcmp(tree->root->children[i]->segment, "api", 3) == 0) {
+            api_node = tree->root->children[i];
+            break;
+        }
+    }
+    TEST_ASSERT_NOT_NULL(api_node);
+    TEST_ASSERT_EQUAL(2, api_node->middleware_count);
+    TEST_ASSERT_EQUAL_PTR(mw_a, api_node->middlewares[0]);
+    TEST_ASSERT_EQUAL_PTR(mw_b, api_node->middlewares[1]);
+
+    radix_tree_destroy(tree);
+}
+
+static void test_ws_middleware_double_registration(void) {
+    ESP_LOGI(TAG, "Test: WS middleware double registration merges correctly");
+
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    // First WS registration on "/ws" with one middleware
+    httpd_middleware_t mw_a = (httpd_middleware_t)mw_handler_ws_a;
+    httpd_err_t err = radix_insert_ws(tree, "/ws", (httpd_ws_handler_t)test_handler_1,
+                                      NULL, 0, &mw_a, 1);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
+
+    // Second WS registration on "/ws" with a different middleware
+    httpd_middleware_t mw_b = (httpd_middleware_t)mw_handler_ws_b;
+    err = radix_insert_ws(tree, "/ws", (httpd_ws_handler_t)test_handler_2,
+                          NULL, 0, &mw_b, 1);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
+
+    // Walk the tree to find the "/ws" node
+    radix_node_t* ws_node = NULL;
+    for (uint8_t i = 0; i < tree->root->child_count; i++) {
+        if (tree->root->children[i]->segment_len == 2 &&
+            memcmp(tree->root->children[i]->segment, "ws", 2) == 0) {
+            ws_node = tree->root->children[i];
+            break;
+        }
+    }
+    TEST_ASSERT_NOT_NULL(ws_node);
+    TEST_ASSERT_EQUAL(2, ws_node->middleware_count);
+    TEST_ASSERT_EQUAL_PTR(mw_a, ws_node->middlewares[0]);
+    TEST_ASSERT_EQUAL_PTR(mw_b, ws_node->middlewares[1]);
+
+    radix_tree_destroy(tree);
+}
+
+// ========== Task #49: Middleware collection during radix lookup ==========
+
+static httpd_err_t mw_collect_a(httpd_req_t* req) { return HTTPD_OK; }
+static httpd_err_t mw_collect_b(httpd_req_t* req) { return HTTPD_OK; }
+
+static void test_radix_lookup_collects_middleware(void) {
+    ESP_LOGI(TAG, "Test: Lookup collects middleware into mw_out");
+
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    // Register a route with 2 middleware functions
+    httpd_middleware_t mw_arr[2] = {
+        (httpd_middleware_t)mw_collect_a,
+        (httpd_middleware_t)mw_collect_b
+    };
+    httpd_err_t err = radix_insert(tree, "/api/protected", HTTP_GET,
+                                   test_handler_1, (void*)1, mw_arr, 2);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
+
+    // Lookup with mw_out buffer
+    radix_match_t match;
+    httpd_middleware_t mw_out[CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE];
+    uint8_t mw_count = 0;
+    memset(mw_out, 0, sizeof(mw_out));
+
+    radix_lookup(tree, "/api/protected", HTTP_GET, false, &match,
+                 mw_out, &mw_count);
+    TEST_ASSERT_TRUE(match.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_1, match.handler);
+
+    // Verify middleware was collected
+    TEST_ASSERT_EQUAL(2, mw_count);
+    TEST_ASSERT_EQUAL_PTR(mw_collect_a, mw_out[0]);
+    TEST_ASSERT_EQUAL_PTR(mw_collect_b, mw_out[1]);
+
+    radix_tree_destroy(tree);
+}
+
+static void test_radix_lookup_no_middleware_collection(void) {
+    ESP_LOGI(TAG, "Test: Lookup with NULL mw_out does not crash");
+
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    // Register a route with middleware
+    httpd_middleware_t mw = (httpd_middleware_t)mw_collect_a;
+    radix_insert(tree, "/api/test", HTTP_GET, test_handler_1, NULL, &mw, 1);
+
+    // Lookup with NULL mw_out — should still work, just skip collection
+    radix_match_t match;
+    radix_lookup(tree, "/api/test", HTTP_GET, false, &match, NULL, NULL);
+    TEST_ASSERT_TRUE(match.matched);
+
+    radix_tree_destroy(tree);
+}
+
 // ========== Issue #3: Method bounds check in radix_insert ==========
 
 static void test_radix_insert_invalid_method(void) {
@@ -1196,6 +1415,79 @@ static void test_radix_insert_invalid_method(void) {
     err = radix_insert(tree, "/test", (http_method_t)(-1),
                         test_handler_1, NULL, NULL, 0);
     TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, err);
+
+    radix_tree_destroy(tree);
+}
+
+// ========== Bug fix: HTTP_ANY fallback in radix_lookup ==========
+
+static void test_http_any_fallback_lookup(void) {
+    ESP_LOGI(TAG, "Test: HTTP_ANY route found via specific method lookup");
+
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    // Register a route with HTTP_ANY directly (goes into http_chains[7])
+    httpd_err_t err = radix_insert(tree, "/any/route", HTTP_ANY,
+                                   test_handler_1, (void*)0xAA, NULL, 0);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
+
+    // Lookup with HTTP_GET should fall back to HTTP_ANY and match
+    radix_match_t m_get;
+    radix_lookup(tree, "/any/route", HTTP_GET, false, &m_get, NULL, NULL);
+    TEST_ASSERT_TRUE(m_get.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_1, m_get.handler);
+    TEST_ASSERT_EQUAL_PTR((void*)0xAA, m_get.user_ctx);
+
+    // Lookup with HTTP_POST should also match via fallback
+    radix_match_t m_post;
+    radix_lookup(tree, "/any/route", HTTP_POST, false, &m_post, NULL, NULL);
+    TEST_ASSERT_TRUE(m_post.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_1, m_post.handler);
+
+    // Lookup with HTTP_PUT should also match via fallback
+    radix_match_t m_put;
+    radix_lookup(tree, "/any/route", HTTP_PUT, false, &m_put, NULL, NULL);
+    TEST_ASSERT_TRUE(m_put.matched);
+
+    // Lookup with HTTP_DELETE should also match via fallback
+    radix_match_t m_del;
+    radix_lookup(tree, "/any/route", HTTP_DELETE, false, &m_del, NULL, NULL);
+    TEST_ASSERT_TRUE(m_del.matched);
+
+    // Lookup with HTTP_ANY directly should match too
+    radix_match_t m_any;
+    radix_lookup(tree, "/any/route", HTTP_ANY, false, &m_any, NULL, NULL);
+    TEST_ASSERT_TRUE(m_any.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_1, m_any.handler);
+
+    radix_tree_destroy(tree);
+}
+
+static void test_http_any_specific_method_takes_priority(void) {
+    ESP_LOGI(TAG, "Test: Specific method handler takes priority over HTTP_ANY");
+
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    // Register HTTP_ANY handler
+    radix_insert(tree, "/priority", HTTP_ANY, test_handler_1, (void*)1, NULL, 0);
+    // Register specific GET handler
+    radix_insert(tree, "/priority", HTTP_GET, test_handler_2, (void*)2, NULL, 0);
+
+    // GET should match the specific handler, not the ANY fallback
+    radix_match_t m_get;
+    radix_lookup(tree, "/priority", HTTP_GET, false, &m_get, NULL, NULL);
+    TEST_ASSERT_TRUE(m_get.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_2, m_get.handler);
+    TEST_ASSERT_EQUAL_PTR((void*)2, m_get.user_ctx);
+
+    // POST should fall back to HTTP_ANY
+    radix_match_t m_post;
+    radix_lookup(tree, "/priority", HTTP_POST, false, &m_post, NULL, NULL);
+    TEST_ASSERT_TRUE(m_post.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_1, m_post.handler);
+    TEST_ASSERT_EQUAL_PTR((void*)1, m_post.user_ctx);
 
     radix_tree_destroy(tree);
 }
@@ -1261,5 +1553,17 @@ void test_radix_tree_run(void) {
     RUN_TEST(test_radix_mixed_param_wildcard);
 
     // Bug fix regression tests
+    RUN_TEST(test_case_insensitive_mixed_case_siblings);
+    RUN_TEST(test_case_insensitive_no_duplicate_insertion);
+    RUN_TEST(test_ws_middleware_merge);
+    RUN_TEST(test_ws_middleware_double_registration);
     RUN_TEST(test_radix_insert_invalid_method);
+
+    // Task #49: Middleware collection during lookup
+    RUN_TEST(test_radix_lookup_collects_middleware);
+    RUN_TEST(test_radix_lookup_no_middleware_collection);
+
+    // Bug fix: HTTP_ANY fallback in radix_lookup
+    RUN_TEST(test_http_any_fallback_lookup);
+    RUN_TEST(test_http_any_specific_method_takes_priority);
 }

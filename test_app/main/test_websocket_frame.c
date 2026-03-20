@@ -28,6 +28,8 @@ static void test_parse_unmasked_text_frame(void)
 
     // Verify payload is unchanged (unmasked)
     TEST_ASSERT_EQUAL_MEMORY("Hello", &frame[2], 5);
+
+    free(ctx.payload_buffer);
 }
 
 // Test parsing masked text frame
@@ -60,6 +62,8 @@ static void test_parse_masked_text_frame(void)
 
     // Verify payload was unmasked in place
     TEST_ASSERT_EQUAL_MEMORY("Hello", &frame_copy[6], 5);
+
+    free(ctx.payload_buffer);
 }
 
 // Test parsing frame with 16-bit extended length
@@ -88,6 +92,8 @@ static void test_parse_extended_length_16(void)
     TEST_ASSERT_EQUAL(WS_OPCODE_BINARY, conn.ws_opcode);
     TEST_ASSERT_EQUAL(126, conn.ws_payload_len);
     TEST_ASSERT_EQUAL(130, consumed); // 1 + 1 + 2 + 126
+
+    free(ctx.payload_buffer);
 }
 
 // Test parsing fragmented frame
@@ -114,6 +120,8 @@ static void test_parse_fragmented_frame(void)
     TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
     TEST_ASSERT_TRUE(conn.ws_fin);
     TEST_ASSERT_EQUAL(WS_OPCODE_CONTINUATION, conn.ws_opcode);
+
+    free(ctx.payload_buffer);
 }
 
 // Test parsing control frames
@@ -145,6 +153,8 @@ static void test_parse_control_frames(void)
                              &ctx, &consumed);
     TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
     TEST_ASSERT_EQUAL(WS_OPCODE_PONG, conn.ws_opcode);
+
+    free(ctx.payload_buffer);
 }
 
 // Test parsing frame received in chunks
@@ -175,6 +185,8 @@ static void test_parse_frame_in_chunks(void)
     result = ws_process_frame(&conn, &full_frame[5], 2, &ctx, &consumed);
     TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
     TEST_ASSERT_EQUAL(5, conn.ws_payload_len);
+
+    free(ctx.payload_buffer);
 }
 
 // Test invalid frames
@@ -203,6 +215,8 @@ static void test_parse_invalid_frames(void)
     result = ws_process_frame(&conn, large_control, sizeof(large_control),
                              &ctx, &consumed);
     TEST_ASSERT_EQUAL(WS_FRAME_ERROR, result);
+
+    free(ctx.payload_buffer);
 }
 
 // Test building frame headers
@@ -491,6 +505,8 @@ static void test_frame_rsv_bits_set(void)
     uint8_t frame_rsv3[] = {0x91, 0x00}; // FIN + RSV3 + TEXT, len=0
     result = ws_process_frame(&conn, frame_rsv3, sizeof(frame_rsv3), &ctx, &consumed);
     TEST_ASSERT_EQUAL(WS_FRAME_ERROR, result);
+
+    free(ctx.payload_buffer);
 }
 
 // Test frame with zero-length payload
@@ -506,6 +522,8 @@ static void test_frame_zero_payload(void)
 
     TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
     TEST_ASSERT_EQUAL(0, conn.ws_payload_len);
+
+    free(ctx.payload_buffer);
 }
 
 // Test close frame without payload
@@ -519,9 +537,11 @@ static void test_close_frame_empty(void)
     ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
                                                 &ctx, &consumed);
     TEST_ASSERT_EQUAL(WS_FRAME_CLOSE, result);
+
+    free(ctx.payload_buffer);
 }
 
-// Test close frame with 1-byte payload (invalid - should have 0 or 2+ bytes)
+// Test close frame with 1-byte payload (invalid per RFC 6455 Section 5.5.1)
 static void test_close_frame_one_byte(void)
 {
     connection_t conn = {0};
@@ -531,8 +551,10 @@ static void test_close_frame_one_byte(void)
     uint8_t frame[] = {0x88, 0x01, 0x00}; // Close with 1 byte payload
     ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
                                                 &ctx, &consumed);
-    // 1-byte close payload is technically invalid, but implementations may vary
-    TEST_ASSERT_TRUE(result == WS_FRAME_CLOSE || result == WS_FRAME_ERROR);
+    // RFC 6455 Section 5.5.1: close payload must be 0 or 2+ bytes
+    TEST_ASSERT_EQUAL(WS_FRAME_ERROR, result);
+
+    free(ctx.payload_buffer);
 }
 
 // Test frame_ctx_init with NULL
@@ -784,13 +806,24 @@ static void test_rsv_bits_fast_path_rejected(void)
     ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
                                                 &ctx, &consumed);
     TEST_ASSERT_EQUAL(WS_FRAME_ERROR, result);
+
+    free(ctx.payload_buffer);
 }
 
 // ========== Issue #34: Split PING payload should not send partial PONGs ==========
+static ssize_t split_ping_mock_send(connection_t* conn, const void* data, size_t len) {
+    (void)conn;
+    (void)data;
+    return (ssize_t)len;
+}
+
 static void test_split_ping_payload(void)
 {
+    // Install mock send function so pong send succeeds (fd=-1 would fail write())
+    ws_set_send_func(split_ping_mock_send);
+
     connection_t conn = {0};
-    conn.fd = -1;  // Prevent actual send attempts
+    conn.fd = -1;
     ws_frame_context_t ctx = {0};
     size_t consumed;
 
@@ -811,6 +844,7 @@ static void test_split_ping_payload(void)
     TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
 
     if (ctx.payload_buffer) free(ctx.payload_buffer);
+    ws_set_send_func(NULL);
 }
 
 // ========== Issue #37: NULL client_key should not crash ==========
@@ -900,6 +934,230 @@ static void test_close_frame_valid_status_codes(void)
     }
 }
 
+// ============================================================================
+// Large frame send atomicity tests
+// ============================================================================
+
+// Mock send function state for atomicity test
+static uint8_t s_mock_send_buf[2048];
+static size_t s_mock_send_len;
+static int s_mock_send_call_count;
+
+static ssize_t mock_send_func(connection_t* conn, const void* data, size_t len) {
+    (void)conn;
+    if (s_mock_send_len + len <= sizeof(s_mock_send_buf)) {
+        memcpy(s_mock_send_buf + s_mock_send_len, data, len);
+    }
+    s_mock_send_len += len;
+    s_mock_send_call_count++;
+    return (ssize_t)len;
+}
+
+// Test that a large frame (>256 bytes) is sent as a single contiguous buffer
+static void test_send_large_frame_atomicity(void)
+{
+    // Reset mock state
+    memset(s_mock_send_buf, 0, sizeof(s_mock_send_buf));
+    s_mock_send_len = 0;
+    s_mock_send_call_count = 0;
+
+    // Install mock send function
+    ws_set_send_func(mock_send_func);
+
+    connection_t conn = {0};
+    conn.fd = -1;
+
+    // Create payload > 256 bytes to exercise the large frame (malloc) path
+    uint8_t payload[300];
+    memset(payload, 0xAB, sizeof(payload));
+
+    int ret = ws_send_frame(&conn, WS_OPCODE_BINARY, payload, sizeof(payload), false);
+
+    // Should succeed
+    TEST_ASSERT_GREATER_THAN(0, ret);
+
+    // The key assertion: exactly ONE send call for the entire frame
+    TEST_ASSERT_EQUAL_MESSAGE(1, s_mock_send_call_count,
+        "Large frame must be sent as a single contiguous buffer");
+
+    // Verify total length: header (4 bytes for 16-bit extended length) + 300 payload
+    size_t expected_header_len = 4; // opcode(1) + len_marker(1) + ext_len(2)
+    size_t expected_total = expected_header_len + sizeof(payload);
+    TEST_ASSERT_EQUAL(expected_total, s_mock_send_len);
+
+    // Verify the header is correct in the contiguous buffer
+    TEST_ASSERT_EQUAL(0x82, s_mock_send_buf[0]); // FIN=1, BINARY
+    TEST_ASSERT_EQUAL(126, s_mock_send_buf[1]);   // Extended 16-bit length marker
+    TEST_ASSERT_EQUAL((sizeof(payload) >> 8) & 0xFF, s_mock_send_buf[2]); // High byte
+    TEST_ASSERT_EQUAL(sizeof(payload) & 0xFF, s_mock_send_buf[3]);        // Low byte
+
+    // Verify payload follows header contiguously
+    TEST_ASSERT_EQUAL_MEMORY(payload, &s_mock_send_buf[expected_header_len], sizeof(payload));
+
+    // Clean up: restore NULL send func
+    ws_set_send_func(NULL);
+}
+
+// Test the boundary between stack buffer (<=256) and malloc (>256) paths
+// For payloads < 126: header = 2 bytes. Max total = 2 + 125 = 127 (always stack).
+// For payloads >= 126: header = 4 bytes (16-bit ext). total = 4 + payload.
+//   total = 256 => payload = 252 (stack path)
+//   total = 257 => payload = 253 (malloc path)
+static void test_send_frame_boundary_256(void)
+{
+    ws_set_send_func(mock_send_func);
+    connection_t conn = {0};
+    conn.fd = -1;
+
+    // Case 1: total_len exactly 256 (stack path, last size before malloc)
+    {
+        memset(s_mock_send_buf, 0, sizeof(s_mock_send_buf));
+        s_mock_send_len = 0;
+        s_mock_send_call_count = 0;
+
+        uint8_t payload[252];
+        memset(payload, 0xCC, sizeof(payload));
+
+        int ret = ws_send_frame(&conn, WS_OPCODE_TEXT, payload, sizeof(payload), false);
+        TEST_ASSERT_EQUAL(256, ret);
+        TEST_ASSERT_EQUAL(1, s_mock_send_call_count);
+
+        // Verify valid frame header
+        TEST_ASSERT_EQUAL(0x81, s_mock_send_buf[0]); // FIN=1, TEXT
+        TEST_ASSERT_EQUAL(126, s_mock_send_buf[1]);   // Extended 16-bit marker
+        TEST_ASSERT_EQUAL(0x00, s_mock_send_buf[2]);  // High byte of 252
+        TEST_ASSERT_EQUAL(0xFC, s_mock_send_buf[3]);  // Low byte of 252
+
+        // Verify payload
+        TEST_ASSERT_EQUAL_MEMORY(payload, &s_mock_send_buf[4], sizeof(payload));
+    }
+
+    // Case 2: total_len = 257 (first size that uses malloc path)
+    {
+        memset(s_mock_send_buf, 0, sizeof(s_mock_send_buf));
+        s_mock_send_len = 0;
+        s_mock_send_call_count = 0;
+
+        uint8_t payload[253];
+        memset(payload, 0xDD, sizeof(payload));
+
+        int ret = ws_send_frame(&conn, WS_OPCODE_TEXT, payload, sizeof(payload), false);
+        TEST_ASSERT_EQUAL(257, ret);
+        TEST_ASSERT_EQUAL(1, s_mock_send_call_count);
+
+        // Verify valid frame header
+        TEST_ASSERT_EQUAL(0x81, s_mock_send_buf[0]); // FIN=1, TEXT
+        TEST_ASSERT_EQUAL(126, s_mock_send_buf[1]);   // Extended 16-bit marker
+        TEST_ASSERT_EQUAL(0x00, s_mock_send_buf[2]);  // High byte of 253
+        TEST_ASSERT_EQUAL(0xFD, s_mock_send_buf[3]);  // Low byte of 253
+
+        // Verify payload
+        TEST_ASSERT_EQUAL_MEMORY(payload, &s_mock_send_buf[4], sizeof(payload));
+    }
+
+    ws_set_send_func(NULL);
+}
+
+// ============================================================================
+// Task #46: Additional WebSocket test coverage
+// ============================================================================
+
+// Test parsing frame with 64-bit extended length (payload_len == 127 marker)
+static void test_parse_64bit_extended_length(void)
+{
+    connection_t conn = {0};
+    ws_frame_context_t ctx = {0};
+    size_t consumed;
+
+    // Frame with 64-bit length marker: FIN=1, BINARY, len=127 (64-bit marker)
+    // 8-byte extended length: 256 (0x0000000000000100)
+    // Total header: 1 (opcode) + 1 (len marker) + 8 (ext len) = 10 bytes
+    size_t payload_size = 256;
+    uint8_t frame[10 + 256];
+    frame[0] = 0x82;   // FIN=1, BINARY
+    frame[1] = 127;    // 64-bit extended length marker
+    // 8-byte big-endian length = 256
+    frame[2] = 0x00;
+    frame[3] = 0x00;
+    frame[4] = 0x00;
+    frame[5] = 0x00;
+    frame[6] = 0x00;
+    frame[7] = 0x00;
+    frame[8] = 0x01;   // High byte of 256
+    frame[9] = 0x00;   // Low byte of 256
+
+    // Fill payload with test pattern
+    for (size_t i = 0; i < payload_size; i++) {
+        frame[10 + i] = (uint8_t)(i & 0xFF);
+    }
+
+    ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
+                                                &ctx, &consumed);
+
+    TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
+    TEST_ASSERT_EQUAL(WS_OPCODE_BINARY, conn.ws_opcode);
+    TEST_ASSERT_EQUAL(256, conn.ws_payload_len);
+    TEST_ASSERT_EQUAL(10 + payload_size, consumed);
+
+    free(ctx.payload_buffer);
+}
+
+// Test that payload exceeding WS_MAX_PAYLOAD_SIZE (8192) is rejected
+static void test_max_payload_size_enforcement(void)
+{
+    connection_t conn = {0};
+    ws_frame_context_t ctx = {0};
+    size_t consumed;
+
+    // Frame with 16-bit extended length = 8193 (exceeds WS_MAX_PAYLOAD_SIZE=8192)
+    // We only need the header bytes -- the parser will reject when it tries
+    // to allocate the payload buffer after reading the full header.
+    // Header: opcode(1) + len_marker(1) + ext_len(2) = 4 bytes
+    // We need enough data for the parser to reach the PAYLOAD state and call
+    // ensure_payload_buffer. Provide 4 header bytes + 1 payload byte.
+    uint8_t frame[5];
+    frame[0] = 0x82;   // FIN=1, BINARY
+    frame[1] = 126;    // 16-bit extended length marker
+    frame[2] = (8193 >> 8) & 0xFF;  // High byte = 0x20
+    frame[3] = 8193 & 0xFF;         // Low byte = 0x01
+    frame[4] = 0xAA;   // First payload byte
+
+    ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
+                                                &ctx, &consumed);
+    TEST_ASSERT_EQUAL(WS_FRAME_ERROR, result);
+
+    free(ctx.payload_buffer);
+}
+
+// Test zero-length masked frame (second byte = 0x80 followed by 4 mask bytes)
+static void test_zero_length_masked_frame(void)
+{
+    connection_t conn = {0};
+    ws_frame_context_t ctx = {0};
+    size_t consumed;
+
+    // Masked frame with zero payload: FIN=1, TEXT, MASK=1, len=0
+    // Second byte = 0x80 (mask bit set, payload len = 0)
+    // Followed by 4 mask key bytes
+    uint8_t frame[] = {
+        0x81,                       // FIN=1, TEXT
+        0x80,                       // MASK=1, len=0
+        0x12, 0x34, 0x56, 0x78     // Mask key (unused since payload is empty)
+    };
+
+    ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
+                                                &ctx, &consumed);
+
+    TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
+    TEST_ASSERT_TRUE(conn.ws_fin);
+    TEST_ASSERT_EQUAL(WS_OPCODE_TEXT, conn.ws_opcode);
+    TEST_ASSERT_TRUE(conn.ws_masked);
+    TEST_ASSERT_EQUAL(0, conn.ws_payload_len);
+    TEST_ASSERT_EQUAL(sizeof(frame), consumed);
+
+    free(ctx.payload_buffer);
+}
+
 void test_websocket_frame_run(void)
 {
     // Core functionality tests
@@ -957,6 +1215,15 @@ void test_websocket_frame_run(void)
     RUN_TEST(test_compute_accept_key_null);
     RUN_TEST(test_close_frame_invalid_status_codes);
     RUN_TEST(test_close_frame_valid_status_codes);
+
+    // Large frame send atomicity tests
+    RUN_TEST(test_send_large_frame_atomicity);
+    RUN_TEST(test_send_frame_boundary_256);
+
+    // Extended coverage tests (Task #46)
+    RUN_TEST(test_parse_64bit_extended_length);
+    RUN_TEST(test_max_payload_size_enforcement);
+    RUN_TEST(test_zero_length_masked_frame);
 
     ESP_LOGI(TAG, "WebSocket frame tests completed");
 }

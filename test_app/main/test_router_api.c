@@ -12,7 +12,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-static const char* TAG = "TEST_ROUTER_API";
+static const char TAG[] = "TEST_ROUTER_API";
 
 // Test handler that just returns OK
 static httpd_err_t test_handler(httpd_req_t* req) {
@@ -271,7 +271,8 @@ static void test_router_websocket_null_handler(void) {
 static void test_httpd_mount_basic(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     httpd_handle_t server = NULL;
-    httpd_start(&server, &config);
+    httpd_err_t start_err = httpd_start(&server, &config);
+    TEST_ASSERT_EQUAL(HTTPD_OK, start_err);
     TEST_ASSERT_NOT_NULL(server);
 
     httpd_router_t router = httpd_router_create();
@@ -298,7 +299,8 @@ static void test_httpd_mount_null_server(void) {
 static void test_httpd_mount_null_router(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     httpd_handle_t server = NULL;
-    httpd_start(&server, &config);
+    httpd_err_t start_err = httpd_start(&server, &config);
+    TEST_ASSERT_EQUAL(HTTPD_OK, start_err);
     TEST_ASSERT_NOT_NULL(server);
 
     httpd_err_t err = httpd_mount(server, "/api", NULL);
@@ -310,7 +312,8 @@ static void test_httpd_mount_null_router(void) {
 static void test_httpd_mount_multiple_routers(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     httpd_handle_t server = NULL;
-    httpd_start(&server, &config);
+    httpd_err_t start_err = httpd_start(&server, &config);
+    TEST_ASSERT_EQUAL(HTTPD_OK, start_err);
     TEST_ASSERT_NOT_NULL(server);
 
     httpd_router_t router_v1 = httpd_router_create();
@@ -336,7 +339,8 @@ static void test_httpd_mount_multiple_routers(void) {
 static void test_httpd_use_middleware(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     httpd_handle_t server = NULL;
-    httpd_start(&server, &config);
+    httpd_err_t start_err = httpd_start(&server, &config);
+    TEST_ASSERT_EQUAL(HTTPD_OK, start_err);
     TEST_ASSERT_NOT_NULL(server);
 
     httpd_err_t err = httpd_use(server, test_middleware);
@@ -353,7 +357,8 @@ static void test_httpd_use_null_server(void) {
 static void test_httpd_use_null_middleware(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     httpd_handle_t server = NULL;
-    httpd_start(&server, &config);
+    httpd_err_t start_err = httpd_start(&server, &config);
+    TEST_ASSERT_EQUAL(HTTPD_OK, start_err);
     TEST_ASSERT_NOT_NULL(server);
 
     httpd_err_t err = httpd_use(server, NULL);
@@ -373,7 +378,8 @@ static httpd_err_t test_error_handler(httpd_err_t err, httpd_req_t* req) {
 static void test_httpd_on_error(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     httpd_handle_t server = NULL;
-    httpd_start(&server, &config);
+    httpd_err_t start_err = httpd_start(&server, &config);
+    TEST_ASSERT_EQUAL(HTTPD_OK, start_err);
     TEST_ASSERT_NOT_NULL(server);
 
     httpd_err_t err = httpd_on_error(server, test_error_handler);

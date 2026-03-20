@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include "esp_log.h"
 
-static const char* TAG = "TEST_CONNECTION";
+static const char TAG[] = "TEST_CONNECTION";
 
 // Test connection pool initialization
 static void test_connection_pool_init(void)
@@ -15,11 +15,13 @@ static void test_connection_pool_init(void)
 
     TEST_ASSERT_EQUAL(0, pool.active_mask);
     TEST_ASSERT_EQUAL(0, pool.write_pending_mask);
+    TEST_ASSERT_EQUAL(0, pool.read_paused_mask);
 
     // All connections should be inactive
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         TEST_ASSERT_FALSE(connection_is_active(&pool, i));
         TEST_ASSERT_FALSE(connection_has_write_pending(&pool, i));
+        TEST_ASSERT_FALSE(connection_is_read_paused(&pool, i));
     }
 
     TEST_ASSERT_EQUAL(0, connection_count_active(&pool));
@@ -34,13 +36,13 @@ static void test_connection_active_management(void)
     // Mark some connections active
     connection_mark_active(&pool, 0);
     connection_mark_active(&pool, 5);
-    connection_mark_active(&pool, 31);
+    connection_mark_active(&pool, MAX_CONNECTIONS - 1);
 
     TEST_ASSERT_TRUE(connection_is_active(&pool, 0));
     TEST_ASSERT_TRUE(connection_is_active(&pool, 5));
-    TEST_ASSERT_TRUE(connection_is_active(&pool, 31));
+    TEST_ASSERT_TRUE(connection_is_active(&pool, MAX_CONNECTIONS - 1));
     TEST_ASSERT_FALSE(connection_is_active(&pool, 1));
-    TEST_ASSERT_FALSE(connection_is_active(&pool, 30));
+    TEST_ASSERT_FALSE(connection_is_active(&pool, MAX_CONNECTIONS - 2));
 
     TEST_ASSERT_EQUAL(3, connection_count_active(&pool));
 
@@ -343,21 +345,13 @@ static void test_structure_sizes(void)
 {
     // Connection should be compact (naturally aligned)
     size_t conn_size = sizeof(connection_t);
-    ESP_LOGI(TAG, "connection_t size: %u bytes", conn_size);
-#ifdef CONFIG_HTTPD_USE_RAW_API
-    TEST_ASSERT_LESS_OR_EQUAL(64, conn_size); // With raw TCP fields (~60 bytes)
-#else
+    ESP_LOGI(TAG, "connection_t size: %zu bytes", conn_size);
     TEST_ASSERT_LESS_OR_EQUAL(48, conn_size); // Socket mode (~40 bytes)
-#endif
 
     // Pool size
     size_t pool_size = sizeof(connection_pool_t);
-    ESP_LOGI(TAG, "connection_pool_t size: %u bytes", pool_size);
-#ifdef CONFIG_HTTPD_USE_RAW_API
-    TEST_ASSERT_LESS_OR_EQUAL(1728, pool_size); // 16 * ~60 + overhead
-#else
+    ESP_LOGI(TAG, "connection_pool_t size: %zu bytes", pool_size);
     TEST_ASSERT_LESS_OR_EQUAL(1536, pool_size); // 16 * ~40 + 12 bytes overhead
-#endif
 }
 
 // ============================================================================
@@ -458,11 +452,13 @@ static void test_connection_close_clears_masks(void)
     int index = conn->pool_index;
     TEST_ASSERT_TRUE(connection_is_active(&pool, index));
 
-    // Set write pending and ws active
+    // Set write pending, ws active, and read paused
     connection_mark_write_pending(&pool, index, true);
     connection_mark_ws_active(&pool, index);
+    connection_mark_read_paused(&pool, index, true);
     TEST_ASSERT_TRUE(connection_has_write_pending(&pool, index));
     TEST_ASSERT_TRUE(connection_is_ws_active(&pool, index));
+    TEST_ASSERT_TRUE(connection_is_read_paused(&pool, index));
 
     // Close the connection
     connection_close(&pool, conn);
@@ -470,9 +466,10 @@ static void test_connection_close_clears_masks(void)
     // State should be CLOSED, but still active (so cleanup_closed can find it)
     TEST_ASSERT_EQUAL(CONN_STATE_CLOSED, conn->state);
     TEST_ASSERT_TRUE(connection_is_active(&pool, index)); // Still active until cleanup
-    // Write pending and WS active should be cleared
+    // Write pending, WS active, and read paused should be cleared
     TEST_ASSERT_FALSE(connection_has_write_pending(&pool, index));
     TEST_ASSERT_FALSE(connection_is_ws_active(&pool, index));
+    TEST_ASSERT_FALSE(connection_is_read_paused(&pool, index));
 
     // After cleanup, active mask should be cleared
     connection_cleanup_closed(&pool);
@@ -579,19 +576,19 @@ static void test_ws_active_mask_handling(void)
 
     // Mark some connections as WS active
     connection_mark_ws_active(&pool, 0);
-    connection_mark_ws_active(&pool, 15);
-    connection_mark_ws_active(&pool, 31);
+    connection_mark_ws_active(&pool, MAX_CONNECTIONS / 2);
+    connection_mark_ws_active(&pool, MAX_CONNECTIONS - 1);
 
     TEST_ASSERT_TRUE(connection_is_ws_active(&pool, 0));
-    TEST_ASSERT_TRUE(connection_is_ws_active(&pool, 15));
-    TEST_ASSERT_TRUE(connection_is_ws_active(&pool, 31));
+    TEST_ASSERT_TRUE(connection_is_ws_active(&pool, MAX_CONNECTIONS / 2));
+    TEST_ASSERT_TRUE(connection_is_ws_active(&pool, MAX_CONNECTIONS - 1));
     TEST_ASSERT_FALSE(connection_is_ws_active(&pool, 1));
 
     // Mark inactive
-    connection_mark_ws_inactive(&pool, 15);
-    TEST_ASSERT_FALSE(connection_is_ws_active(&pool, 15));
+    connection_mark_ws_inactive(&pool, MAX_CONNECTIONS / 2);
+    TEST_ASSERT_FALSE(connection_is_ws_active(&pool, MAX_CONNECTIONS / 2));
     TEST_ASSERT_TRUE(connection_is_ws_active(&pool, 0));
-    TEST_ASSERT_TRUE(connection_is_ws_active(&pool, 31));
+    TEST_ASSERT_TRUE(connection_is_ws_active(&pool, MAX_CONNECTIONS - 1));
 }
 
 // Test connection state preservation after close

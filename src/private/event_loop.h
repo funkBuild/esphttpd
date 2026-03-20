@@ -1,18 +1,12 @@
-#ifndef _CORE_EVENT_LOOP_H_
-#define _CORE_EVENT_LOOP_H_
+#ifndef ESPHTTPD_EVENT_LOOP_H
+#define ESPHTTPD_EVENT_LOOP_H
 
 #include "sdkconfig.h"
 
 #include <stdint.h>
 #include <stdbool.h>
-#ifndef CONFIG_HTTPD_USE_RAW_API
 #include <sys/time.h>
-#endif
 #include "connection.h"
-
-#ifdef CONFIG_HTTPD_USE_RAW_API
-struct tcp_pcb;  // Forward declaration
-#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -23,10 +17,8 @@ typedef struct {
     uint16_t port;                  // Server port
     uint16_t backlog;               // Listen backlog
     uint32_t timeout_ms;            // Connection timeout in milliseconds
-#ifndef CONFIG_HTTPD_USE_RAW_API
     uint32_t select_timeout_ms;     // Select timeout in milliseconds
     size_t io_buffer_size;          // I/O buffer size (typically 1024)
-#endif
     uint16_t ws_close_timeout_ms;       // WebSocket close handshake timeout (0 = default 5s)
     bool nodelay;                   // TCP_NODELAY option
     bool reuseaddr;                 // SO_REUSEADDR option
@@ -34,25 +26,17 @@ typedef struct {
 
 // Event loop context
 typedef struct {
-#ifdef CONFIG_HTTPD_USE_RAW_API
-    struct tcp_pcb* listen_pcb;     // Listening PCB (raw API)
-#else
     int listen_fd;                  // Listening socket
-#endif
     connection_pool_t* pool;        // Connection pool
     event_loop_config_t config;     // Configuration
     uint32_t tick_count;            // Tick counter for timeouts
     uint32_t timeout_ticks;         // Precomputed timeout in ticks
     uint32_t ws_close_timeout_ticks; // Precomputed WS close handshake timeout in ticks
-#ifndef CONFIG_HTTPD_USE_RAW_API
     struct timeval select_timeout;  // Precomputed select timeout struct
-#endif
-    bool running;                   // Event loop is running
+    volatile bool running;          // Event loop is running (volatile: written by stop, read by run)
 
-#ifndef CONFIG_HTTPD_USE_RAW_API
     // I/O buffer (heap allocated to save stack space)
     uint8_t* io_buffer;             // Receive buffer (allocated on start)
-#endif
 
     // Statistics
     uint32_t total_connections;     // Total connections accepted
@@ -85,25 +69,23 @@ void event_loop_init_default(event_loop_t* loop, connection_pool_t* pool);
 // Initialize event loop with custom configuration
 void event_loop_init(event_loop_t* loop, connection_pool_t* pool, const event_loop_config_t* config);
 
-#ifndef CONFIG_HTTPD_USE_RAW_API
-// Create and bind listening socket (socket mode only)
+// Create and bind listening socket
 int event_loop_create_listener(event_loop_t* loop);
 
-// Main event loop - runs until stopped (socket mode only)
+// Main event loop - runs until stopped
 void event_loop_run(event_loop_t* loop, const event_handlers_t* handlers);
 
-// Process single iteration (for testing/integration, socket mode only)
+// Process single iteration (for testing/integration)
 int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, uint8_t* io_buffer);
 
-// Utility functions (socket mode only)
+// Utility functions
 void event_loop_check_timeouts(event_loop_t* loop);
-#endif
 
-// Stop the event loop (both modes)
+// Stop the event loop
 void event_loop_stop(event_loop_t* loop);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // _CORE_EVENT_LOOP_H_
+#endif // ESPHTTPD_EVENT_LOOP_H

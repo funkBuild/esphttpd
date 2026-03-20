@@ -26,7 +26,8 @@ static bool mock_send_buf_installed = false;
 static void start_test_server(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.port = 80;
-    httpd_start(&test_server, &config);
+    httpd_err_t err = httpd_start(&test_server, &config);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
 }
 
 // Helper to stop test server
@@ -144,6 +145,18 @@ static void test_resp_set_header_null_value(void) {
     TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, err);
 }
 
+static void test_resp_set_header_after_body_started(void) {
+    httpd_req_t req;
+    connection_t conn;
+    setup_mock_request(&req, &conn);
+
+    // Simulate body already started
+    req.body_started = true;
+
+    httpd_err_t err = httpd_resp_set_header(&req, "X-Late-Header", "value");
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, err);
+}
+
 // ==================== Response Type Tests ====================
 
 static void test_resp_set_type_json(void) {
@@ -191,6 +204,25 @@ static void test_resp_send_null_req(void) {
 static void test_resp_send_error_null_req(void) {
     httpd_err_t err = httpd_resp_send_error(NULL, 500, "Error");
     TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, err);
+}
+
+static void test_resp_send_error_after_headers_sent(void) {
+    start_test_server();
+    install_mock_send_buffer();
+
+    httpd_req_t req;
+    connection_t conn;
+    setup_mock_request(&req, &conn);
+
+    // Simulate headers already committed
+    req.headers_sent = true;
+
+    httpd_err_t err = httpd_resp_send_error(&req, 500, "Internal Server Error");
+    TEST_ASSERT_EQUAL(HTTPD_ERR_IO, err);
+    TEST_ASSERT_EQUAL(CONN_STATE_CLOSED, conn.state);
+
+    remove_mock_send_buffer();
+    stop_test_server();
 }
 
 static void test_resp_send_chunk_null_req(void) {
@@ -525,6 +557,98 @@ static void test_check_basic_auth_no_header(void) {
     TEST_ASSERT_FALSE(result);
 }
 
+// Helper: set up a test_request_context_t with a single stored header.
+// httpd_req_get_header() recovers request_context_t from req via offsetof,
+// so we must use the full test_request_context_t layout.
+static void setup_mock_request_with_header(test_request_context_t* ctx,
+                                            connection_t* conn,
+                                            const char* hdr_key,
+                                            const char* hdr_value) {
+    memset(ctx, 0, sizeof(*ctx));
+    memset(conn, 0, sizeof(*conn));
+    conn->fd = -1;
+    conn->state = CONN_STATE_HTTP_HEADERS;
+    conn->pool_index = 0;
+    ctx->req._internal = conn;
+    ctx->req.status_code = 200;
+
+    // Store key\0value\0 in a heap-allocated header buffer
+    size_t key_len = strlen(hdr_key);
+    size_t val_len = strlen(hdr_value);
+    size_t buf_size = key_len + 1 + val_len + 1;
+    char* buf = (char*)malloc(buf_size);
+    TEST_ASSERT_NOT_NULL(buf);
+
+    memcpy(buf, hdr_key, key_len);
+    buf[key_len] = '\0';
+    memcpy(buf + key_len + 1, hdr_value, val_len);
+    buf[key_len + 1 + val_len] = '\0';
+
+    ctx->header_buf = buf;
+    ctx->req.header_buf = buf;
+    ctx->req.header_buf_size = buf_size;
+    ctx->req.header_buf_used = buf_size;
+    ctx->req.header_count = 1;
+
+    ctx->headers[0].key_offset = 0;
+    ctx->headers[0].key_len = (uint16_t)key_len;
+    ctx->headers[0].value_offset = (uint16_t)(key_len + 1);
+    ctx->headers[0].value_len = (uint16_t)val_len;
+}
+
+static void test_check_basic_auth_valid_credentials(void) {
+    test_request_context_t ctx;
+    connection_t conn;
+
+    // "user:password" -> base64 "dXNlcjpwYXNzd29yZA=="
+    setup_mock_request_with_header(&ctx, &conn,
+        "Authorization", "Basic dXNlcjpwYXNzd29yZA==");
+
+    bool result = httpd_check_basic_auth(&ctx.req, "user", "password");
+    TEST_ASSERT_TRUE(result);
+
+    free(ctx.header_buf);
+}
+
+static void test_check_basic_auth_wrong_credentials(void) {
+    test_request_context_t ctx;
+    connection_t conn;
+
+    // "user:password" -> base64 "dXNlcjpwYXNzd29yZA=="
+    setup_mock_request_with_header(&ctx, &conn,
+        "Authorization", "Basic dXNlcjpwYXNzd29yZA==");
+
+    // Check with wrong password
+    bool result = httpd_check_basic_auth(&ctx.req, "user", "wrongpassword");
+    TEST_ASSERT_FALSE(result);
+
+    // Check with wrong username
+    result = httpd_check_basic_auth(&ctx.req, "admin", "password");
+    TEST_ASSERT_FALSE(result);
+
+    free(ctx.header_buf);
+}
+
+static void test_check_basic_auth_empty_credentials(void) {
+    test_request_context_t ctx;
+    connection_t conn;
+
+    // ":" -> base64 "Og==" - empty username and empty password
+    // This triggers constant_time_compare_n with len_a or len_b == 0
+    setup_mock_request_with_header(&ctx, &conn,
+        "Authorization", "Basic Og==");
+
+    // Both username and password are empty in the credential, but we check against non-empty
+    bool result = httpd_check_basic_auth(&ctx.req, "user", "pass");
+    TEST_ASSERT_FALSE(result);
+
+    // Also test with empty expected credentials matching empty received credentials
+    result = httpd_check_basic_auth(&ctx.req, "", "");
+    TEST_ASSERT_TRUE(result);
+
+    free(ctx.header_buf);
+}
+
 static void test_send_auth_challenge_null_req(void) {
     httpd_err_t err = httpd_resp_send_auth_challenge(NULL, "Test Realm");
     TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, err);
@@ -601,6 +725,7 @@ void test_http_api_run(void) {
     RUN_TEST(test_resp_set_header_null_req);
     RUN_TEST(test_resp_set_header_null_key);
     RUN_TEST(test_resp_set_header_null_value);
+    RUN_TEST(test_resp_set_header_after_body_started);
 
     // Response type tests
     RUN_TEST(test_resp_set_type_json);
@@ -610,6 +735,7 @@ void test_http_api_run(void) {
     // Response send tests
     RUN_TEST(test_resp_send_null_req);
     RUN_TEST(test_resp_send_error_null_req);
+    RUN_TEST(test_resp_send_error_after_headers_sent);
     RUN_TEST(test_resp_send_chunk_null_req);
 
     // Query parameter tests
@@ -647,6 +773,9 @@ void test_http_api_run(void) {
     RUN_TEST(test_check_basic_auth_null_user);
     RUN_TEST(test_check_basic_auth_null_pass);
     RUN_TEST(test_check_basic_auth_no_header);
+    RUN_TEST(test_check_basic_auth_valid_credentials);
+    RUN_TEST(test_check_basic_auth_wrong_credentials);
+    RUN_TEST(test_check_basic_auth_empty_credentials);
     RUN_TEST(test_send_auth_challenge_null_req);
 
     // Content length tests

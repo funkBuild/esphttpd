@@ -1,5 +1,5 @@
-#ifndef _FILESYSTEM_H_
-#define _FILESYSTEM_H_
+#ifndef ESPHTTPD_FILESYSTEM_H
+#define ESPHTTPD_FILESYSTEM_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -18,9 +18,11 @@ typedef ssize_t (*fs_send_func_t)(connection_t* conn, const void* data, size_t l
 
 // File stream callback type: initiates non-blocking file streaming via send buffer.
 // Opens the file descriptor for streaming and marks the connection as write-pending.
-// Signature: (connection, file_fd, file_size) -> 0 on success, -1 on error
+// Signature: (connection, file_fd, file_size, on_close, on_close_arg) -> 0 on success, -1 on error
 // Note: ownership of file_fd transfers to the callback (it will be closed by send_buffer)
-typedef int (*fs_start_file_stream_func_t)(connection_t* conn, int file_fd, size_t file_size);
+// on_close is called when the file fd is finally closed (used to decrement open_files)
+typedef int (*fs_start_file_stream_func_t)(connection_t* conn, int file_fd, size_t file_size,
+                                           send_buffer_file_close_cb_t on_close, void* on_close_arg);
 
 // Set the send function used by filesystem operations.
 // Called by the server during init to route sends through send_nonblocking().
@@ -65,6 +67,7 @@ typedef struct {
 typedef struct {
     bool mounted;
     char base_path[32];
+    char partition_label[17];        // ESP partition labels are max 16 chars + null
     uint8_t base_path_len;           // Cached strlen(base_path) for fast path building
     uint8_t open_files;
     uint8_t max_open_files;          // Maximum concurrent open files (0 = unlimited)
@@ -121,4 +124,4 @@ bool filesystem_validate_path(const char* path);
 }
 #endif
 
-#endif // _FILESYSTEM_H_
+#endif // ESPHTTPD_FILESYSTEM_H

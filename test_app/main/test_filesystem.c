@@ -165,13 +165,13 @@ static void test_validate_path_percent_sign_valid(void) {
 }
 
 static void test_validate_path_incomplete_percent(void) {
-    // Incomplete percent encoding at end - should be allowed (not dangerous)
-    TEST_ASSERT_TRUE(filesystem_validate_path("/file%2"));
+    // Incomplete percent encoding at end - reject truncated encoding
+    TEST_ASSERT_FALSE(filesystem_validate_path("/file%2"));
 }
 
 static void test_validate_path_percent_at_end(void) {
-    // Single percent at end - should be allowed (not dangerous)
-    TEST_ASSERT_TRUE(filesystem_validate_path("/file%"));
+    // Single percent at end - reject truncated encoding
+    TEST_ASSERT_FALSE(filesystem_validate_path("/file%"));
 }
 
 // ============================================================================
@@ -289,6 +289,43 @@ static void test_mime_type_double_extension(void) {
     TEST_ASSERT_EQUAL_STRING("application/gzip", filesystem_get_mime_type("/file.tar.gz"));
 }
 
+// ============================================================================
+// Single Dot Path Tests
+// ============================================================================
+
+static void test_validate_path_single_dot(void) {
+    // "/foo/./bar" contains a single dot segment — NOT directory traversal
+    // Single dots are harmless (current directory), only ".." is dangerous
+    TEST_ASSERT_TRUE(filesystem_validate_path("/foo/./bar"));
+}
+
+// ============================================================================
+// Long Path Tests (128-byte boundary)
+// ============================================================================
+
+static void test_validate_path_long_path_at_boundary(void) {
+    // Build a valid path exactly 127 chars long (127 chars + null terminator = 128 bytes)
+    char path[129];
+    path[0] = '/';
+    for (int i = 1; i < 127; i++) {
+        path[i] = 'a';
+    }
+    path[127] = '\0';
+    TEST_ASSERT_TRUE(filesystem_validate_path(path));
+}
+
+static void test_validate_path_long_path_128_chars(void) {
+    // Build a valid path exactly 128 chars long
+    char path[130];
+    path[0] = '/';
+    for (int i = 1; i < 128; i++) {
+        path[i] = 'b';
+    }
+    path[128] = '\0';
+    // validate_path has no length limit — should still accept
+    TEST_ASSERT_TRUE(filesystem_validate_path(path));
+}
+
 // ========== Issue #32: Invalid hex digits in percent-encoding ==========
 
 static void test_validate_path_percent_invalid_hex_g(void) {
@@ -389,6 +426,13 @@ void test_filesystem_run(void) {
     RUN_TEST(test_mime_type_case_insensitive_html);
     RUN_TEST(test_mime_type_case_insensitive_js);
     RUN_TEST(test_mime_type_nested_path);
+
+    // Single dot path tests
+    RUN_TEST(test_validate_path_single_dot);
+
+    // Long path boundary tests
+    RUN_TEST(test_validate_path_long_path_at_boundary);
+    RUN_TEST(test_validate_path_long_path_128_chars);
 
     // Invalid hex percent-encoding tests (Issue #32)
     RUN_TEST(test_validate_path_percent_invalid_hex_g);

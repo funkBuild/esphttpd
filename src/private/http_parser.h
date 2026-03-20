@@ -1,5 +1,5 @@
-#ifndef _HTTP_PARSER_H_
-#define _HTTP_PARSER_H_
+#ifndef ESPHTTPD_HTTP_PARSER_H
+#define ESPHTTPD_HTTP_PARSER_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -45,10 +45,12 @@ typedef struct {
     uint16_t line_pos;      // Position in current line
     uint16_t header_count;  // Number of headers parsed
     uint16_t url_len;
-    // 1-byte fields (packed together, no padding)
+    // Mixed-size fields (uint8_t + uint8_t + uint16_t = 4 bytes, naturally aligned)
     uint8_t method_len;
     uint8_t header_key_len;
     uint16_t header_value_len;
+    // Flags (packed with 1-byte fields above, no extra padding)
+    uint8_t content_length_seen;  // Whether Content-Length header has been seen
     // Arrays at end
     char ws_client_key[32]; // Per-parse WebSocket client key
 } http_parser_context_t;
@@ -80,7 +82,8 @@ parse_result_t http_parse_request(connection_t* conn,
                                  http_parser_context_t* ctx);
 
 // Process a single header (called by parser)
-void http_process_header(connection_t* conn,
+// Returns PARSE_OK on success, PARSE_ERROR on invalid/conflicting headers
+parse_result_t http_process_header(connection_t* conn,
                         const uint8_t* key, uint16_t key_len,
                         const uint8_t* value, uint16_t value_len,
                         http_parser_context_t* parser_ctx);
@@ -102,13 +105,8 @@ bool http_parse_url_params(const uint8_t* url, uint16_t len,
 // RFC 7230 token chars: ALPHA / DIGIT / "!" / "#" / "$" / "%" / "&" / "'" /
 //                       "*" / "+" / "-" / "." / "^" / "_" / "`" / "|" / "~"
 // Bitmap lookup replaces 10+ branch chain with single table lookup
-static const uint32_t token_bitmap[8] = {
-    0x00000000, // 0x00-0x1F: no control chars
-    0x03FF6CFA, // 0x20-0x3F: digits, !, #, $, %, &, ', *, +, -, .
-    0xC7FFFFFE, // 0x40-0x5F: A-Z, ^, _
-    0x57FFFFFF, // 0x60-0x7F: `, a-z, |, ~
-    0x00000000, 0x00000000, 0x00000000, 0x00000000
-};
+// Defined in http_parser.c to avoid duplication in every translation unit
+extern const uint32_t token_bitmap[8];
 static inline bool is_token_char(uint8_t c) {
     return (token_bitmap[c >> 5] >> (c & 31)) & 1;
 }
@@ -120,6 +118,10 @@ static inline bool is_whitespace(uint8_t c) {
 // Case-insensitive comparison for header names
 // Uses bitwise OR with 0x20 for fast ASCII lowercase conversion
 // Optimized: uses single index for both arrays, reducing register pressure
+// Note: The |0x20 trick only works correctly for ASCII letters (A-Z / a-z).
+// Non-alpha characters may collide (e.g. '@' and '`'), but this is safe here
+// because HTTP header names consist solely of alphanumeric chars and hyphens
+// (RFC 7230 token characters), so no false equality can occur.
 static inline bool header_equals(const uint8_t* header, uint16_t len, const char* str) {
     size_t i = 0;
     while (str[i]) {
@@ -138,4 +140,4 @@ static inline bool header_equals(const uint8_t* header, uint16_t len, const char
 }
 #endif
 
-#endif // _HTTP_PARSER_H_
+#endif // ESPHTTPD_HTTP_PARSER_H

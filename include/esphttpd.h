@@ -1,5 +1,5 @@
-#ifndef _ESPHTTPD_H_
-#define _ESPHTTPD_H_
+#ifndef ESPHTTPD_H
+#define ESPHTTPD_H
 
 /**
  * @file esphttpd.h
@@ -7,13 +7,7 @@
  *
  * Modern C API with proper error handling, thread safety, and extensibility.
  *
- * Transport modes:
- * - Default: BSD sockets + select() in a dedicated FreeRTOS task
- * - Raw API (CONFIG_HTTPD_USE_RAW_API=y): lwIP raw TCP callbacks in tcpip_thread
- *   Eliminates socket layer overhead (~20-110us per request).
- *   Requires: CONFIG_LWIP_TCPIP_CORE_LOCKING=y, CONFIG_LWIP_TCPIP_TASK_STACK_SIZE >= 6144
- *   Constraint: Handlers must not block (no vTaskDelay, no blocking I/O).
- *   The fd field in httpd_req_t and httpd_ws_t is set to -1 under raw API mode.
+ * Transport: BSD sockets + select() in a dedicated FreeRTOS task.
  */
 
 #include <stdint.h>
@@ -566,10 +560,25 @@ size_t httpd_req_get_content_length(httpd_req_t* req);
 
 /**
  * @brief Receive request body data
+ *
+ * Reads up to @p len bytes of the request body into @p buf.
+ *
+ * Return values:
+ * - Positive: number of bytes received (may be less than @p len)
+ * - 0: all body data received (EOF / content_length reached)
+ * - HTTPD_ERR_WOULD_BLOCK (-13): no data available yet (non-blocking);
+ *   caller should retry after a delay or yield
+ * - HTTPD_ERR_CONN_CLOSED (-7): peer disconnected mid-body
+ * - Negative (other): I/O or argument error
+ *
+ * @note For large request bodies that may arrive over multiple event loop
+ *       iterations, consider using httpd_req_defer() or httpd_req_continue()
+ *       instead of calling httpd_req_recv() in a blocking loop.
+ *
  * @param req Request context
  * @param buf Buffer to receive data
  * @param len Maximum bytes to receive
- * @return Number of bytes received, 0 on EOF, negative on error
+ * @return Bytes received, 0 on EOF, or negative httpd_err_t on error
  */
 int httpd_req_recv(httpd_req_t* req, void* buf, size_t len);
 
@@ -1029,7 +1038,7 @@ typedef httpd_err_t (*httpd_continuation_t)(httpd_req_t* req, const void* data,
  *     if (data && len > 0) {
  *         esp_ota_write(state->handle, data, len);
  *         state->received += len;
- *         cont->received_bytes += len;
+ *         // Note: cont->received_bytes is updated automatically by the server
  *
  *         if (state->received >= req->content_length) {
  *             esp_ota_end(state->handle);
@@ -1262,4 +1271,4 @@ const char* httpd_get_mime_type(const char* path);
 }
 #endif
 
-#endif /* _ESPHTTPD_H_ */
+#endif /* ESPHTTPD_H */

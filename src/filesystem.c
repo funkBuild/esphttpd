@@ -122,6 +122,8 @@ int filesystem_init(filesystem_t* fs, const filesystem_config_t* config) {
     strncpy(fs->base_path, config->base_path, sizeof(fs->base_path) - 1);
     fs->base_path[sizeof(fs->base_path) - 1] = '\0';
     fs->base_path_len = (uint8_t)strlen(fs->base_path);
+    strncpy(fs->partition_label, config->partition_label, sizeof(fs->partition_label) - 1);
+    fs->partition_label[sizeof(fs->partition_label) - 1] = '\0';
     fs->mounted = true;
     fs->open_files = 0;
     fs->max_open_files = (config->max_open_files <= 255) ? (uint8_t)config->max_open_files : 255;
@@ -130,7 +132,7 @@ int filesystem_init(filesystem_t* fs, const filesystem_config_t* config) {
     size_t total = 0, used = 0;
     ret = esp_littlefs_info(config->partition_label, &total, &used);
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "LittleFS mounted at %s (total: %d KB, used: %d KB)",
+        ESP_LOGI(TAG, "LittleFS mounted at %s (total: %zu KB, used: %zu KB)",
                  config->base_path, total / 1024, used / 1024);
     }
 
@@ -142,7 +144,7 @@ void filesystem_unmount(filesystem_t* fs) {
         return;
     }
 
-    esp_vfs_littlefs_unregister(fs->base_path);
+    esp_vfs_littlefs_unregister(fs->partition_label);
     fs->mounted = false;
     ESP_LOGI(TAG, "Filesystem unmounted");
 }
@@ -262,7 +264,8 @@ bool filesystem_validate_path(const char* path) {
         if (c == '\\') return false;
         if (c == '.' && prev == '.') return false;
         if (c == '/' && prev == '/') return false;
-        if (c == '%' && p[1] && p[2]) {
+        if (c == '%') {
+            if (!p[1] || !p[2]) return false;  // Truncated percent-encoding
             // Validate hex digits
             char h1 = p[1], h2 = p[2];
             bool valid_hex = ((h1 >= '0' && h1 <= '9') || ((h1 | 0x20) >= 'a' && (h1 | 0x20) <= 'f'))
@@ -325,6 +328,16 @@ int filesystem_serve_file(filesystem_t* fs,
     return filesystem_send_file(fs, conn, actual_path, &metadata);
 }
 
+// Callback invoked by send_buffer when a streamed file fd is closed.
+// Decrements the filesystem open_files counter at the correct time (when the file
+// is actually done streaming), rather than immediately after handing off to send_buffer.
+static void fs_on_file_close(void* user_data) {
+    filesystem_t* fs = (filesystem_t*)user_data;
+    if (fs && fs->open_files > 0) {
+        fs->open_files--;
+    }
+}
+
 int filesystem_send_file(filesystem_t* fs,
                         connection_t* conn,
                         const char* path,
@@ -354,6 +367,7 @@ int filesystem_send_file(filesystem_t* fs,
     char* p = headers;
     memcpy(p, h1, sizeof(h1) - 1); p += sizeof(h1) - 1;
     size_t mime_len = strlen(metadata->mime_type);
+    if (mime_len > 128) mime_len = 128;  // Defensive clamp against corrupted mime_type
     memcpy(p, metadata->mime_type, mime_len); p += mime_len;
     memcpy(p, h2, sizeof(h2) - 1); p += sizeof(h2) - 1;
     p += format_uint(p, metadata->size);
@@ -380,6 +394,7 @@ int filesystem_send_file(filesystem_t* fs,
     // Send headers via non-blocking send
     if (fs_send(conn, headers, header_len) < 0) {
         close(file_fd);
+        if (fs->open_files > 0) fs->open_files--;
         return -1;
     }
 
@@ -387,12 +402,15 @@ int filesystem_send_file(filesystem_t* fs,
     if (s_file_stream_func) {
         // Non-blocking: hand off file to send_buffer infrastructure.
         // Ownership of file_fd transfers to the stream function (it will close it).
-        if (s_file_stream_func(conn, file_fd, metadata->size) < 0) {
+        // The on_file_close callback decrements open_files when the file is actually closed,
+        // rather than immediately after handoff (which was the previous bug).
+        if (s_file_stream_func(conn, file_fd, metadata->size,
+                               fs_on_file_close, fs) < 0) {
             close(file_fd);
             if (fs->open_files > 0) fs->open_files--;
             return -1;
         }
-        if (fs->open_files > 0) fs->open_files--;
+        // Don't decrement here - the callback will do it when streaming finishes
         return (metadata->size <= (uint32_t)INT_MAX) ? (int)metadata->size : INT_MAX;
     }
 

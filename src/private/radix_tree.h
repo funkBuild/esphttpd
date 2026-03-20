@@ -1,5 +1,5 @@
-#ifndef _RADIX_TREE_H_
-#define _RADIX_TREE_H_
+#ifndef ESPHTTPD_RADIX_TREE_H
+#define ESPHTTPD_RADIX_TREE_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -9,6 +9,9 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// Number of HTTP methods (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, ANY)
+#define HTTP_METHOD_COUNT 8
 
 // ============================================================================
 // Configuration (with fallbacks for non-Kconfig builds)
@@ -74,7 +77,7 @@ typedef struct handler_node {
  * @brief Handler storage for a node (one per HTTP method + WebSocket)
  */
 typedef struct {
-    handler_node_t* http_chains[8];       // Handler chain heads indexed by http_method_t
+    handler_node_t* http_chains[HTTP_METHOD_COUNT]; // Handler chain heads indexed by http_method_t
     httpd_ws_handler_t ws_handler;        // WebSocket handler
     void* ws_user_ctx;
     uint32_t ws_ping_interval;
@@ -273,12 +276,14 @@ radix_node_t* radix_find_static_child(radix_node_t* node, const char* segment,
  * @brief Insert a static child in sorted order
  * @param node Parent node
  * @param child Child to insert
+ * @param case_sensitive If true, sort by memcmp; if false, sort by strncasecmp
  * @return HTTPD_OK on success, error code otherwise
  */
-httpd_err_t radix_insert_static_child(radix_node_t* node, radix_node_t* child);
+httpd_err_t radix_insert_static_child(radix_node_t* node, radix_node_t* child,
+                                      bool case_sensitive);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // _RADIX_TREE_H_
+#endif // ESPHTTPD_RADIX_TREE_H

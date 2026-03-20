@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>  // For strncasecmp
+#include <inttypes.h>
 #include "esp_log.h"
 
 static const char TAG[] = "RADIX_TREE";
@@ -66,7 +67,7 @@ void radix_node_destroy(radix_node_t* node) {
 
     // Free handler chains
     if (node->handlers) {
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < HTTP_METHOD_COUNT; i++) {
             handler_node_t* h = node->handlers->http_chains[i];
             while (h) {
                 handler_node_t* next = h->next;
@@ -113,7 +114,7 @@ radix_tree_t* radix_tree_create(void) {
 void radix_tree_destroy(radix_tree_t* tree) {
     if (!tree) return;
 
-    ESP_LOGI(TAG, "Destroying radix tree (routes=%d, nodes=%d)",
+    ESP_LOGI(TAG, "Destroying radix tree (routes=%" PRIu16 ", nodes=%" PRIu16 ")",
              tree->route_count, tree->node_count);
 
     radix_node_destroy(tree->root);
@@ -186,7 +187,8 @@ radix_node_t* radix_find_static_child(radix_node_t* node, const char* segment,
     return radix_find_static_child_internal(node, segment, segment_len, true);
 }
 
-httpd_err_t radix_insert_static_child(radix_node_t* node, radix_node_t* child) {
+httpd_err_t radix_insert_static_child(radix_node_t* node, radix_node_t* child,
+                                      bool case_sensitive) {
     if (!node || !child) return HTTPD_ERR_INVALID_ARG;
 
     // Grow children array if needed
@@ -204,12 +206,15 @@ httpd_err_t radix_insert_static_child(radix_node_t* node, radix_node_t* child) {
     }
 
     // Find insertion position (keep sorted lexicographically)
+    // Must use the same comparison as radix_find_static_child_internal
     int pos = 0;
     while (pos < node->child_count) {
         radix_node_t* existing = node->children[pos];
         size_t min_len = existing->segment_len < child->segment_len ?
                          existing->segment_len : child->segment_len;
-        int cmp = memcmp(existing->segment, child->segment, min_len);
+        int cmp = case_sensitive ?
+                  memcmp(existing->segment, child->segment, min_len) :
+                  strncasecmp(existing->segment, child->segment, min_len);
 
         if (cmp < 0 || (cmp == 0 && existing->segment_len < child->segment_len)) {
             pos++;  // Existing is lexicographically less, continue
@@ -241,7 +246,7 @@ httpd_err_t radix_insert(radix_tree_t* tree, const char* pattern,
                          void* user_ctx, httpd_middleware_t* middlewares,
                          uint8_t middleware_count) {
     if (!tree || !pattern || !handler) return HTTPD_ERR_INVALID_ARG;
-    if (method < 0 || method > HTTP_ANY) return HTTPD_ERR_INVALID_ARG;
+    if (method > HTTP_ANY) return HTTPD_ERR_INVALID_ARG;
 
     ESP_LOGD(TAG, "Inserting route: pattern='%s', method=%d", pattern, method);
 
@@ -300,7 +305,7 @@ httpd_err_t radix_insert(radix_tree_t* tree, const char* pattern,
             if (!child) {
                 child = radix_node_create(seg_start, seg_len, type);
                 if (!child) return HTTPD_ERR_NO_MEM;
-                httpd_err_t err = radix_insert_static_child(node, child);
+                httpd_err_t err = radix_insert_static_child(node, child, tree->case_sensitive);
                 if (err != HTTPD_OK) {
                     radix_node_destroy(child);
                     return err;
@@ -331,18 +336,8 @@ httpd_err_t radix_insert(radix_tree_t* tree, const char* pattern,
     new_handler->user_ctx = user_ctx;
     new_handler->next = NULL;
 
-    // Append to end of chain for this method
-    handler_node_t** chain_ptr = &node->handlers->http_chains[method];
-    while (*chain_ptr) {
-        chain_ptr = &(*chain_ptr)->next;
-    }
-    *chain_ptr = new_handler;
-
-    node->handlers->http_method_mask |= (1 << method);
-    node->handlers->has_trailing_slash = has_trailing_slash;
-    ESP_LOGD(TAG, "Added handler to chain (method=%d, trailing_slash=%d)", method, has_trailing_slash);
-
-    // Copy middleware if provided
+    // Allocate middleware BEFORE appending handler to the chain, so that
+    // a middleware allocation failure doesn't leave a half-installed route.
     if (middlewares && middleware_count > 0) {
         if (middleware_count > CONFIG_HTTPD_MAX_ROUTE_MIDDLEWARE) {
             ESP_LOGW(TAG, "Truncating middleware count from %d to %d",
@@ -356,6 +351,7 @@ httpd_err_t radix_insert(radix_tree_t* tree, const char* pattern,
                 middleware_count * sizeof(httpd_middleware_t));
             if (!node->middlewares) {
                 ESP_LOGE(TAG, "Failed to allocate middleware array");
+                free(new_handler);
                 return HTTPD_ERR_NO_MEM;
             }
         } else {
@@ -368,6 +364,7 @@ httpd_err_t radix_insert(radix_tree_t* tree, const char* pattern,
                 node->middlewares, new_count * sizeof(httpd_middleware_t));
             if (!new_mw) {
                 ESP_LOGE(TAG, "Failed to realloc middleware array");
+                free(new_handler);
                 return HTTPD_ERR_NO_MEM;
             }
             node->middlewares = new_mw;
@@ -375,12 +372,21 @@ httpd_err_t radix_insert(radix_tree_t* tree, const char* pattern,
             middleware_count = new_count - node->middleware_count;
         }
 
-        if (node->middlewares) {
-            memcpy(&node->middlewares[node->middleware_count], middlewares,
-                   middleware_count * sizeof(httpd_middleware_t));
-            node->middleware_count += middleware_count;
-        }
+        memcpy(&node->middlewares[node->middleware_count], middlewares,
+               middleware_count * sizeof(httpd_middleware_t));
+        node->middleware_count += middleware_count;
     }
+
+    // Append handler to end of chain for this method (after middleware is secured)
+    handler_node_t** chain_ptr = &node->handlers->http_chains[method];
+    while (*chain_ptr) {
+        chain_ptr = &(*chain_ptr)->next;
+    }
+    *chain_ptr = new_handler;
+
+    node->handlers->http_method_mask |= (1 << method);
+    node->handlers->has_trailing_slash = has_trailing_slash;
+    ESP_LOGD(TAG, "Added handler to chain (method=%d, trailing_slash=%d)", method, has_trailing_slash);
 
     tree->route_count++;
     ESP_LOGD(TAG, "Route inserted successfully (total routes=%d, nodes=%d)",
@@ -441,7 +447,7 @@ httpd_err_t radix_insert_ws(radix_tree_t* tree, const char* pattern,
             if (!child) {
                 child = radix_node_create(seg_start, seg_len, type);
                 if (!child) return HTTPD_ERR_NO_MEM;
-                httpd_err_t err = radix_insert_static_child(node, child);
+                httpd_err_t err = radix_insert_static_child(node, child, tree->case_sensitive);
                 if (err != HTTPD_OK) {
                     radix_node_destroy(child);
                     return err;
@@ -471,17 +477,32 @@ httpd_err_t radix_insert_ws(radix_tree_t* tree, const char* pattern,
         }
 
         if (!node->middlewares) {
+            // First allocation
             node->middlewares = (httpd_middleware_t*)malloc(
                 middleware_count * sizeof(httpd_middleware_t));
             if (!node->middlewares) {
                 ESP_LOGE(TAG, "Failed to allocate WS middleware array");
                 return HTTPD_ERR_NO_MEM;
             }
+        } else {
+            // Merge with existing middleware
+            uint8_t new_count = node->middleware_count + middleware_count;
+            if (new_count > CONFIG_HTTPD_MAX_ROUTE_MIDDLEWARE) {
+                new_count = CONFIG_HTTPD_MAX_ROUTE_MIDDLEWARE;
+            }
+            httpd_middleware_t* new_mw = (httpd_middleware_t*)realloc(
+                node->middlewares, new_count * sizeof(httpd_middleware_t));
+            if (!new_mw) {
+                ESP_LOGE(TAG, "Failed to realloc WS middleware array");
+                return HTTPD_ERR_NO_MEM;
+            }
+            node->middlewares = new_mw;
+            middleware_count = new_count - node->middleware_count;
         }
 
-        memcpy(node->middlewares, middlewares,
+        memcpy(&node->middlewares[node->middleware_count], middlewares,
                middleware_count * sizeof(httpd_middleware_t));
-        node->middleware_count = middleware_count;
+        node->middleware_count += middleware_count;
     }
 
     tree->route_count++;
@@ -662,9 +683,13 @@ void radix_lookup(radix_tree_t* tree, const char* path,
             result->ws_user_ctx = node->handlers->ws_user_ctx;
             result->is_websocket = true;
             ESP_LOGD(TAG, "Matched WebSocket route");
-        } else if (!is_websocket && method >= 0 && method < 8) {
+        } else if (!is_websocket && method >= 0 && method < HTTP_METHOD_COUNT) {
             // Direct chain check - non-null chain implies method is supported
             handler_node_t* chain = node->handlers->http_chains[method];
+            // Fallback to HTTP_ANY if no specific handler for this method
+            if (!chain && method != HTTP_ANY) {
+                chain = node->handlers->http_chains[HTTP_ANY];
+            }
             if (chain) {
                 result->matched = true;
                 result->handler_chain = chain;

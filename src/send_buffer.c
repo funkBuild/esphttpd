@@ -33,8 +33,13 @@ bool send_buffer_alloc(send_buffer_t* sb) {
 }
 
 void send_buffer_free(send_buffer_t* sb) {
+    // Capture callback before clearing state
+    send_buffer_file_close_cb_t cb = sb->on_file_close;
+    void* cb_arg = sb->on_file_close_arg;
+    bool had_file = (sb->file_fd >= 0);
+
     // Close any open file
-    if (sb->file_fd >= 0) {
+    if (had_file) {
         close(sb->file_fd);
     }
 
@@ -45,13 +50,23 @@ void send_buffer_free(send_buffer_t* sb) {
     }
 
     send_buffer_init(sb);
+
+    // Notify after close - filesystem uses this to decrement open_files
+    if (had_file && cb) {
+        cb(cb_arg);
+    }
 }
 
 void send_buffer_reset(send_buffer_t* sb) {
+    // Capture callback before clearing state
+    send_buffer_file_close_cb_t cb = sb->on_file_close;
+    void* cb_arg = sb->on_file_close_arg;
+    bool had_file = (sb->file_fd >= 0);
+
     sb->head = 0;
     sb->tail = 0;
 
-    if (sb->file_fd >= 0) {
+    if (had_file) {
         close(sb->file_fd);
         sb->file_fd = -1;
     }
@@ -59,6 +74,13 @@ void send_buffer_reset(send_buffer_t* sb) {
     sb->streaming = 0;
     sb->chunked = 0;
     sb->headers_done = 0;
+    sb->on_file_close = NULL;
+    sb->on_file_close_arg = NULL;
+
+    // Notify after close - filesystem uses this to decrement open_files
+    if (had_file && cb) {
+        cb(cb_arg);
+    }
 }
 
 ssize_t send_buffer_queue(send_buffer_t* __restrict sb, const void* __restrict data, size_t len) {
@@ -127,7 +149,8 @@ void send_buffer_consume(send_buffer_t* sb, size_t len) {
     }
 }
 
-bool send_buffer_start_file(send_buffer_t* sb, int file_fd, size_t file_size) {
+bool send_buffer_start_file(send_buffer_t* sb, int file_fd, size_t file_size,
+                            send_buffer_file_close_cb_t on_close, void* on_close_arg) {
     if (file_fd < 0) {
         return false;
     }
@@ -138,24 +161,37 @@ bool send_buffer_start_file(send_buffer_t* sb, int file_fd, size_t file_size) {
         file_size = UINT32_MAX;
     }
 
-    // Close any existing file
+    // Close any existing file (invoke its callback if set)
     if (sb->file_fd >= 0) {
-        close(sb->file_fd);
+        send_buffer_stop_file(sb);
     }
 
     sb->file_fd = file_fd;
     sb->file_remaining = (uint32_t)file_size;
     sb->streaming = 1;
+    sb->on_file_close = on_close;
+    sb->on_file_close_arg = on_close_arg;
 
     ESP_LOGD(TAG, "Started file stream: fd=%d, size=%zu", file_fd, file_size);
     return true;
 }
 
 void send_buffer_stop_file(send_buffer_t* sb) {
+    // Capture callback before clearing state
+    send_buffer_file_close_cb_t cb = sb->on_file_close;
+    void* cb_arg = sb->on_file_close_arg;
+
     if (sb->file_fd >= 0) {
         close(sb->file_fd);
         sb->file_fd = -1;
     }
     sb->file_remaining = 0;
     sb->streaming = 0;
+    sb->on_file_close = NULL;
+    sb->on_file_close_arg = NULL;
+
+    // Notify after close - filesystem uses this to decrement open_files
+    if (cb) {
+        cb(cb_arg);
+    }
 }

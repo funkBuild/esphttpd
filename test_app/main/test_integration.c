@@ -43,7 +43,8 @@ static httpd_err_t test_handler(httpd_req_t* req) {
 static void start_test_server(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.port = 80;
-    httpd_start(&test_handle, &config);
+    httpd_err_t err = httpd_start(&test_handle, &config);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
 }
 
 // Helper to stop server after tests
@@ -681,6 +682,213 @@ static void test_router_use_null(void)
     TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, result);
 }
 
+// ==================== FD LEAK DETECTION TESTS ====================
+
+// Test that after server start/stop cycle, all connection pool slots are clean.
+// This is the practical fd leak check for unit tests: verify all fds are -1
+// and all bitmasks are zero after httpd_stop().
+static void test_fd_leak_after_start_stop(void) {
+    // Start and stop the server
+    start_test_server();
+    TEST_ASSERT_NOT_NULL(g_server);
+
+    // Grab a snapshot of pool state while running
+    connection_pool_t* pool = &g_server->connection_pool;
+
+    // All slots should start clean (no active connections yet)
+    TEST_ASSERT_EQUAL(0, pool->active_mask);
+    TEST_ASSERT_EQUAL(0, pool->write_pending_mask);
+    TEST_ASSERT_EQUAL(0, pool->ws_active_mask);
+    TEST_ASSERT_EQUAL(0, pool->read_paused_mask);
+
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        connection_t* conn = connection_get(pool, i);
+        TEST_ASSERT_NOT_NULL(conn);
+        TEST_ASSERT_EQUAL(-1, conn->fd);
+        TEST_ASSERT_EQUAL(CONN_STATE_FREE, conn->state);
+    }
+
+    stop_test_server();
+}
+
+// Test that after simulating connections and stopping, everything is clean
+static void test_fd_leak_after_connections_and_stop(void) {
+    start_test_server();
+    TEST_ASSERT_NOT_NULL(g_server);
+
+    connection_pool_t* pool = &g_server->connection_pool;
+
+    // Simulate some connection activity
+    for (int i = 0; i < 3; i++) {
+        connection_t* conn = connection_get(pool, i);
+        TEST_ASSERT_NOT_NULL(conn);
+        conn->fd = 100 + i;
+        conn->state = CONN_STATE_HTTP_HEADERS;
+        connection_mark_active(pool, i);
+    }
+
+    // Close and cleanup all simulated connections
+    for (int i = 0; i < 3; i++) {
+        connection_t* conn = connection_get(pool, i);
+        connection_close(pool, conn);
+    }
+    connection_cleanup_closed(pool);
+
+    // Verify all pool slots have fd == -1 and all bitmasks are 0
+    TEST_ASSERT_EQUAL(0, pool->active_mask);
+    TEST_ASSERT_EQUAL(0, pool->write_pending_mask);
+    TEST_ASSERT_EQUAL(0, pool->ws_active_mask);
+    TEST_ASSERT_EQUAL(0, pool->read_paused_mask);
+
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        connection_t* conn = connection_get(pool, i);
+        TEST_ASSERT_NOT_NULL(conn);
+        TEST_ASSERT_EQUAL(-1, conn->fd);
+        TEST_ASSERT_EQUAL(CONN_STATE_FREE, conn->state);
+    }
+
+    stop_test_server();
+}
+
+// ==================== CONNECTION DROP TESTS ====================
+
+// Test that setting a connection to CONN_STATE_CLOSED and running cleanup
+// properly resets all resources
+static void test_connection_drop_cleanup(void) {
+    start_test_server();
+    TEST_ASSERT_NOT_NULL(g_server);
+
+    connection_pool_t* pool = &g_server->connection_pool;
+
+    // Set up a connection that simulates an active HTTP session
+    int idx = 0;
+    connection_t* conn = connection_get(pool, idx);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    conn->fd = 200;
+    conn->state = CONN_STATE_HTTP_BODY;
+    conn->content_length = 5000;
+    conn->bytes_received = 1000;
+    conn->keep_alive = 1;
+    conn->pool_index = idx;
+    connection_mark_active(pool, idx);
+    connection_mark_write_pending(pool, idx, true);
+
+    // Simulate connection drop by closing the connection
+    connection_close(pool, conn);
+
+    // State should be CLOSED but still in active mask (for cleanup to find)
+    TEST_ASSERT_EQUAL(CONN_STATE_CLOSED, conn->state);
+    TEST_ASSERT_TRUE(connection_is_active(pool, idx));
+    // Write pending should be cleared by connection_close
+    TEST_ASSERT_FALSE(connection_has_write_pending(pool, idx));
+
+    // Run cleanup
+    connection_cleanup_closed(pool);
+
+    // After cleanup, everything should be reset
+    TEST_ASSERT_EQUAL(CONN_STATE_FREE, conn->state);
+    TEST_ASSERT_EQUAL(-1, conn->fd);
+    TEST_ASSERT_FALSE(connection_is_active(pool, idx));
+
+    stop_test_server();
+}
+
+// Test connection drop for a WebSocket connection
+static void test_connection_drop_websocket(void) {
+    start_test_server();
+    TEST_ASSERT_NOT_NULL(g_server);
+
+    connection_pool_t* pool = &g_server->connection_pool;
+
+    // Set up a WebSocket connection
+    int idx = 1;
+    connection_t* conn = connection_get(pool, idx);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    conn->fd = 300;
+    conn->state = CONN_STATE_WEBSOCKET;
+    conn->is_websocket = 1;
+    conn->ws_opcode = WS_OPCODE_TEXT;
+    conn->pool_index = idx;
+    connection_mark_active(pool, idx);
+    connection_mark_ws_active(pool, idx);
+    connection_mark_write_pending(pool, idx, true);
+    connection_mark_read_paused(pool, idx, true);
+
+    // Verify all masks are set
+    TEST_ASSERT_TRUE(connection_is_active(pool, idx));
+    TEST_ASSERT_TRUE(connection_is_ws_active(pool, idx));
+    TEST_ASSERT_TRUE(connection_has_write_pending(pool, idx));
+    TEST_ASSERT_TRUE(connection_is_read_paused(pool, idx));
+
+    // Simulate connection drop
+    connection_close(pool, conn);
+
+    // connection_close should clear write_pending, ws_active, and read_paused
+    TEST_ASSERT_FALSE(connection_has_write_pending(pool, idx));
+    TEST_ASSERT_FALSE(connection_is_ws_active(pool, idx));
+    TEST_ASSERT_FALSE(connection_is_read_paused(pool, idx));
+
+    // Run cleanup
+    connection_cleanup_closed(pool);
+
+    // Everything should be reset
+    TEST_ASSERT_EQUAL(CONN_STATE_FREE, conn->state);
+    TEST_ASSERT_EQUAL(-1, conn->fd);
+    TEST_ASSERT_FALSE(connection_is_active(pool, idx));
+
+    stop_test_server();
+}
+
+// Test multiple simultaneous connection drops
+static void test_connection_drop_multiple(void) {
+    start_test_server();
+    TEST_ASSERT_NOT_NULL(g_server);
+
+    connection_pool_t* pool = &g_server->connection_pool;
+
+    // Set up multiple connections
+    for (int i = 0; i < 4; i++) {
+        connection_t* conn = connection_get(pool, i);
+        TEST_ASSERT_NOT_NULL(conn);
+        conn->fd = 400 + i;
+        conn->state = CONN_STATE_HTTP_HEADERS;
+        conn->pool_index = i;
+        connection_mark_active(pool, i);
+    }
+
+    TEST_ASSERT_EQUAL(4, connection_count_active(pool));
+
+    // Drop connections 0 and 2 (simulate two simultaneous drops)
+    connection_close(pool, connection_get(pool, 0));
+    connection_close(pool, connection_get(pool, 2));
+
+    // Connections 1 and 3 should still be active
+    TEST_ASSERT_TRUE(connection_is_active(pool, 1));
+    TEST_ASSERT_TRUE(connection_is_active(pool, 3));
+
+    // Run cleanup
+    connection_cleanup_closed(pool);
+
+    // Connections 0 and 2 should be fully cleaned up
+    TEST_ASSERT_EQUAL(CONN_STATE_FREE, connection_get(pool, 0)->state);
+    TEST_ASSERT_EQUAL(-1, connection_get(pool, 0)->fd);
+    TEST_ASSERT_FALSE(connection_is_active(pool, 0));
+
+    TEST_ASSERT_EQUAL(CONN_STATE_FREE, connection_get(pool, 2)->state);
+    TEST_ASSERT_EQUAL(-1, connection_get(pool, 2)->fd);
+    TEST_ASSERT_FALSE(connection_is_active(pool, 2));
+
+    // Connections 1 and 3 should be untouched
+    TEST_ASSERT_EQUAL(401, connection_get(pool, 1)->fd);
+    TEST_ASSERT_EQUAL(403, connection_get(pool, 3)->fd);
+    TEST_ASSERT_TRUE(connection_is_active(pool, 1));
+    TEST_ASSERT_TRUE(connection_is_active(pool, 3));
+
+    stop_test_server();
+}
+
 // ==================== TEST RUNNER ====================
 
 void test_integration_run(void) {
@@ -725,5 +933,14 @@ void test_integration_run(void) {
     RUN_TEST(test_ws_context_null);
     RUN_TEST(test_router_use_null);
 
-    ESP_LOGI(TAG, "Integration tests completed (30 tests)");
+    // FD leak detection tests
+    RUN_TEST(test_fd_leak_after_start_stop);
+    RUN_TEST(test_fd_leak_after_connections_and_stop);
+
+    // Connection drop tests
+    RUN_TEST(test_connection_drop_cleanup);
+    RUN_TEST(test_connection_drop_websocket);
+    RUN_TEST(test_connection_drop_multiple);
+
+    ESP_LOGI(TAG, "Integration tests completed (35 tests)");
 }

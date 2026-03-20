@@ -1,5 +1,5 @@
-#ifndef _TEMPLATE_H_
-#define _TEMPLATE_H_
+#ifndef ESPHTTPD_TEMPLATE_H
+#define ESPHTTPD_TEMPLATE_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -35,6 +35,8 @@ typedef struct {
     uint8_t state;              // Parser state
     uint8_t var_name_len;       // Current variable name length
     uint8_t delim_pos;          // Position in delimiter matching
+    uint8_t flush_pending;      // Bytes of start_delim still needing flush
+    uint8_t flush_offset;       // Offset into start_delim for pending flush
     char var_name[32];          // Variable name buffer
 
     // Owned copies of delimiter strings (config.start_delim/end_delim point here)
@@ -96,4 +98,4 @@ int template_var_env(const char* var_name, uint8_t* output,
 }
 #endif
 
-#endif // _TEMPLATE_H_
+#endif // ESPHTTPD_TEMPLATE_H

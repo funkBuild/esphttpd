@@ -3,7 +3,7 @@
 #include <string.h>
 #include "esp_log.h"
 
-static const char* TAG = "TEST_SEND_BUF";
+static const char TAG[] = "TEST_SEND_BUF";
 
 // Test buffer initialization
 static void test_buffer_init(void)
@@ -655,7 +655,7 @@ static void test_start_file_valid_fd(void)
     int mock_fd = 42;
     size_t file_size = 1024;
 
-    bool result = send_buffer_start_file(&sb, mock_fd, file_size);
+    bool result = send_buffer_start_file(&sb, mock_fd, file_size, NULL, NULL);
 
     TEST_ASSERT_TRUE(result);
     TEST_ASSERT_EQUAL(mock_fd, sb.file_fd);
@@ -676,7 +676,7 @@ static void test_start_file_invalid_fd(void)
     send_buffer_init(&sb);
     send_buffer_alloc(&sb);
 
-    bool result = send_buffer_start_file(&sb, -1, 1024);
+    bool result = send_buffer_start_file(&sb, -1, 1024, NULL, NULL);
 
     TEST_ASSERT_FALSE(result);
     TEST_ASSERT_EQUAL(-1, sb.file_fd);
@@ -695,7 +695,7 @@ static void test_start_file_zero_size(void)
 
     // Zero size file is valid
     int mock_fd = 10;
-    bool result = send_buffer_start_file(&sb, mock_fd, 0);
+    bool result = send_buffer_start_file(&sb, mock_fd, 0, NULL, NULL);
 
     TEST_ASSERT_TRUE(result);
     TEST_ASSERT_EQUAL(mock_fd, sb.file_fd);
@@ -854,7 +854,7 @@ static void test_start_file_replaces_existing(void)
 
     // Start new file (should close old one)
     int new_fd = 20;
-    bool result = send_buffer_start_file(&sb, new_fd, 1000);
+    bool result = send_buffer_start_file(&sb, new_fd, 1000, NULL, NULL);
 
     TEST_ASSERT_TRUE(result);
     TEST_ASSERT_EQUAL(new_fd, sb.file_fd);
@@ -862,6 +862,109 @@ static void test_start_file_replaces_existing(void)
     TEST_ASSERT_TRUE(sb.streaming);
 
     sb.file_fd = -1;  // Prevent close attempt
+    send_buffer_free(&sb);
+}
+
+// ========== Task #50: Write pointer wrapped-state tests ==========
+
+static void test_write_ptr_wrapped(void)
+{
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+    send_buffer_alloc(&sb);
+
+    // Position head near end of buffer by filling and partially consuming
+    // Fill with (size - 20) bytes to move head near end
+    size_t fill_size = SEND_BUFFER_SIZE - 20;
+    char* fill_data = malloc(fill_size);
+    TEST_ASSERT_NOT_NULL(fill_data);
+    memset(fill_data, 'W', fill_size);
+
+    send_buffer_queue(&sb, fill_data, fill_size);
+
+    // Consume most data, leaving 10 bytes — this moves tail forward
+    // but keeps head near the end
+    send_buffer_consume(&sb, fill_size - 10);
+
+    // Now head is near end of buffer, tail has advanced
+    // write_ptr should return contiguous space limited to distance to buffer end
+    uint8_t* write_ptr;
+    size_t contiguous = send_buffer_write_ptr(&sb, &write_ptr);
+
+    // Head is at fill_size (near buffer end), so contiguous should be
+    // min(SEND_BUFFER_SIZE - head, total_space)
+    size_t to_end = SEND_BUFFER_SIZE - sb.head;
+    size_t total_space = send_buffer_space(&sb);
+    size_t expected = (to_end < total_space) ? to_end : total_space;
+
+    TEST_ASSERT_NOT_NULL(write_ptr);
+    TEST_ASSERT_EQUAL_MESSAGE(expected, contiguous,
+        "Contiguous write space should be limited to distance to buffer end");
+
+    // The contiguous space should be less than total space (since head is near end)
+    // (unless the buffer wrapped/reset, which it shouldn't since there's still data)
+    TEST_ASSERT_LESS_OR_EQUAL_MESSAGE(SEND_BUFFER_SIZE - sb.head, contiguous,
+        "Contiguous write space must not exceed distance from head to buffer end");
+
+    free(fill_data);
+    send_buffer_free(&sb);
+}
+
+static void test_commit_wraps_around(void)
+{
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+    send_buffer_alloc(&sb);
+
+    // Position head near end of buffer
+    size_t fill_size = SEND_BUFFER_SIZE - 10;
+    char* fill_data = malloc(fill_size);
+    TEST_ASSERT_NOT_NULL(fill_data);
+    memset(fill_data, 'C', fill_size);
+
+    send_buffer_queue(&sb, fill_data, fill_size);
+
+    // Consume all to move tail to match head (near end), then they reset to 0
+    send_buffer_consume(&sb, fill_size);
+
+    // After consuming all, head and tail reset to 0 — we need a different approach
+    // to get head near end without full consume. Fill again to near end,
+    // then consume partially.
+    send_buffer_queue(&sb, fill_data, fill_size);
+    // Consume half — tail moves forward but head stays at fill_size
+    send_buffer_consume(&sb, fill_size / 2);
+
+    // Now head is near end, tail is in the middle
+    uint16_t head_before = sb.head;
+    TEST_ASSERT_GREATER_OR_EQUAL(SEND_BUFFER_SIZE - 10, head_before);
+
+    // Get write pointer — will be limited to distance to buffer end
+    uint8_t* write_ptr;
+    size_t contiguous = send_buffer_write_ptr(&sb, &write_ptr);
+
+    if (contiguous > 0) {
+        // Write some bytes and commit — head should wrap around using bitmask
+        size_t to_write = contiguous;  // Write all contiguous space
+        memset(write_ptr, 'X', to_write);
+        send_buffer_commit(&sb, to_write);
+
+        // After committing past end of buffer, head should wrap via bitmask
+        // head = (head + len) & (size - 1)
+        uint16_t expected_head = (head_before + to_write) & (SEND_BUFFER_SIZE - 1);
+        TEST_ASSERT_EQUAL_MESSAGE(expected_head, sb.head,
+            "Head should wrap around correctly via bitmask");
+    }
+
+    // Now test the actual wrap: commit enough that would go past end
+    // Get fresh write pointer
+    contiguous = send_buffer_write_ptr(&sb, &write_ptr);
+    if (contiguous > 0 && sb.head > 0) {
+        // Already wrapped — verify data integrity
+        size_t pending = send_buffer_pending(&sb);
+        TEST_ASSERT_GREATER_THAN(0, pending);
+    }
+
+    free(fill_data);
     send_buffer_free(&sb);
 }
 
@@ -986,5 +1089,9 @@ void test_send_buffer_run(void)
     RUN_TEST(test_space_zero_size_no_underflow);
     RUN_TEST(test_consume_null_sb);
 
-    ESP_LOGI(TAG, "Send buffer tests completed (36 tests)");
+    // Task #50: Write pointer wrapped-state tests
+    RUN_TEST(test_write_ptr_wrapped);
+    RUN_TEST(test_commit_wraps_around);
+
+    ESP_LOGI(TAG, "Send buffer tests completed (38 tests)");
 }

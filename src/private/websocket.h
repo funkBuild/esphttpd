@@ -1,5 +1,5 @@
-#ifndef _WEBSOCKET_FRAME_H_
-#define _WEBSOCKET_FRAME_H_
+#ifndef ESPHTTPD_WEBSOCKET_FRAME_H
+#define ESPHTTPD_WEBSOCKET_FRAME_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -141,4 +141,4 @@ static inline uint8_t ws_get_payload_length(uint8_t second_byte) {
 }
 #endif
 
-#endif // _WEBSOCKET_FRAME_H_
+#endif // ESPHTTPD_WEBSOCKET_FRAME_H

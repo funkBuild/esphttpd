@@ -1,5 +1,5 @@
-#ifndef _SEND_BUFFER_H_
-#define _SEND_BUFFER_H_
+#ifndef ESPHTTPD_SEND_BUFFER_H
+#define ESPHTTPD_SEND_BUFFER_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -10,8 +10,10 @@
 extern "C" {
 #endif
 
-// Default buffer size - can be overridden via Kconfig
-#ifndef SEND_BUFFER_SIZE
+// Buffer size from Kconfig, with fallback default
+#ifdef CONFIG_HTTPD_SEND_BUFFER_SIZE
+#define SEND_BUFFER_SIZE CONFIG_HTTPD_SEND_BUFFER_SIZE
+#else
 #define SEND_BUFFER_SIZE 4096
 #endif
 
@@ -19,7 +21,11 @@ _Static_assert(SEND_BUFFER_SIZE <= UINT16_MAX,
     "SEND_BUFFER_SIZE exceeds uint16_t capacity of send_buffer_t fields");
 
 _Static_assert((SEND_BUFFER_SIZE & (SEND_BUFFER_SIZE - 1)) == 0,
-    "SEND_BUFFER_SIZE must be a power of 2 for bitmask optimization");
+    "SEND_BUFFER_SIZE must be a power of 2 (set via HTTPD_SEND_BUFFER_SIZE in Kconfig)");
+
+// Callback invoked when file streaming completes (file fd is closed).
+// Used by filesystem to decrement open_files counter when the file is actually done.
+typedef void (*send_buffer_file_close_cb_t)(void* user_data);
 
 // Send buffer state - dynamically allocated
 typedef struct {
@@ -32,6 +38,8 @@ typedef struct {
     // File streaming state
     int file_fd;                // Open file descriptor (-1 if not streaming)
     uint32_t file_remaining;    // Bytes left to send from file
+    send_buffer_file_close_cb_t on_file_close;  // Called when file fd is closed
+    void* on_file_close_arg;    // Argument for on_file_close callback
 
     // State flags
     uint8_t allocated : 1;      // Buffer is allocated
@@ -106,7 +114,8 @@ static inline void send_buffer_commit(send_buffer_t* sb, size_t len) {
 }
 
 // File streaming
-bool send_buffer_start_file(send_buffer_t* sb, int file_fd, size_t file_size);
+bool send_buffer_start_file(send_buffer_t* sb, int file_fd, size_t file_size,
+                            send_buffer_file_close_cb_t on_close, void* on_close_arg);
 void send_buffer_stop_file(send_buffer_t* sb);
 
 static inline bool send_buffer_is_streaming(send_buffer_t* sb) {
@@ -121,4 +130,4 @@ static inline size_t send_buffer_file_remaining(send_buffer_t* sb) {
 }
 #endif
 
-#endif // _SEND_BUFFER_H_
+#endif // ESPHTTPD_SEND_BUFFER_H

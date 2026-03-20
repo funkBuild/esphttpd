@@ -2,6 +2,7 @@
 #include "private/radix_tree.h"
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 #include "esp_log.h"
 
 static const char TAG[] = "ROUTER_API";
@@ -86,8 +87,8 @@ httpd_err_t httpd_router_all(httpd_router_t router, const char* pattern,
                              httpd_handler_t handler) {
     if (!router || !pattern || !handler) return HTTPD_ERR_INVALID_ARG;
 
-    // Register for all HTTP methods. Continue on failure to avoid
-    // partial registration (some methods registered, others not).
+    // Register for all HTTP methods. Continue on failure to register
+    // as many methods as possible.
     httpd_err_t first_err = HTTPD_OK;
     for (int method = HTTP_GET; method <= HTTP_PATCH; method++) {
         httpd_err_t err = radix_insert(router->tree, pattern, (http_method_t)method,
@@ -104,7 +105,7 @@ httpd_err_t httpd_router_route(httpd_router_t router, const char* pattern,
                                http_method_t method, httpd_handler_t handler,
                                void* user_ctx) {
     if (!router || !pattern || !handler) return HTTPD_ERR_INVALID_ARG;
-    if (method < 0 || method > HTTP_ANY) return HTTPD_ERR_INVALID_ARG;
+    if (method > HTTP_ANY) return HTTPD_ERR_INVALID_ARG;
     return radix_insert(router->tree, pattern, method, handler, user_ctx, NULL, 0);
 }
 
@@ -135,7 +136,7 @@ httpd_err_t httpd_router_use(httpd_router_t router, httpd_middleware_t middlewar
     }
 
     router->middlewares[router->middleware_count++] = middleware;
-    ESP_LOGI(TAG, "Added router middleware (count=%d)", router->middleware_count);
+    ESP_LOGI(TAG, "Added router middleware (count=%" PRIu8 ")", router->middleware_count);
     return HTTPD_OK;
 }
 

@@ -335,8 +335,9 @@ static void test_parse_lf_only(void)
                                               strlen(request),
                                               &ctx);
 
-    // Should either parse or need proper CRLF
-    TEST_ASSERT_TRUE(result == PARSE_COMPLETE || result == PARSE_NEED_MORE || result == PARSE_ERROR);
+    TEST_ASSERT_EQUAL(PARSE_COMPLETE, result);
+    TEST_ASSERT_EQUAL(HTTP_GET, conn.method);
+    TEST_ASSERT_EQUAL(CONN_STATE_HTTP_HEADERS, conn.state);
 }
 
 // Test HTTP/0.9 style request (method URL only)
@@ -561,23 +562,21 @@ static void test_parse_header_empty_key(void) {
 }
 
 // Test request with only LF (no CR) line endings
-// Note: The streaming parser requires a byte after the final blank line to
-// trigger completion. With CRLF, the '\n' after '\r' does this. With LF-only,
-// we need an extra byte or accept NEED_MORE (headers are actually complete).
 static void test_parse_lf_only_line_endings(void) {
     connection_t conn = {0};
     http_parser_context_t ctx = {0};
 
-    // Add a trailing space to trigger completion processing
     const char* request = "GET /test HTTP/1.1\n"
                          "Host: localhost\n"
-                         "\n ";  // Extra byte triggers completion
+                         "\n";
 
     parse_result_t result = http_parse_request(&conn,
                                               (const uint8_t*)request,
                                               strlen(request),
                                               &ctx);
     TEST_ASSERT_EQUAL(PARSE_COMPLETE, result);
+    TEST_ASSERT_EQUAL(HTTP_GET, conn.method);
+    TEST_ASSERT_EQUAL(CONN_STATE_HTTP_HEADERS, conn.state);
 }
 
 // Test request line only (no headers)
@@ -1091,7 +1090,8 @@ static void test_parse_headers_too_large(void) {
     TEST_ASSERT_EQUAL(PARSE_ERROR, result);
 }
 
-// Test empty header value
+// Test empty header value - must call http_process_header so the header is
+// visible to httpd_req_get_header().  Verify via header_count.
 static void test_parse_empty_header_value(void) {
     connection_t conn = {0};
     http_parser_context_t ctx = {0};
@@ -1106,6 +1106,46 @@ static void test_parse_empty_header_value(void) {
                                               strlen(request),
                                               &ctx);
     TEST_ASSERT_EQUAL(PARSE_COMPLETE, result);
+    // Both X-Empty (empty value) and Content-Length should be counted
+    TEST_ASSERT_EQUAL(2, ctx.header_count);
+}
+
+// Test header with whitespace-only value (treated as empty after OWS trim)
+static void test_parse_whitespace_only_header_value(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "GET /test HTTP/1.1\r\n"
+                         "X-Space:   \r\n"
+                         "Host: localhost\r\n"
+                         "\r\n";
+
+    parse_result_t result = http_parse_request(&conn,
+                                              (const uint8_t*)request,
+                                              strlen(request),
+                                              &ctx);
+    TEST_ASSERT_EQUAL(PARSE_COMPLETE, result);
+    // Both X-Space (whitespace-only -> empty) and Host should be counted
+    TEST_ASSERT_EQUAL(2, ctx.header_count);
+}
+
+// Test empty header value with LF-only line endings
+static void test_parse_empty_header_value_lf_only(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "GET /test HTTP/1.1\n"
+                         "X-Empty:\n"
+                         "Host: localhost\n"
+                         "\n";
+
+    parse_result_t result = http_parse_request(&conn,
+                                              (const uint8_t*)request,
+                                              strlen(request),
+                                              &ctx);
+    TEST_ASSERT_EQUAL(PARSE_COMPLETE, result);
+    // Both X-Empty and Host should be counted
+    TEST_ASSERT_EQUAL(2, ctx.header_count);
 }
 
 // ========== Issue #19: Malformed header (no colon) ==========
@@ -1251,6 +1291,49 @@ static void test_header_value_over_2048_rejected(void) {
     free(request);
 }
 
+// ========== RFC 7230 Section 3.3.2: Duplicate Content-Length ==========
+
+// Test that duplicate Content-Length with same value is accepted
+static void test_parse_duplicate_content_length_same_value(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "POST /api/data HTTP/1.1\r\n"
+                         "Host: localhost\r\n"
+                         "Content-Length: 100\r\n"
+                         "Content-Length: 100\r\n"
+                         "\r\n";
+
+    parse_result_t result = http_parse_request(&conn,
+                                              (const uint8_t*)request,
+                                              strlen(request),
+                                              &ctx);
+
+    // Identical Content-Length values should be accepted per RFC 7230
+    TEST_ASSERT_EQUAL(PARSE_OK, result);
+    TEST_ASSERT_EQUAL(100, conn.content_length);
+}
+
+// Test that duplicate Content-Length with different values is rejected
+static void test_parse_duplicate_content_length_different_values(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "POST /api/data HTTP/1.1\r\n"
+                         "Host: localhost\r\n"
+                         "Content-Length: 100\r\n"
+                         "Content-Length: 200\r\n"
+                         "\r\n";
+
+    parse_result_t result = http_parse_request(&conn,
+                                              (const uint8_t*)request,
+                                              strlen(request),
+                                              &ctx);
+
+    // Conflicting Content-Length values must be rejected per RFC 7230 Section 3.3.2
+    TEST_ASSERT_EQUAL(PARSE_ERROR, result);
+}
+
 void test_http_parser_run(void)
 {
     // Core functionality tests
@@ -1295,6 +1378,8 @@ void test_http_parser_run(void)
     RUN_TEST(test_parse_header_key_too_long);
     RUN_TEST(test_parse_header_empty_key);
     RUN_TEST(test_parse_empty_header_value);
+    RUN_TEST(test_parse_whitespace_only_header_value);
+    RUN_TEST(test_parse_empty_header_value_lf_only);
     RUN_TEST(test_parse_lf_only_line_endings);
     RUN_TEST(test_parse_no_headers);
     RUN_TEST(test_keep_alive_null);
@@ -1346,6 +1431,10 @@ void test_http_parser_run(void)
     RUN_TEST(test_parse_bare_cr_in_header_value);
     RUN_TEST(test_header_value_long_accepted);
     RUN_TEST(test_header_value_over_2048_rejected);
+
+    // RFC 7230 Section 3.3.2: Duplicate Content-Length
+    RUN_TEST(test_parse_duplicate_content_length_same_value);
+    RUN_TEST(test_parse_duplicate_content_length_different_values);
 
     ESP_LOGI(TAG, "HTTP Parser tests completed");
 }

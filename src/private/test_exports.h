@@ -1,5 +1,5 @@
-#ifndef _TEST_EXPORTS_H_
-#define _TEST_EXPORTS_H_
+#ifndef ESPHTTPD_TEST_EXPORTS_H
+#define ESPHTTPD_TEST_EXPORTS_H
 
 #ifdef CONFIG_ESPHTTPD_TEST_MODE
 
@@ -38,7 +38,7 @@ typedef struct {
 // Mounted router entry (must match esphttpd.c)
 typedef struct {
     const char* prefix;
-    uint8_t prefix_len;
+    uint16_t prefix_len;
     httpd_router_t router;
 } test_mounted_router_t;
 
@@ -46,6 +46,7 @@ typedef struct {
 typedef struct {
     char name[16];
     int8_t index;
+    uint8_t subscriber_count;
 } test_channel_hash_entry_t;
 
 // Internal server context exposed for tests
@@ -87,6 +88,7 @@ typedef struct {
     // State
     bool initialized;
     volatile bool running;
+    volatile bool task_exited;
 } esphttpd_server_t;
 
 // Global server instance accessible to tests
@@ -99,8 +101,8 @@ httpd_err_t _middleware_next_test(httpd_req_t* req);
 typedef struct {
     const char* key;
     const char* value;
-    uint8_t key_len;
-    uint8_t value_len;
+    uint16_t key_len;
+    uint16_t value_len;
 } test_query_param_entry_t;
 
 #define MAX_QUERY_PARAMS 8
@@ -114,8 +116,8 @@ typedef struct {
 typedef struct {
     uint16_t key_offset;
     uint16_t value_offset;
-    uint8_t key_len;
-    uint8_t value_len;
+    uint16_t key_len;
+    uint16_t value_len;
 } test_req_header_entry_t;
 
 // Per-connection request context (must match esphttpd.c request_context_t EXACTLY)
@@ -188,12 +190,6 @@ extern void* g_test_request_contexts;
 // Points to send_buffer_t*[MAX_CONNECTIONS] - pointers into pre-allocated backing storage
 extern void* g_test_send_buffers;
 
-#ifdef CONFIG_HTTPD_USE_RAW_API
-#include "raw_tcp.h"
-// Tests can install a mock for raw_tcp_write to capture output
-// See raw_tcp.h: raw_tcp_set_write_mock()
-#endif
-
 #endif // CONFIG_ESPHTTPD_TEST_MODE
 
-#endif // _TEST_EXPORTS_H_
+#endif // ESPHTTPD_TEST_EXPORTS_H

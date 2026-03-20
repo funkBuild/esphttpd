@@ -337,6 +337,7 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
                 ctx->state = WS_STATE_OPCODE;
                 ctx->header_bytes = 0;
                 ctx->mask_bytes_read = 0;
+                ctx->payload_received = 0;
                 conn->ws_payload_read = 0;
                 conn->ws_payload_len = 0;
                 return WS_FRAME_COMPLETE;
@@ -409,7 +410,7 @@ size_t ws_build_frame_header(uint8_t* buffer, ws_opcode_internal_t opcode,
     }
 
     if (mask) {
-        // Add mask key (would be random in production)
+        // Server frames are not masked per RFC 6455. Mask key is zeroed for completeness.
         memset(buffer + header_len, 0, 4);
         header_len += 4;
     }
@@ -440,30 +441,32 @@ int ws_send_frame(connection_t* conn, ws_opcode_internal_t opcode, const uint8_t
 
     // Build complete frame into a single buffer to ensure atomic send.
     // For small frames (<=256 bytes), use the stack. For larger frames,
-    // send header and payload as two separate calls - the send_buffer
-    // infrastructure ensures ordering.
+    // heap-allocate a contiguous buffer to prevent interleaving with
+    // concurrent sends from other tasks.
+    ssize_t sent;
     if (total_len <= 256) {
         uint8_t frame_buf[256];
         memcpy(frame_buf, header, header_len);
         if (payload_len > 0) {
             memcpy(frame_buf + header_len, payload, payload_len);
         }
-        if (ws_do_send(conn, frame_buf, total_len) < 0) {
-            return -1;
-        }
+        sent = ws_do_send(conn, frame_buf, total_len);
     } else {
-        // Larger frame: send header then payload (send_buffer preserves order)
-        if (ws_do_send(conn, header, header_len) < 0) {
+        uint8_t* frame_buf = malloc(total_len);
+        if (!frame_buf) {
+            ESP_LOGE(TAG, "Failed to allocate frame buffer of %" PRIu32 " bytes",
+                     (uint32_t)total_len);
             return -1;
         }
+        memcpy(frame_buf, header, header_len);
         if (payload_len > 0) {
-            if (ws_do_send(conn, payload, payload_len) < 0) {
-                return -1;
-            }
+            memcpy(frame_buf + header_len, payload, payload_len);
         }
+        sent = ws_do_send(conn, frame_buf, total_len);
+        free(frame_buf);
     }
 
-    return (int)total_len;
+    return (int)sent;
 }
 
 int ws_send_close(connection_t* conn, uint16_t code, const char* reason) {
@@ -510,6 +513,11 @@ ws_frame_result_t ws_handle_control_frame(connection_t* conn,
 
     switch (opcode) {
         case WS_OPCODE_CLOSE: {
+            // RFC 6455 Section 5.5.1: close frame payload must be 0 or 2+ bytes
+            if (payload_len == 1) {
+                ESP_LOGE(TAG, "Close frame with 1-byte payload (RFC 6455 requires 0 or 2+)");
+                return WS_FRAME_ERROR;
+            }
             // Validate close frame status code per RFC 6455 Section 7.4
             if (payload_len >= 2) {
                 uint16_t code = ((uint16_t)payload[0] << 8) | payload[1];
@@ -523,14 +531,21 @@ ws_frame_result_t ws_handle_control_frame(connection_t* conn,
             // If we're in WS_CLOSING state, the server already sent a close
             // frame and this is the client's acknowledgment (RFC 6455 5.5.1).
             if (conn->state != CONN_STATE_WS_CLOSING) {
-                ws_send_close(conn, 0, NULL);
+                if (payload_len >= 2) {
+                    uint16_t code = (payload[0] << 8) | payload[1];
+                    ws_send_close(conn, code, NULL);
+                } else {
+                    ws_send_close(conn, 0, NULL);
+                }
             }
             return WS_FRAME_CLOSE;
         }
 
         case WS_OPCODE_PING:
             // Respond with pong
-            ws_send_pong(conn, payload, payload_len);
+            if (ws_send_pong(conn, payload, payload_len) < 0) {
+                return WS_FRAME_ERROR;
+            }
             return WS_FRAME_OK;
 
         case WS_OPCODE_PONG:
@@ -550,17 +565,21 @@ int ws_compute_accept_key(const char* client_key, char* accept_key, size_t accep
 
     mbedtls_sha1_context sha_ctx;
     mbedtls_sha1_init(&sha_ctx);
-    mbedtls_sha1_starts(&sha_ctx);
-    mbedtls_sha1_update(&sha_ctx, (const unsigned char*)client_key, key_len);
-    mbedtls_sha1_update(&sha_ctx, (const unsigned char*)WS_GUID, sizeof(WS_GUID) - 1);
+    int ret = mbedtls_sha1_starts(&sha_ctx);
+    if (ret == 0) ret = mbedtls_sha1_update(&sha_ctx, (const unsigned char*)client_key, key_len);
+    if (ret == 0) ret = mbedtls_sha1_update(&sha_ctx, (const unsigned char*)WS_GUID, sizeof(WS_GUID) - 1);
     unsigned char hash[20];
-    mbedtls_sha1_finish(&sha_ctx, hash);
+    if (ret == 0) ret = mbedtls_sha1_finish(&sha_ctx, hash);
     mbedtls_sha1_free(&sha_ctx);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "SHA1 computation failed: %d", ret);
+        return -1;
+    }
 
     // Base64 encode the hash
     size_t olen;
-    int ret = mbedtls_base64_encode((unsigned char*)accept_key, accept_key_size,
-                                     &olen, hash, 20);
+    ret = mbedtls_base64_encode((unsigned char*)accept_key, accept_key_size,
+                                &olen, hash, 20);
     if (ret == 0 && out_len) {
         *out_len = olen;
     }

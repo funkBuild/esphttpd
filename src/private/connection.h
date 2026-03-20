@@ -1,18 +1,11 @@
-#ifndef _CORE_CONNECTION_H_
-#define _CORE_CONNECTION_H_
+#ifndef ESPHTTPD_CONNECTION_H
+#define ESPHTTPD_CONNECTION_H
 
 #include "sdkconfig.h"
 
 #include <stdint.h>
 #include <stdbool.h>
-#ifndef CONFIG_HTTPD_USE_RAW_API
 #include <sys/socket.h>
-#endif
-
-#ifdef CONFIG_HTTPD_USE_RAW_API
-struct tcp_pcb;  // Forward declaration
-struct pbuf;     // Forward declaration
-#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,7 +17,7 @@ extern "C" {
 #endif
 #define MAX_CONNECTIONS CONFIG_HTTPD_MAX_CONNECTIONS
 
-// Enforce limit: active_mask/write_pending_mask/ws_active_mask are uint32_t bitmasks
+// Enforce limit: active_mask/write_pending_mask/ws_active_mask/read_paused_mask are uint32_t bitmasks
 _Static_assert(MAX_CONNECTIONS <= 32,
     "MAX_CONNECTIONS exceeds uint32_t bitmask capacity");
 
@@ -60,28 +53,12 @@ typedef enum {
     WS_OPCODE_PONG         = 0xA
 } ws_opcode_internal_t;
 
-#ifdef CONFIG_HTTPD_USE_RAW_API
-// Raw TCP connection state (replaces socket fd)
-typedef struct {
-    struct tcp_pcb *pcb;         // lwIP TCP protocol control block
-    struct pbuf *recv_chain;     // Pending received pbuf chain (reserved for future buffered recv)
-    uint16_t recv_offset;        // Read offset into current pbuf (reserved for future buffered recv)
-    uint32_t unacked_bytes;      // Bytes written but not yet acked
-    bool write_pending;          // tcp_write data waiting for output
-} raw_tcp_conn_t;
-#endif
-
 // Connection structure - naturally aligned for zero-penalty access on Xtensa
 // Fields ordered by alignment: 32-bit, 16-bit, 8-bit, bitfields
 // ~40 bytes per connection (vs ~36 packed), eliminates unaligned access traps
 typedef struct {
     // 32-bit aligned fields (24 bytes)
-#ifdef CONFIG_HTTPD_USE_RAW_API
-    raw_tcp_conn_t raw;          // Raw TCP connection state
-    int fd;                      // Compatibility: always -1 under raw API
-#else
     int fd;                      // Socket file descriptor
-#endif
     uint32_t content_length;     // Expected content length (supports up to 4GB)
     uint32_t bytes_received;     // Bytes received for current message
     uint32_t ws_mask_key;        // WebSocket masking key (when masked)
@@ -125,13 +102,13 @@ typedef struct {
     uint32_t active_mask;        // Bitmask of active connections
     uint32_t write_pending_mask; // Bitmask of connections with pending writes
     uint32_t ws_active_mask;     // Bitmask of active WebSocket connections (O(k) iteration)
+    uint32_t read_paused_mask;   // Bitmask of connections with reads paused (TCP backpressure)
 } connection_pool_t;
 
 // Connection management functions
 void connection_pool_init(connection_pool_t* pool);
 connection_t* connection_accept(connection_pool_t* pool, int listen_fd);
 connection_t* connection_find(connection_pool_t* pool, int fd);
-connection_t* connection_alloc_slot(connection_pool_t* pool);
 connection_t* connection_get(connection_pool_t* pool, int index);
 int connection_get_index(connection_pool_t* pool, connection_t* conn);
 void connection_close(connection_pool_t* pool, connection_t* conn);
@@ -139,23 +116,30 @@ void connection_cleanup_closed(connection_pool_t* pool);
 int connection_count_active(connection_pool_t* pool);
 
 // Utility functions
+// All bitmask functions validate index is in [0, MAX_CONNECTIONS) to prevent
+// undefined behavior from shifting uint32_t by 32+ bits.
 static inline bool connection_is_active(connection_pool_t* pool, int index) {
+    if (index < 0 || index >= MAX_CONNECTIONS) return false;
     return (pool->active_mask & (1U << index)) != 0;
 }
 
 static inline void connection_mark_active(connection_pool_t* pool, int index) {
+    if (index < 0 || index >= MAX_CONNECTIONS) return;
     pool->active_mask |= (1U << index);
 }
 
 static inline void connection_mark_inactive(connection_pool_t* pool, int index) {
+    if (index < 0 || index >= MAX_CONNECTIONS) return;
     pool->active_mask &= ~(1U << index);
 }
 
 static inline bool connection_has_write_pending(connection_pool_t* pool, int index) {
+    if (index < 0 || index >= MAX_CONNECTIONS) return false;
     return (pool->write_pending_mask & (1U << index)) != 0;
 }
 
 static inline void connection_mark_write_pending(connection_pool_t* pool, int index, bool pending) {
+    if (index < 0 || index >= MAX_CONNECTIONS) return;
     if (pending) {
         pool->write_pending_mask |= (1U << index);
     } else {
@@ -165,24 +149,43 @@ static inline void connection_mark_write_pending(connection_pool_t* pool, int in
 
 // WebSocket active tracking for O(k) broadcast iteration
 static inline bool connection_is_ws_active(connection_pool_t* pool, int index) {
+    if (index < 0 || index >= MAX_CONNECTIONS) return false;
     return (pool->ws_active_mask & (1U << index)) != 0;
 }
 
 static inline void connection_mark_ws_active(connection_pool_t* pool, int index) {
+    if (index < 0 || index >= MAX_CONNECTIONS) return;
     pool->ws_active_mask |= (1U << index);
 }
 
 static inline void connection_mark_ws_inactive(connection_pool_t* pool, int index) {
+    if (index < 0 || index >= MAX_CONNECTIONS) return;
     pool->ws_active_mask &= ~(1U << index);
 }
 
 // Get count of active WebSocket connections using popcount
-static inline int connection_ws_active_count(connection_pool_t* pool) {
+static inline int connection_ws_active_count(const connection_pool_t* pool) {
+    if (!pool) return 0;
     return __builtin_popcount(pool->ws_active_mask);
+}
+
+// Read-paused tracking for TCP backpressure (deferred pause)
+static inline bool connection_is_read_paused(const connection_pool_t* pool, int index) {
+    if (index < 0 || index >= MAX_CONNECTIONS) return false;
+    return (pool->read_paused_mask & (1U << index)) != 0;
+}
+
+static inline void connection_mark_read_paused(connection_pool_t* pool, int index, bool paused) {
+    if (index < 0 || index >= MAX_CONNECTIONS) return;
+    if (paused) {
+        pool->read_paused_mask |= (1U << index);
+    } else {
+        pool->read_paused_mask &= ~(1U << index);
+    }
 }
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // _CORE_CONNECTION_H_
+#endif // ESPHTTPD_CONNECTION_H

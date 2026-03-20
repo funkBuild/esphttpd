@@ -3,10 +3,40 @@
 #include "unity.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esphttpd.h"
+#include "test_exports.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 static const char* TAG = "ESPHTTPD_TEST";
+
+// Unity setUp/tearDown - called before/after EVERY test.
+//
+// tearDown defensively stops the server if it is still running. This prevents
+// cascade failures when a test assertion fires mid-execution (after
+// start_test_server but before stop_test_server). Without this, the leaked
+// server would cause every subsequent test that calls httpd_start to fail
+// with HTTPD_ERR_ALREADY_STARTED or similar.
+//
+// We use the global g_server pointer (set by httpd_start, cleared by
+// httpd_stop) as the single source of truth. Each test file has its own
+// static handle variable, but those are irrelevant here; httpd_stop via
+// g_server is sufficient because httpd_stop sets g_server = NULL internally.
+// The per-file static handles will be stale after tearDown, but every test
+// that uses start_test_server calls httpd_start which overwrites them anyway.
+
+void setUp(void) {
+    // Nothing needed before each test
+}
+
+void tearDown(void) {
+    // If the server is still running (test failed before stop_test_server),
+    // stop it to prevent cascade failures in subsequent tests.
+    if (g_server != NULL) {
+        httpd_stop((httpd_handle_t)g_server);
+        // httpd_stop sets g_server = NULL internally
+    }
+}
 
 // Declare test functions
 void test_http_parser_run(void);

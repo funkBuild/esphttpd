@@ -4,6 +4,15 @@
 
 static const char TAG[] = "HTTP_PARSER";
 
+// RFC 7230 token character bitmap (declared extern in http_parser.h)
+const uint32_t token_bitmap[8] = {
+    0x00000000, // 0x00-0x1F: no control chars
+    0x03FF6CFA, // 0x20-0x3F: digits, !, #, $, %, &, ', *, +, -, .
+    0xC7FFFFFE, // 0x40-0x5F: A-Z, ^, _
+    0x57FFFFFF, // 0x60-0x7F: `, a-z, |, ~
+    0x00000000, 0x00000000, 0x00000000, 0x00000000
+};
+
 // External function to store headers (defined in esphttpd.c)
 extern void esphttpd_store_header(connection_t* conn,
                                   const uint8_t* key, uint16_t key_len,
@@ -179,7 +188,7 @@ bool http_parse_keep_alive(const uint8_t* value, uint16_t len) {
     return true; // Default to keep-alive for HTTP/1.1
 }
 
-void http_process_header(connection_t* conn,
+parse_result_t http_process_header(connection_t* conn,
                         const uint8_t* key, uint16_t key_len,
                         const uint8_t* value, uint16_t value_len,
                         http_parser_context_t* parser_ctx) {
@@ -189,9 +198,21 @@ void http_process_header(connection_t* conn,
     header_type_t type = http_identify_header(key, key_len);
 
     switch (type) {
-        case HEADER_CONTENT_LENGTH:
-            conn->content_length = http_parse_content_length(value, value_len);
+        case HEADER_CONTENT_LENGTH: {
+            uint32_t new_cl = http_parse_content_length(value, value_len);
+            if (parser_ctx->content_length_seen) {
+                // RFC 7230 Section 3.3.2: reject if values differ
+                if (new_cl != conn->content_length) {
+                    ESP_LOGE(TAG, "Duplicate Content-Length with conflicting values");
+                    return PARSE_ERROR;
+                }
+                // Identical values: accept per RFC 7230
+            } else {
+                conn->content_length = new_cl;
+                parser_ctx->content_length_seen = 1;
+            }
             break;
+        }
 
         case HEADER_CONNECTION:
             conn->keep_alive = http_parse_keep_alive(value, value_len);
@@ -216,6 +237,7 @@ void http_process_header(connection_t* conn,
             // Other headers can be processed as needed
             break;
     }
+    return PARSE_OK;
 }
 
 parse_result_t http_parse_request(connection_t* __restrict conn,
@@ -352,14 +374,37 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                 // First byte: check for leading whitespace to find value start
                 if (!ctx->current_header_value) {
                     if (c == '\r') {
-                        // Empty value - stay in HEADER_VALUE; \n will trigger
-                        // transition to HEADER_KEY on next iteration
+                        // Empty value - process header with zero-length value
+                        // so it is visible to httpd_req_get_header()
+                        if (ctx->current_header_key) {
+                            parse_result_t hdr_result = http_process_header(conn,
+                                              ctx->current_header_key, ctx->header_key_len,
+                                              &buffer[i], 0, ctx);
+                            if (__builtin_expect(hdr_result == PARSE_ERROR, 0)) {
+                                return PARSE_ERROR;
+                            }
+                        }
                         ctx->header_count++;
+                        // Clear key so the following \n does not re-process
+                        ctx->current_header_key = NULL;
+                        ctx->header_key_len = 0;
                         break;
                     }
                     if (c == '\n') {
                         // Empty value (LF-only) or \n after \r from previous
-                        // header - transition to HEADER_KEY
+                        // header - transition to HEADER_KEY.
+                        // If this is a fresh empty value (not the \n after a
+                        // \r that already processed the header above), process
+                        // the header now.
+                        if (ctx->current_header_key && ctx->header_key_len > 0) {
+                            parse_result_t hdr_result = http_process_header(conn,
+                                              ctx->current_header_key, ctx->header_key_len,
+                                              &buffer[i], 0, ctx);
+                            if (__builtin_expect(hdr_result == PARSE_ERROR, 0)) {
+                                return PARSE_ERROR;
+                            }
+                            ctx->header_count++;
+                        }
                         ctx->state = PARSE_STATE_HEADER_KEY;
                         ctx->current_header_key = NULL;
                         ctx->header_key_len = 0;
@@ -389,17 +434,23 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                     ctx->header_value_len += span;
                     // End of header value - process it
                     if (ctx->current_header_key && ctx->current_header_value) {
-                        http_process_header(conn,
+                        parse_result_t hdr_result = http_process_header(conn,
                                           ctx->current_header_key, ctx->header_key_len,
                                           ctx->current_header_value, ctx->header_value_len,
                                           ctx);
+                        if (__builtin_expect(hdr_result == PARSE_ERROR, 0)) {
+                            return PARSE_ERROR;
+                        }
                     }
                     ctx->header_count++;
                     // Reset value pointer so \n handler can trigger HEADER_KEY transition
                     ctx->current_header_value = NULL;
                     if (*end == '\r') {
                         // CRLF: point to \r; i++ moves to \n which triggers
-                        // HEADER_KEY transition via the NULL value \n handler above
+                        // HEADER_KEY transition via the NULL value \n handler above.
+                        // Clear key so the \n handler does not re-process.
+                        ctx->current_header_key = NULL;
+                        ctx->header_key_len = 0;
                         i = end - buffer;
                     } else {
                         // LF-only: transition directly to HEADER_KEY
@@ -453,6 +504,33 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
             case PARSE_STATE_COMPLETE:
             case PARSE_STATE_ERROR:
                 return ctx->state == PARSE_STATE_COMPLETE ? PARSE_COMPLETE : PARSE_ERROR;
+        }
+
+        // When a bare LF sets state to HEADERS_COMPLETE, the i++ below
+        // pushes past buffer_len, causing the loop to exit before the
+        // HEADERS_COMPLETE case runs. Handle it immediately here.
+        // For CRLF, \r sets the state and the switch case on the next
+        // iteration (at the \n) handles it correctly, so only intercept
+        // when the trigger was a bare \n.
+        if (__builtin_expect(ctx->state == PARSE_STATE_HEADERS_COMPLETE
+                             && c == '\n', 0)) {
+            conn->state = CONN_STATE_HTTP_HEADERS;
+            conn->header_bytes = i + 1;
+
+            if ((conn->method == HTTP_POST ||
+                 conn->method == HTTP_PUT ||
+                 conn->method == HTTP_PATCH) &&
+                conn->content_length > 0) {
+                conn->state = CONN_STATE_HTTP_BODY;
+                conn->bytes_received = 0;
+                ctx->state = PARSE_STATE_BODY;
+                return PARSE_OK;
+            } else if (conn->is_websocket && conn->upgrade_ws) {
+                conn->state = CONN_STATE_WEBSOCKET;
+                return PARSE_COMPLETE;
+            } else {
+                return PARSE_COMPLETE;
+            }
         }
 
         i++;

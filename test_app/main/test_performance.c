@@ -3,6 +3,7 @@
 #include "esp_log.h"
 #include <string.h>
 #include <stdlib.h>
+#include <inttypes.h>
 
 // Include internal headers for benchmarking
 #include "esphttpd.h"
@@ -23,7 +24,7 @@ static const char* TAG = "TEST_PERF";
 #define PERF_END(name, iters) do { \
     int64_t _perf_elapsed = esp_timer_get_time() - _perf_start; \
     int64_t _ns_per_op = (_perf_elapsed * 1000) / (iters); \
-    printf("PERF: %s: %lld us total, %lld ns/op (%d iterations)\n", \
+    printf("PERF: %s: %" PRId64 " us total, %" PRId64 " ns/op (%d iterations)\n", \
            (name), _perf_elapsed, _ns_per_op, (iters)); \
     TEST_ASSERT_MESSAGE(_perf_elapsed > 0, "Timer returned 0 - benchmark invalid"); \
 } while(0)

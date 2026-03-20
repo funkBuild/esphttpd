@@ -12,7 +12,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-static const char* TAG = "TEST_MIDDLEWARE";
+static const char TAG[] = "TEST_MIDDLEWARE";
 
 // ==================== Execution Tracking ====================
 
@@ -332,6 +332,76 @@ static void test_middleware_modifies_request(void) {
     // so we can't verify middleware modifications to user_data survive to handler
 }
 
+// ==================== User Context Tests ====================
+
+// Global to capture user_data seen by handler
+static void* captured_user_data = NULL;
+
+static httpd_err_t test_handler_capture_user_data(httpd_req_t* req) {
+    captured_user_data = req->user_data;
+    record_execution(999);
+    return HTTPD_OK;
+}
+
+static void test_user_ctx_without_middleware(void) {
+    ESP_LOGI(TAG, "Test: user_ctx is set when middleware count is zero");
+    reset_exec_tracking();
+    captured_user_data = NULL;
+
+    httpd_req_t req;
+    connection_t conn;
+    setup_mock_req(&req, &conn);
+
+    static int expected_ctx = 42;
+
+    // Empty middleware chain (mw_count == 0)
+    req._mw.chain = NULL;
+    req._mw.chain_len = 0;
+    req._mw.current = 0;
+    req._mw.final_handler = test_handler_capture_user_data;
+    req._mw.final_user_ctx = &expected_ctx;
+    req._mw.router = NULL;
+
+    // Simulate what the dispatch code does: set user_data then call handler
+    // When _middleware_next is called with chain_len==0, it sets user_data from final_user_ctx
+    httpd_err_t err = _middleware_next_test(&req);
+
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
+    TEST_ASSERT_EQUAL(1, exec_count);
+    TEST_ASSERT_EQUAL(999, exec_order[0]);
+    // Verify user_data was set to the expected user_ctx pointer
+    TEST_ASSERT_EQUAL_PTR(&expected_ctx, captured_user_data);
+}
+
+static void test_user_ctx_with_middleware(void) {
+    ESP_LOGI(TAG, "Test: user_ctx is set when middleware is present");
+    reset_exec_tracking();
+    captured_user_data = NULL;
+
+    httpd_req_t req;
+    connection_t conn;
+    setup_mock_req(&req, &conn);
+
+    static int expected_ctx = 99;
+
+    httpd_middleware_t chain[1] = { middleware_1 };
+    req._mw.chain = chain;
+    req._mw.chain_len = 1;
+    req._mw.current = 0;
+    req._mw.final_handler = test_handler_capture_user_data;
+    req._mw.final_user_ctx = &expected_ctx;
+    req._mw.router = NULL;
+
+    httpd_err_t err = _middleware_next_test(&req);
+
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
+    TEST_ASSERT_EQUAL(2, exec_count);
+    TEST_ASSERT_EQUAL(1, exec_order[0]);    // middleware_1
+    TEST_ASSERT_EQUAL(999, exec_order[1]);  // handler
+    // Verify user_data was set to the expected user_ctx pointer
+    TEST_ASSERT_EQUAL_PTR(&expected_ctx, captured_user_data);
+}
+
 // ==================== NULL Input Tests ====================
 
 static void test_middleware_next_null_req(void) {
@@ -510,6 +580,10 @@ void test_middleware_run(void) {
 
     // Request modification tests
     RUN_TEST(test_middleware_modifies_request);
+
+    // User context tests
+    RUN_TEST(test_user_ctx_without_middleware);
+    RUN_TEST(test_user_ctx_with_middleware);
 
     // NULL input tests
     RUN_TEST(test_middleware_next_null_req);
