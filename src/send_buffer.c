@@ -38,6 +38,11 @@ void send_buffer_free(send_buffer_t* sb) {
         close(sb->file_fd);
     }
 
+    // Free owned memory buffer
+    if (sb->mem_owned) {
+        free(sb->mem_owned);
+    }
+
     // Free dynamically allocated buffer
     if (sb->buffer) {
         free(sb->buffer);
@@ -59,6 +64,15 @@ void send_buffer_reset(send_buffer_t* sb) {
     sb->streaming = 0;
     sb->chunked = 0;
     sb->headers_done = 0;
+
+    // Clean up memory streaming
+    if (sb->mem_owned) {
+        free(sb->mem_owned);
+        sb->mem_owned = NULL;
+    }
+    sb->mem_ptr = NULL;
+    sb->mem_remaining = 0;
+    sb->mem_streaming = 0;
 }
 
 ssize_t send_buffer_queue(send_buffer_t* __restrict sb, const void* __restrict data, size_t len) {
@@ -158,4 +172,41 @@ void send_buffer_stop_file(send_buffer_t* sb) {
     }
     sb->file_remaining = 0;
     sb->streaming = 0;
+}
+
+bool send_buffer_start_mem(send_buffer_t* sb, const uint8_t* data, size_t len) {
+    if (!data || len == 0) {
+        return false;
+    }
+
+    // Allocate a copy so the caller's buffer can go out of scope
+    uint8_t* copy = (uint8_t*)malloc(len);
+    if (!copy) {
+        ESP_LOGW(TAG, "Failed to allocate memory stream buffer (%zu bytes)", len);
+        return false;
+    }
+    memcpy(copy, data, len);
+
+    // Free any previous owned buffer
+    if (sb->mem_owned) {
+        free(sb->mem_owned);
+    }
+
+    sb->mem_owned = copy;
+    sb->mem_ptr = copy;
+    sb->mem_remaining = (uint32_t)len;
+    sb->mem_streaming = 1;
+
+    ESP_LOGD(TAG, "Started memory stream: %zu bytes", len);
+    return true;
+}
+
+void send_buffer_stop_mem(send_buffer_t* sb) {
+    if (sb->mem_owned) {
+        free(sb->mem_owned);
+        sb->mem_owned = NULL;
+    }
+    sb->mem_ptr = NULL;
+    sb->mem_remaining = 0;
+    sb->mem_streaming = 0;
 }

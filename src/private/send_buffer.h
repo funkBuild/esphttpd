@@ -33,12 +33,18 @@ typedef struct {
     int file_fd;                // Open file descriptor (-1 if not streaming)
     uint32_t file_remaining;    // Bytes left to send from file
 
+    // Memory streaming state (for large in-memory responses)
+    const uint8_t* mem_ptr;     // Current read position in memory buffer
+    uint32_t mem_remaining;     // Bytes left to send from memory
+    uint8_t* mem_owned;         // Heap-allocated copy (NULL if not owned, freed on stop)
+
     // State flags
     uint8_t allocated : 1;      // Buffer is allocated
     uint8_t streaming : 1;      // File streaming active
     uint8_t chunked : 1;        // Using chunked transfer encoding
     uint8_t headers_done : 1;   // HTTP headers fully sent
-    uint8_t _reserved : 4;
+    uint8_t mem_streaming : 1;  // Memory streaming active
+    uint8_t _reserved : 3;
 } send_buffer_t;
 
 // Initialize a send buffer (does not allocate memory yet)
@@ -115,6 +121,19 @@ static inline bool send_buffer_is_streaming(send_buffer_t* sb) {
 
 static inline size_t send_buffer_file_remaining(send_buffer_t* sb) {
     return sb->file_remaining;
+}
+
+// Memory streaming (for large in-memory responses)
+// Takes ownership of a heap-allocated copy of the data
+bool send_buffer_start_mem(send_buffer_t* sb, const uint8_t* data, size_t len);
+void send_buffer_stop_mem(send_buffer_t* sb);
+
+static inline bool send_buffer_is_mem_streaming(send_buffer_t* sb) {
+    return sb->mem_streaming && sb->mem_ptr != NULL;
+}
+
+static inline size_t send_buffer_mem_remaining(send_buffer_t* sb) {
+    return sb->mem_remaining;
 }
 
 #ifdef __cplusplus

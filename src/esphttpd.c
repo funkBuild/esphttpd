@@ -594,9 +594,16 @@ queue_data:
             drain_send_buffer(conn);
             space = send_buffer_space(sb);
             if (space == 0) {
-                // Socket also full - no progress possible
-                ESP_LOGE(TAG, "Send buffer full, cannot queue %zu bytes", remaining);
-                return -1;
+                // Socket also full - fall back to async memory streaming.
+                // Copies remaining data to heap so on_write_ready can drain
+                // it incrementally as the TCP window opens.
+                if (!send_buffer_start_mem(sb, ptr, remaining)) {
+                    ESP_LOGE(TAG, "Send buffer full and mem stream alloc failed (%zu bytes)", remaining);
+                    return -1;
+                }
+                ESP_LOGD(TAG, "Deferred %zu bytes to memory stream for conn [%d]",
+                         remaining, conn->pool_index);
+                break;
             }
         }
         size_t to_queue = (remaining <= space) ? remaining : space;
@@ -3979,9 +3986,9 @@ static void on_disconnect(connection_t* conn) {
         memset(ws_contexts[idx], 0, sizeof(ws_context_t));
     }
 
-    // Reset send buffer - free internal ring buffer, keep struct
+    // Reset send buffer - free internal ring buffer and memory stream, keep struct
     if (connection_send_buffers[idx]) {
-        if (connection_send_buffers[idx]->allocated) {
+        if (connection_send_buffers[idx]->allocated || connection_send_buffers[idx]->mem_owned) {
             send_buffer_free(connection_send_buffers[idx]);
         } else {
             send_buffer_init(connection_send_buffers[idx]);
@@ -4036,6 +4043,29 @@ static void on_write_ready(connection_t* conn) {
                 send_buffer_stop_file(sb);
             }
 #endif
+        }
+    }
+
+    // If streaming from memory buffer, refill the ring buffer (memcpy into ring buffer)
+    if (send_buffer_is_mem_streaming(sb)) {
+        uint8_t* write_ptr;
+        size_t contiguous = send_buffer_write_ptr(sb, &write_ptr);
+
+        if (contiguous > 0 && sb->mem_remaining > 0) {
+            size_t to_copy = contiguous;
+            if (to_copy > sb->mem_remaining) {
+                to_copy = sb->mem_remaining;
+            }
+
+            memcpy(write_ptr, sb->mem_ptr, to_copy);
+            send_buffer_commit(sb, to_copy);
+            sb->mem_ptr += to_copy;
+            sb->mem_remaining -= to_copy;
+
+            if (sb->mem_remaining == 0) {
+                send_buffer_stop_mem(sb);
+                ESP_LOGD(TAG, "Memory streaming complete for conn [%d]", conn->pool_index);
+            }
         }
     }
 
@@ -4157,6 +4187,11 @@ static void on_write_ready(connection_t* conn) {
 
         // If file streaming needs more data, continue the loop
         if (send_buffer_is_streaming(sb)) {
+            continue;
+        }
+
+        // If memory streaming needs more data, continue the loop
+        if (send_buffer_is_mem_streaming(sb)) {
             continue;
         }
 
