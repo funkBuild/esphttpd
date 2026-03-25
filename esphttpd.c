@@ -33,6 +33,7 @@
 #define SEND_BUFFER_SIZE 1024
 #define RCV_BUFFER_SIZE 1024
 #define WS_MAX_PAYLOAD_LEN 1024
+#define MAX_HEADER_SIZE (8 * 1024)
 
 static TaskHandle_t esphttpd_task_handle = NULL;
 static EventGroupHandle_t esphttpd_event_group = NULL;
@@ -601,9 +602,13 @@ bool webserver_check_basic_auth(http_req* req, char* auth_user, char* auth_passw
   strtok(auth_header, " ");
   char* value = strtok(NULL, "");
 
+  if (!value) return false;
+
   char auth_value[128];
   size_t auth_value_len = 0;
-  mbedtls_base64_decode((unsigned char*)auth_value, 128, &auth_value_len, (unsigned char*)value, strlen(value));
+  int ret = mbedtls_base64_decode((unsigned char*)auth_value, sizeof(auth_value) - 1, &auth_value_len, (unsigned char*)value, strlen(value));
+
+  if (ret != 0) return false;
 
   auth_value[auth_value_len] = 0;
 
@@ -1198,12 +1203,18 @@ bool read_request_headers(struct netconn* conn, http_req* req) {
     req->rx_bytes += copied;
     netbuf_delete(buf);
 
-    if (req->recv_buf_len >= 4 && strstr(req->recv_buf, "\r\n\r\n") != NULL) {
+    if (req->recv_buf_len > MAX_HEADER_SIZE) {
+      ESP_LOGE(TAG, "Header too large: %u bytes (max %d)", req->recv_buf_len, MAX_HEADER_SIZE);
+      return false;
+    }
+
+    if (req->recv_buf_len >= 4 &&
+        memmem(req->recv_buf, req->recv_buf_len, "\r\n\r\n", 4) != NULL) {
       reached_body = true;
     }
   }
 
-  char* header_end = strstr(req->recv_buf, "\r\n\r\n");
+  char* header_end = memmem(req->recv_buf, req->recv_buf_len, "\r\n\r\n", 4);
   size_t headers_len = header_end - req->recv_buf + 4;
   size_t leftover = req->recv_buf_len - headers_len;
 
