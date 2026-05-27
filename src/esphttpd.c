@@ -290,6 +290,7 @@ typedef struct {
     struct {
         httpd_continuation_t handler;     // Continuation handler callback
         httpd_req_continuation_t cont;    // Continuation state
+        httpd_continuation_close_cb_t on_close;  // Disconnect/abort cleanup callback
         bool active;                      // Continuation mode active
     } continuation;
     char _zero_end[0];                    // Marker: memset stops here
@@ -2658,6 +2659,7 @@ httpd_err_t httpd_req_continue(httpd_req_t* req, httpd_continuation_t handler,
     ctx->continuation.cont.phase = 0;
     ctx->continuation.cont.expected_bytes = 0;
     ctx->continuation.cont.received_bytes = 0;
+    ctx->continuation.on_close = NULL;
     ctx->continuation.active = true;
     conn->continuation = 1;
 
@@ -2718,6 +2720,19 @@ bool httpd_req_is_continuation(httpd_req_t* req) {
 
     request_context_t* ctx = (request_context_t*)((char*)req - offsetof(request_context_t, req));
     return ctx->continuation.active;
+}
+
+httpd_err_t httpd_req_set_continuation_close_cb(httpd_req_t* req,
+                                                httpd_continuation_close_cb_t cb) {
+    if (!req) {
+        return HTTPD_ERR_INVALID_ARG;
+    }
+    request_context_t* ctx = (request_context_t*)((char*)req - offsetof(request_context_t, req));
+    if (!ctx->continuation.active) {
+        return HTTPD_ERR_INVALID_ARG;
+    }
+    ctx->continuation.on_close = cb;
+    return HTTPD_OK;
 }
 
 // ============================================================================
@@ -3935,6 +3950,19 @@ static void on_disconnect(connection_t* conn) {
             ctx->defer.active = false;
             conn->deferred = 0;
         }
+    }
+
+    // Handle disconnect for an in-flight continuation. The continuation data
+    // path is not called again on disconnect, so notify the handler here so it
+    // can release any resources it owns (heap state, OTA sessions, locks).
+    if (conn->continuation && ctx && ctx->continuation.active) {
+        if (ctx->continuation.on_close) {
+            ESP_LOGW(TAG, "Connection closed during continuation request");
+            ctx->continuation.on_close(&ctx->req, ctx->continuation.cont.state,
+                                       HTTPD_ERR_CONN_CLOSED);
+        }
+        ctx->continuation.active = false;
+        conn->continuation = 0;
     }
 
     // Handle disconnect for async send

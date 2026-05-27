@@ -1060,6 +1060,43 @@ httpd_err_t httpd_req_continue(httpd_req_t* req, httpd_continuation_t handler,
  */
 bool httpd_req_is_continuation(httpd_req_t* req);
 
+/**
+ * @brief Continuation close/abort callback
+ *
+ * Invoked exactly once if the connection is torn down (client disconnect,
+ * read/write error, timeout) while a continuation is still active — i.e. the
+ * handler last returned HTTPD_ERR_WOULD_BLOCK and never reached a terminal
+ * (HTTPD_OK / error) return. Unlike the data handler, the continuation data
+ * path is NOT called again on disconnect, so without this callback any
+ * handler-owned resources (heap state, open OTA sessions, locks) would leak.
+ *
+ * The callback must NOT send a response (the connection is already gone); it
+ * should only release/free handler-owned resources. It is mutually exclusive
+ * with the handler's own terminal cleanup: once the handler returns HTTPD_OK or
+ * an error the continuation is marked inactive, so this callback will not fire.
+ *
+ * @param req    Request context (connection already closed — do not send)
+ * @param state  The handler_state passed to httpd_req_continue()
+ * @param reason Why the continuation is being closed (e.g. HTTPD_ERR_CONN_CLOSED)
+ */
+typedef void (*httpd_continuation_close_cb_t)(httpd_req_t* req, void* state,
+                                              httpd_err_t reason);
+
+/**
+ * @brief Register a close/abort callback for an active continuation
+ *
+ * Call immediately after httpd_req_continue(). The callback fires only if the
+ * connection is torn down while the continuation is still active; on normal
+ * completion the handler cleans up itself and the callback is not invoked.
+ *
+ * @param req Request context (must already be in continuation mode)
+ * @param cb  Close callback (NULL clears it)
+ * @return HTTPD_OK on success, HTTPD_ERR_INVALID_ARG if req is NULL or not in
+ *         continuation mode
+ */
+httpd_err_t httpd_req_set_continuation_close_cb(httpd_req_t* req,
+                                                httpd_continuation_close_cb_t cb);
+
 // ============================================================================
 // Authentication
 // ============================================================================

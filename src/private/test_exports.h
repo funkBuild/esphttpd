@@ -167,6 +167,7 @@ typedef struct {
     struct {
         httpd_continuation_t handler;     // Continuation handler callback
         httpd_req_continuation_t cont;    // Continuation state
+        httpd_continuation_close_cb_t on_close;  // Disconnect/abort cleanup callback
         bool active;                      // Continuation mode active
     } continuation;
     char _zero_end[0];                    // Marker: memset stops here
