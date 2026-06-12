@@ -143,8 +143,23 @@ static radix_node_t* radix_find_static_child_internal(radix_node_t* node, const 
                                                        size_t segment_len, bool case_sensitive) {
     if (__builtin_expect(!node || !segment || segment_len == 0, 0)) return NULL;
 
-    // Unified binary search - single loop reduces I-cache pressure
     if (node->child_count == 0) return NULL;
+
+    // Case-insensitive lookup must NOT binary-search: children are sorted by
+    // case-SENSITIVE byte order ('B' < 'a'), so a case-folded comparison over
+    // that ordering skips matching entries. Linear scan instead (rare path).
+    if (__builtin_expect(!case_sensitive, 0)) {
+        for (int i = 0; i < (int)node->child_count; i++) {
+            radix_node_t* child = node->children[i];
+            if (child->segment_len == segment_len &&
+                strncasecmp(child->segment, segment, segment_len) == 0) {
+                return child;
+            }
+        }
+        return NULL;
+    }
+
+    // Unified binary search - single loop reduces I-cache pressure
     int left = 0;
     int right = (int)node->child_count - 1;
 
@@ -156,10 +171,7 @@ static radix_node_t* radix_find_static_child_internal(radix_node_t* node, const 
         size_t child_seg_len = child->segment_len;
         size_t min_len = child_seg_len < segment_len ? child_seg_len : segment_len;
 
-        // Branch hint: case_sensitive is true ~95% of the time
-        int cmp = __builtin_expect(case_sensitive, 1) ?
-                  memcmp(child->segment, segment, min_len) :
-                  strncasecmp(child->segment, segment, min_len);
+        int cmp = memcmp(child->segment, segment, min_len);
 
         if (cmp == 0) {
             // Prefixes match, compare by length (use cached child_seg_len)
@@ -191,6 +203,12 @@ httpd_err_t radix_insert_static_child(radix_node_t* node, radix_node_t* child) {
 
     // Grow children array if needed
     if (node->child_count >= node->child_capacity) {
+        // Hard cap: capacity saturates at 255 (uint8_t); inserting past it
+        // would write out of bounds and wrap child_count
+        if (node->child_count == 255) {
+            ESP_LOGE(TAG, "Node child limit (255) reached");
+            return HTTPD_ERR_NO_MEM;
+        }
         uint8_t new_capacity = node->child_capacity == 0 ? 4
             : (node->child_capacity <= 127 ? node->child_capacity * 2 : 255);
         radix_node_t** new_children = (radix_node_t**)realloc(
@@ -464,7 +482,9 @@ httpd_err_t radix_insert_ws(radix_tree_t* tree, const char* pattern,
     node->handlers->ws_ping_interval = ping_interval_ms;
     node->handlers->has_ws = true;
 
-    // Copy middleware if provided
+    // Copy middleware if provided (mirrors radix_insert: must MERGE behind
+    // any entries an earlier HTTP-route insert placed on this node — a plain
+    // overwrite-memcpy clobbered them and could overflow a smaller allocation)
     if (middlewares && middleware_count > 0) {
         if (middleware_count > CONFIG_HTTPD_MAX_ROUTE_MIDDLEWARE) {
             middleware_count = CONFIG_HTTPD_MAX_ROUTE_MIDDLEWARE;
@@ -477,11 +497,28 @@ httpd_err_t radix_insert_ws(radix_tree_t* tree, const char* pattern,
                 ESP_LOGE(TAG, "Failed to allocate WS middleware array");
                 return HTTPD_ERR_NO_MEM;
             }
+            memcpy(node->middlewares, middlewares,
+                   middleware_count * sizeof(httpd_middleware_t));
+            node->middleware_count = middleware_count;
+        } else {
+            uint8_t new_count = node->middleware_count + middleware_count;
+            if (new_count > CONFIG_HTTPD_MAX_ROUTE_MIDDLEWARE) {
+                new_count = CONFIG_HTTPD_MAX_ROUTE_MIDDLEWARE;
+            }
+            uint8_t to_copy = new_count - node->middleware_count;
+            if (to_copy > 0) {
+                httpd_middleware_t* new_mw = (httpd_middleware_t*)realloc(
+                    node->middlewares, new_count * sizeof(httpd_middleware_t));
+                if (!new_mw) {
+                    ESP_LOGE(TAG, "Failed to realloc WS middleware array");
+                    return HTTPD_ERR_NO_MEM;
+                }
+                memcpy(&new_mw[node->middleware_count], middlewares,
+                       to_copy * sizeof(httpd_middleware_t));
+                node->middlewares = new_mw;
+                node->middleware_count = new_count;
+            }
         }
-
-        memcpy(node->middlewares, middlewares,
-               middleware_count * sizeof(httpd_middleware_t));
-        node->middleware_count = middleware_count;
     }
 
     tree->route_count++;
@@ -665,6 +702,11 @@ void radix_lookup(radix_tree_t* tree, const char* path,
         } else if (!is_websocket && method >= 0 && method < 8) {
             // Direct chain check - non-null chain implies method is supported
             handler_node_t* chain = node->handlers->http_chains[method];
+            // Fall back to HTTP_ANY: routes registered with it were previously
+            // unreachable since no request ever parses to method 7
+            if (!chain && method != HTTP_ANY) {
+                chain = node->handlers->http_chains[HTTP_ANY];
+            }
             if (chain) {
                 result->matched = true;
                 result->handler_chain = chain;

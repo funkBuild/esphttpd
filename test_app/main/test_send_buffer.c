@@ -938,6 +938,137 @@ static void test_consume_null_sb(void)
     TEST_PASS();
 }
 
+// ========== Memory streaming (send-from-memory API) ==========
+
+static void test_start_mem_basic(void)
+{
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+
+    const char* data = "memory stream payload";
+    size_t len = strlen(data);
+
+    TEST_ASSERT_TRUE(send_buffer_start_mem(&sb, (const uint8_t*)data, len));
+    TEST_ASSERT_TRUE(send_buffer_is_mem_streaming(&sb));
+    TEST_ASSERT_NOT_NULL(sb.mem_owned);
+    TEST_ASSERT_EQUAL_PTR(sb.mem_owned, sb.mem_ptr);
+    TEST_ASSERT_EQUAL(len, send_buffer_mem_remaining(&sb));
+    // It must be a copy, not the caller's pointer
+    TEST_ASSERT_TRUE(sb.mem_owned != (const uint8_t*)data);
+    TEST_ASSERT_EQUAL_MEMORY(data, sb.mem_owned, len);
+
+    send_buffer_free(&sb);
+}
+
+static void test_start_mem_invalid_args(void)
+{
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+
+    TEST_ASSERT_FALSE(send_buffer_start_mem(&sb, NULL, 10));
+    TEST_ASSERT_FALSE(send_buffer_start_mem(&sb, (const uint8_t*)"x", 0));
+    TEST_ASSERT_FALSE(send_buffer_is_mem_streaming(&sb));
+    TEST_ASSERT_NULL(sb.mem_owned);
+
+    send_buffer_free(&sb);
+}
+
+// Regression: a second start_mem while a stream is pending must APPEND, not
+// replace — replacing dropped unsent response bytes (data loss) and reordered
+// output when send_nonblocking overflowed twice on a slow client.
+static void test_start_mem_append_preserves_pending(void)
+{
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+
+    const char* a = "AAAAAAAA";
+    const char* b = "BBBB";
+
+    TEST_ASSERT_TRUE(send_buffer_start_mem(&sb, (const uint8_t*)a, strlen(a)));
+    TEST_ASSERT_TRUE(send_buffer_start_mem(&sb, (const uint8_t*)b, strlen(b)));
+
+    TEST_ASSERT_EQUAL(strlen(a) + strlen(b), send_buffer_mem_remaining(&sb));
+    TEST_ASSERT_EQUAL_MEMORY("AAAAAAAABBBB", sb.mem_ptr, strlen(a) + strlen(b));
+
+    send_buffer_free(&sb);
+}
+
+static void test_start_mem_append_after_partial_drain(void)
+{
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+
+    const char* a = "0123456789";
+    TEST_ASSERT_TRUE(send_buffer_start_mem(&sb, (const uint8_t*)a, 10));
+
+    // Simulate on_write_ready having drained the first 6 bytes
+    sb.mem_ptr += 6;
+    sb.mem_remaining -= 6;
+
+    const char* b = "abcd";
+    TEST_ASSERT_TRUE(send_buffer_start_mem(&sb, (const uint8_t*)b, 4));
+
+    // Only the unsent tail of A survives, with B behind it
+    TEST_ASSERT_EQUAL(8, send_buffer_mem_remaining(&sb));
+    TEST_ASSERT_EQUAL_MEMORY("6789abcd", sb.mem_ptr, 8);
+
+    send_buffer_free(&sb);
+}
+
+static void test_stop_mem_clears_state(void)
+{
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+
+    TEST_ASSERT_TRUE(send_buffer_start_mem(&sb, (const uint8_t*)"data", 4));
+    send_buffer_stop_mem(&sb);
+
+    TEST_ASSERT_FALSE(send_buffer_is_mem_streaming(&sb));
+    TEST_ASSERT_NULL(sb.mem_owned);
+    TEST_ASSERT_NULL(sb.mem_ptr);
+    TEST_ASSERT_EQUAL(0, send_buffer_mem_remaining(&sb));
+
+    // Double stop must be safe
+    send_buffer_stop_mem(&sb);
+    TEST_ASSERT_NULL(sb.mem_owned);
+
+    send_buffer_free(&sb);
+}
+
+static void test_reset_clears_mem_state(void)
+{
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+    send_buffer_alloc(&sb);
+
+    TEST_ASSERT_TRUE(send_buffer_start_mem(&sb, (const uint8_t*)"data", 4));
+    send_buffer_reset(&sb);
+
+    TEST_ASSERT_FALSE(send_buffer_is_mem_streaming(&sb));
+    TEST_ASSERT_NULL(sb.mem_owned);
+    TEST_ASSERT_EQUAL(0, send_buffer_mem_remaining(&sb));
+    // Ring allocation survives reset
+    TEST_ASSERT_TRUE(sb.allocated);
+
+    send_buffer_free(&sb);
+}
+
+static void test_free_releases_mem_stream(void)
+{
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+
+    TEST_ASSERT_TRUE(send_buffer_start_mem(&sb, (const uint8_t*)"data", 4));
+    send_buffer_free(&sb);
+
+    TEST_ASSERT_NULL(sb.mem_owned);
+    TEST_ASSERT_FALSE(send_buffer_is_mem_streaming(&sb));
+
+    // Free again must be safe (no double-free)
+    send_buffer_free(&sb);
+    TEST_PASS();
+}
+
 void test_send_buffer_run(void)
 {
     // Basic functionality tests
@@ -986,5 +1117,14 @@ void test_send_buffer_run(void)
     RUN_TEST(test_space_zero_size_no_underflow);
     RUN_TEST(test_consume_null_sb);
 
-    ESP_LOGI(TAG, "Send buffer tests completed (36 tests)");
+    // Memory streaming tests
+    RUN_TEST(test_start_mem_basic);
+    RUN_TEST(test_start_mem_invalid_args);
+    RUN_TEST(test_start_mem_append_preserves_pending);
+    RUN_TEST(test_start_mem_append_after_partial_drain);
+    RUN_TEST(test_stop_mem_clears_state);
+    RUN_TEST(test_reset_clears_mem_state);
+    RUN_TEST(test_free_releases_mem_stream);
+
+    ESP_LOGI(TAG, "Send buffer tests completed (43 tests)");
 }

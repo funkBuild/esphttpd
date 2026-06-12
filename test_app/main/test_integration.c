@@ -56,6 +56,59 @@ static void stop_test_server(void) {
 
 // ==================== TEST FUNCTIONS ====================
 
+// Handler for the keep-alive re-arm test: counts calls, sends nothing
+static int ka_handler_calls = 0;
+static httpd_err_t ka_handler(httpd_req_t* req) {
+    (void)req;
+    ka_handler_calls++;
+    return HTTPD_OK;
+}
+
+// Regression for the keep-alive wedge: after a POST whose body arrived with
+// the headers, the connection previously stayed in CONN_STATE_HTTP_BODY
+// forever (and kept stale content_length/upgrade flags), so the next request
+// on the same connection was routed to on_http_body and silently dropped.
+static void test_keepalive_rearm_after_post(void) {
+    start_test_server();
+    ka_handler_calls = 0;
+
+    httpd_route_t post_route = {
+        .method = HTTP_POST, .pattern = "/ka", .handler = ka_handler };
+    httpd_route_t get_route = {
+        .method = HTTP_GET, .pattern = "/ka", .handler = ka_handler };
+    httpd_register_route(test_handle, &post_route);
+    httpd_register_route(test_handle, &get_route);
+
+    connection_t conn = {0};
+    conn.fd = -1;
+    conn.pool_index = 0;
+    conn.state = CONN_STATE_NEW;
+
+    // First request: POST with the full body in the same segment
+    char req1[] = "POST /ka HTTP/1.1\r\n"
+                  "Content-Length: 4\r\n"
+                  "\r\n"
+                  "BODY";
+    g_server->handlers.on_http_request(&conn, (uint8_t*)req1, sizeof(req1) - 1);
+
+    TEST_ASSERT_EQUAL(1, ka_handler_calls);
+    // The connection must be re-armed for the next request...
+    TEST_ASSERT_EQUAL(CONN_STATE_NEW, conn.state);
+    // ...with the per-request parse state cleared
+    TEST_ASSERT_EQUAL(0, conn.content_length);
+    TEST_ASSERT_EQUAL(0, conn.upgrade_ws);
+    TEST_ASSERT_EQUAL(0, conn.is_websocket);
+
+    // Second request on the SAME connection must dispatch normally
+    char req2[] = "GET /ka HTTP/1.1\r\n\r\n";
+    g_server->handlers.on_http_request(&conn, (uint8_t*)req2, sizeof(req2) - 1);
+
+    TEST_ASSERT_EQUAL(2, ka_handler_calls);
+    TEST_ASSERT_EQUAL(CONN_STATE_NEW, conn.state);
+
+    stop_test_server();
+}
+
 // Test full HTTP GET request processing
 static void test_full_http_get_request(void) {
     // Setup server
@@ -688,6 +741,7 @@ void test_integration_run(void) {
 
     RUN_TEST(test_full_http_get_request);
     RUN_TEST(test_full_http_post_request);
+    RUN_TEST(test_keepalive_rearm_after_post);
     RUN_TEST(test_websocket_upgrade);
     RUN_TEST(test_websocket_frame_processing);
     RUN_TEST(test_route_matching_integration);

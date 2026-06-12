@@ -126,6 +126,71 @@ static void test_resp_set_header_null_req(void) {
     TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, err);
 }
 
+// Headers must STAGE (not transmit) so the status line is emitted with the
+// handler's final status code - regression for the CORS middleware freezing
+// "200 OK" on the wire before the handler chose 404
+static void test_resp_set_header_stages_until_send(void) {
+    httpd_req_t req;
+    connection_t conn;
+    setup_mock_request(&req, &conn);
+
+    uint8_t stage[128];
+    req._resp_hdr_buf = stage;
+    req._resp_hdr_cap = sizeof(stage);
+    req._resp_hdr_len = 0;
+
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_resp_set_header(&req, "X-Test", "abc"));
+    // Nothing on the wire yet: status line not locked in
+    TEST_ASSERT_FALSE(req.headers_sent);
+    TEST_ASSERT_EQUAL(strlen("X-Test: abc\r\n"), req._resp_hdr_len);
+    TEST_ASSERT_EQUAL_MEMORY("X-Test: abc\r\n", stage, req._resp_hdr_len);
+
+    // Content-Type via set_header is tracked (suppresses implicit CT later)
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_resp_set_header(&req, "Content-Type", "text/csv"));
+    TEST_ASSERT_TRUE(req.content_type_set);
+
+    // Manual Content-Length is tracked
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_resp_set_header(&req, "Content-Length", "10"));
+    TEST_ASSERT_TRUE(req.content_length_set);
+}
+
+// CR/LF in keys or values is response splitting - must be rejected
+static void test_resp_set_header_rejects_crlf_injection(void) {
+    httpd_req_t req;
+    connection_t conn;
+    setup_mock_request(&req, &conn);
+
+    uint8_t stage[128];
+    req._resp_hdr_buf = stage;
+    req._resp_hdr_cap = sizeof(stage);
+    req._resp_hdr_len = 0;
+
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG,
+        httpd_resp_set_header(&req, "X-Evil", "x\r\nInjected: 1"));
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG,
+        httpd_resp_set_header(&req, "X\nBad", "v"));
+    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG,
+        httpd_resp_set_header(&req, "X-Evil2", "trailing\r"));
+    // Nothing staged from rejected headers
+    TEST_ASSERT_EQUAL(0, req._resp_hdr_len);
+}
+
+// Staging buffer exhaustion reports NO_MEM instead of overflowing
+static void test_resp_set_header_staging_overflow(void) {
+    httpd_req_t req;
+    connection_t conn;
+    setup_mock_request(&req, &conn);
+
+    uint8_t stage[32];
+    req._resp_hdr_buf = stage;
+    req._resp_hdr_cap = sizeof(stage);
+    req._resp_hdr_len = 0;
+
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_resp_set_header(&req, "A", "12345678"));
+    TEST_ASSERT_EQUAL(HTTPD_ERR_NO_MEM,
+        httpd_resp_set_header(&req, "B", "this-value-does-not-fit-anymore"));
+}
+
 static void test_resp_set_header_null_key(void) {
     httpd_req_t req;
     connection_t conn;
@@ -599,6 +664,9 @@ void test_http_api_run(void) {
     // Response header tests
     RUN_TEST(test_resp_set_header_basic);
     RUN_TEST(test_resp_set_header_null_req);
+    RUN_TEST(test_resp_set_header_stages_until_send);
+    RUN_TEST(test_resp_set_header_rejects_crlf_injection);
+    RUN_TEST(test_resp_set_header_staging_overflow);
     RUN_TEST(test_resp_set_header_null_key);
     RUN_TEST(test_resp_set_header_null_value);
 

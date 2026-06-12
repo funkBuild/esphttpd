@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include "esp_log.h"
+#include "esp_timer.h"
 
 static const char TAG[] __attribute__((unused)) = "EVENT_LOOP";
 
@@ -37,7 +38,9 @@ void event_loop_init(event_loop_t* loop, connection_pool_t* pool, const event_lo
     memset(loop, 0, sizeof(event_loop_t));
     loop->pool = pool;
     loop->config = *config;
-    // Validate configuration
+    // Validate configuration BEFORE deriving tick budgets from it: computing
+    // from the raw input meant timeout_ms==0 yielded timeout_ticks==0 and
+    // connections were closed after ~1 tick instead of the 30 s default.
     if (loop->config.timeout_ms == 0) loop->config.timeout_ms = 30000;
     if (loop->config.backlog == 0) loop->config.backlog = 5;
     if (loop->config.ws_close_timeout_ms == 0) loop->config.ws_close_timeout_ms = 5000;
@@ -46,18 +49,20 @@ void event_loop_init(event_loop_t* loop, connection_pool_t* pool, const event_lo
     // Compute timeout in poll intervals (each poll = CONFIG_HTTPD_RAW_POLL_INTERVAL * 500ms)
     uint32_t poll_interval_ms = CONFIG_HTTPD_RAW_POLL_INTERVAL * 500;
     uint32_t divisor = poll_interval_ms > 0 ? poll_interval_ms : 1000;
-    loop->timeout_ticks = config->timeout_ms / divisor;
+    loop->timeout_ticks = loop->config.timeout_ms / divisor;
     loop->ws_close_timeout_ticks = loop->config.ws_close_timeout_ms / divisor;
 #else
     loop->listen_fd = -1;
-    // Precompute timeout in ticks (avoid division in hot path)
-    loop->timeout_ticks = config->select_timeout_ms > 0
-        ? config->timeout_ms / config->select_timeout_ms : config->timeout_ms;
-    loop->ws_close_timeout_ticks = config->select_timeout_ms > 0
-        ? loop->config.ws_close_timeout_ms / config->select_timeout_ms : 5;
+    if (loop->config.select_timeout_ms == 0) loop->config.select_timeout_ms = 1000;
+    // Precompute timeout in ticks (avoid division in hot path); floor of 1
+    // tick so a coarse select interval cannot zero out a timeout entirely
+    loop->timeout_ticks = loop->config.timeout_ms / loop->config.select_timeout_ms;
+    if (loop->timeout_ticks == 0) loop->timeout_ticks = 1;
+    loop->ws_close_timeout_ticks = loop->config.ws_close_timeout_ms / loop->config.select_timeout_ms;
+    if (loop->ws_close_timeout_ticks == 0) loop->ws_close_timeout_ticks = 1;
     // Precompute select timeout struct (avoid repeated struct construction)
-    loop->select_timeout.tv_sec = config->select_timeout_ms / 1000;
-    loop->select_timeout.tv_usec = (config->select_timeout_ms % 1000) * 1000;
+    loop->select_timeout.tv_sec = loop->config.select_timeout_ms / 1000;
+    loop->select_timeout.tv_usec = (loop->config.select_timeout_ms % 1000) * 1000;
 #endif
     loop->running = false;
 
@@ -356,10 +361,27 @@ int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, u
         return -1;
     }
 
-    // Always increment tick_count and check timeouts, even when there's activity.
-    // Otherwise connections are never timed out under sustained load (slow-loris).
-    loop->tick_count++;
-    event_loop_check_timeouts(loop);
+    // Advance the timeout clock from real elapsed time, not per select()
+    // return: under load select() returns once per packet, which previously
+    // advanced the "clock" by thousands of ticks per second and closed idle
+    // keep-alive connections long before their configured timeout. Checking
+    // on every iteration (not only idle ones) still catches slow-loris.
+    {
+        int64_t now_us = esp_timer_get_time();
+        int64_t tick_us = (int64_t)loop->config.select_timeout_ms * 1000;
+        if (loop->last_tick_us == 0) {
+            loop->last_tick_us = now_us;
+        }
+        bool tick_advanced = false;
+        while (now_us - loop->last_tick_us >= tick_us) {
+            loop->last_tick_us += tick_us;
+            loop->tick_count++;
+            tick_advanced = true;
+        }
+        if (tick_advanced) {
+            event_loop_check_timeouts(loop);
+        }
+    }
 
     if (activity == 0) {
         return 0;

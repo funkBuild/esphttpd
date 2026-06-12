@@ -44,6 +44,7 @@ typedef struct {
     uint32_t tick_count;            // Tick counter for timeouts
     uint32_t timeout_ticks;         // Precomputed timeout in ticks
     uint32_t ws_close_timeout_ticks; // Precomputed WS close handshake timeout in ticks
+    int64_t last_tick_us;           // Wall-clock time of the last tick advance (µs)
 #ifndef CONFIG_HTTPD_USE_RAW_API
     struct timeval select_timeout;  // Precomputed select timeout struct
 #endif

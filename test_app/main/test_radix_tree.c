@@ -137,6 +137,61 @@ static void test_radix_multiple_routes(void) {
     radix_tree_destroy(tree);
 }
 
+// Regression: HTTP_ANY routes were registered but never matched (no request
+// parses to method 7, and lookup had no fallback to the HTTP_ANY chain)
+static void test_radix_http_any_route(void) {
+    ESP_LOGI(TAG, "Test: HTTP_ANY route matches every method");
+
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    radix_insert(tree, "/any", HTTP_ANY, test_handler_1, (void*)0xA, NULL, 0);
+    // A specific method on the same pattern takes precedence over HTTP_ANY
+    radix_insert(tree, "/any", HTTP_POST, test_handler_2, (void*)0xB, NULL, 0);
+
+    radix_match_t m_get;
+    radix_lookup(tree, "/any", HTTP_GET, false, &m_get, NULL, NULL);
+    TEST_ASSERT_TRUE(m_get.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_1, m_get.handler);
+
+    radix_match_t m_del;
+    radix_lookup(tree, "/any", HTTP_DELETE, false, &m_del, NULL, NULL);
+    TEST_ASSERT_TRUE(m_del.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_1, m_del.handler);
+
+    radix_match_t m_post;
+    radix_lookup(tree, "/any", HTTP_POST, false, &m_post, NULL, NULL);
+    TEST_ASSERT_TRUE(m_post.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_2, m_post.handler);
+
+    radix_tree_destroy(tree);
+}
+
+// Double-slash (empty segment) paths must not crash the segment walker and
+// must not spuriously fail exact-path lookups afterwards
+static void test_radix_empty_segments(void) {
+    ESP_LOGI(TAG, "Test: Paths with empty segments (//)");
+
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    radix_insert(tree, "/api/users", HTTP_GET, test_handler_1, (void*)1, NULL, 0);
+
+    radix_match_t m1;
+    radix_lookup(tree, "/api//users", HTTP_GET, false, &m1, NULL, NULL);
+    // Must not crash; policy (skip vs reject empty segments) is not pinned
+
+    radix_match_t m2;
+    radix_lookup(tree, "//", HTTP_GET, false, &m2, NULL, NULL);
+    TEST_ASSERT_FALSE(m2.matched);
+
+    radix_match_t m3;
+    radix_lookup(tree, "/api/users", HTTP_GET, false, &m3, NULL, NULL);
+    TEST_ASSERT_TRUE(m3.matched);
+
+    radix_tree_destroy(tree);
+}
+
 static void test_radix_nested_routes(void) {
     ESP_LOGI(TAG, "Test: Nested routes");
 
@@ -1211,6 +1266,8 @@ void test_radix_tree_run(void) {
     RUN_TEST(test_radix_lookup_static_route);
     RUN_TEST(test_radix_multiple_routes);
     RUN_TEST(test_radix_nested_routes);
+    RUN_TEST(test_radix_http_any_route);
+    RUN_TEST(test_radix_empty_segments);
     RUN_TEST(test_radix_root_route);
     RUN_TEST(test_radix_websocket_route);
     RUN_TEST(test_radix_all_http_methods);

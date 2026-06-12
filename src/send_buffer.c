@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <inttypes.h>
 #include "esp_log.h"
 
 static const char TAG[] = "SEND_BUF";
@@ -179,6 +180,28 @@ bool send_buffer_start_mem(send_buffer_t* sb, const uint8_t* data, size_t len) {
         return false;
     }
 
+    // If a stream is already pending, append behind its unsent bytes —
+    // replacing the buffer here would silently drop response data.
+    if (sb->mem_owned) {
+        size_t unsent = sb->mem_remaining;
+        // Compact unsent bytes to the start of the allocation, then grow.
+        memmove(sb->mem_owned, sb->mem_ptr, unsent);
+        sb->mem_ptr = sb->mem_owned;
+        uint8_t* grown = (uint8_t*)realloc(sb->mem_owned, unsent + len);
+        if (!grown) {
+            ESP_LOGW(TAG, "Failed to grow memory stream buffer (%zu bytes)", unsent + len);
+            return false;
+        }
+        memcpy(grown + unsent, data, len);
+        sb->mem_owned = grown;
+        sb->mem_ptr = grown;
+        sb->mem_remaining = (uint32_t)(unsent + len);
+        sb->mem_streaming = 1;
+        ESP_LOGD(TAG, "Appended %zu bytes to memory stream (%" PRIu32 " pending)",
+                 len, sb->mem_remaining);
+        return true;
+    }
+
     // Allocate a copy so the caller's buffer can go out of scope
     uint8_t* copy = (uint8_t*)malloc(len);
     if (!copy) {
@@ -186,11 +209,6 @@ bool send_buffer_start_mem(send_buffer_t* sb, const uint8_t* data, size_t len) {
         return false;
     }
     memcpy(copy, data, len);
-
-    // Free any previous owned buffer
-    if (sb->mem_owned) {
-        free(sb->mem_owned);
-    }
 
     sb->mem_owned = copy;
     sb->mem_ptr = copy;

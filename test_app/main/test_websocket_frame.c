@@ -90,6 +90,115 @@ static void test_parse_extended_length_16(void)
     TEST_ASSERT_EQUAL(130, consumed); // 1 + 1 + 2 + 126
 }
 
+// Test parsing 64-bit extended length (len byte 127 + 8 length bytes)
+static void test_parse_extended_length_64(void)
+{
+    connection_t conn = {0};
+    ws_frame_context_t ctx = {0};
+    size_t consumed;
+
+    // Frame with 300-byte payload declared via the 64-bit length field
+    enum { WS64_PAYLOAD = 300 };
+    static uint8_t frame[10 + WS64_PAYLOAD];
+    frame[0] = 0x82;  // FIN=1, BINARY
+    frame[1] = 127;   // 64-bit extended length follows
+    memset(&frame[2], 0, 8);
+    frame[8] = (WS64_PAYLOAD >> 8) & 0xFF;
+    frame[9] = WS64_PAYLOAD & 0xFF;
+    for (int i = 0; i < WS64_PAYLOAD; i++) {
+        frame[10 + i] = i & 0xFF;
+    }
+
+    ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
+                                               &ctx, &consumed);
+
+    TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
+    TEST_ASSERT_EQUAL(WS_OPCODE_BINARY, conn.ws_opcode);
+    TEST_ASSERT_EQUAL(WS64_PAYLOAD, conn.ws_payload_len);
+    TEST_ASSERT_EQUAL(sizeof(frame), consumed);
+    TEST_ASSERT_EQUAL(WS64_PAYLOAD, ctx.payload_received);
+    TEST_ASSERT_EQUAL(42, ctx.payload_buffer[42]);
+
+    free(ctx.payload_buffer);
+}
+
+// 64-bit length above the 64KB cap must be rejected, not truncated
+static void test_parse_extended_length_64_too_large(void)
+{
+    connection_t conn = {0};
+    ws_frame_context_t ctx = {0};
+    size_t consumed;
+
+    uint8_t frame[10];
+    frame[0] = 0x82;
+    frame[1] = 127;
+    memset(&frame[2], 0, 8);
+    frame[6] = 0x00;
+    frame[7] = 0x01;  // 0x10000 = 65536 (> 65535 cap)
+
+    ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
+                                               &ctx, &consumed);
+    TEST_ASSERT_EQUAL(WS_FRAME_ERROR, result);
+
+    free(ctx.payload_buffer);
+}
+
+// 64-bit length with any of the upper 32 bits set must be rejected early
+// (would otherwise overflow size arithmetic on a 32-bit target)
+static void test_parse_extended_length_64_upper_bits(void)
+{
+    connection_t conn = {0};
+    ws_frame_context_t ctx = {0};
+    size_t consumed;
+
+    uint8_t frame[10];
+    frame[0] = 0x82;
+    frame[1] = 127;
+    memset(&frame[2], 0, 8);
+    frame[2] = 0x01;  // bit in the upper 32 bits of the 64-bit length
+
+    ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
+                                               &ctx, &consumed);
+    TEST_ASSERT_EQUAL(WS_FRAME_ERROR, result);
+
+    free(ctx.payload_buffer);
+}
+
+// 64-bit length header delivered byte-by-byte must resume correctly
+static void test_parse_extended_length_64_split(void)
+{
+    connection_t conn = {0};
+    ws_frame_context_t ctx = {0};
+    size_t consumed;
+
+    enum { WS64S_PAYLOAD = 200 };
+    static uint8_t frame[10 + WS64S_PAYLOAD];
+    frame[0] = 0x82;
+    frame[1] = 127;
+    memset(&frame[2], 0, 8);
+    frame[9] = WS64S_PAYLOAD;  // 200 fits in the low byte
+    for (int i = 0; i < WS64S_PAYLOAD; i++) {
+        frame[10 + i] = i & 0xFF;
+    }
+
+    // Feed the 10-byte header one byte at a time
+    size_t offset = 0;
+    ws_frame_result_t result = WS_FRAME_NEED_MORE;
+    for (int i = 0; i < 10; i++) {
+        result = ws_process_frame(&conn, frame + offset, 1, &ctx, &consumed);
+        TEST_ASSERT_EQUAL(WS_FRAME_NEED_MORE, result);
+        offset += consumed;
+    }
+    // Then the full payload
+    result = ws_process_frame(&conn, frame + offset, sizeof(frame) - offset,
+                              &ctx, &consumed);
+    TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
+    TEST_ASSERT_EQUAL(WS64S_PAYLOAD, conn.ws_payload_len);
+    TEST_ASSERT_EQUAL(WS64S_PAYLOAD, ctx.payload_received);
+
+    free(ctx.payload_buffer);
+}
+
 // Test parsing fragmented frame
 static void test_parse_fragmented_frame(void)
 {
@@ -906,6 +1015,10 @@ void test_websocket_frame_run(void)
     RUN_TEST(test_parse_unmasked_text_frame);
     RUN_TEST(test_parse_masked_text_frame);
     RUN_TEST(test_parse_extended_length_16);
+    RUN_TEST(test_parse_extended_length_64);
+    RUN_TEST(test_parse_extended_length_64_too_large);
+    RUN_TEST(test_parse_extended_length_64_upper_bits);
+    RUN_TEST(test_parse_extended_length_64_split);
     RUN_TEST(test_parse_fragmented_frame);
     RUN_TEST(test_parse_control_frames);
     RUN_TEST(test_parse_frame_in_chunks);

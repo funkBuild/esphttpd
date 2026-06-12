@@ -43,4 +43,6 @@ idf_component_register(
         freertos
         ${FILESYSTEM_REQUIRES}
         unity  # For tests
+    PRIV_REQUIRES
+        esp_timer  # esp_timer_get_time() in src/esphttpd.c — not transitively guaranteed in production builds
 )

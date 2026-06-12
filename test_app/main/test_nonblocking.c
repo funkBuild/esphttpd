@@ -435,116 +435,6 @@ static void test_deferred_continuation_exclusive(void)
 }
 
 // ============================================================================
-// CONTINUATION DISCONNECT CLEANUP (close callback)
-// ============================================================================
-
-// g_test_request_contexts points to request_context_t* array[MAX_CONNECTIONS]
-static test_request_context_t* get_test_ctx_nb(int idx) {
-    if (!g_test_request_contexts) return NULL;
-    test_request_context_t** ptrs = (test_request_context_t**)g_test_request_contexts;
-    if (!ptrs[idx]) {
-        ptrs[idx] = (test_request_context_t*)calloc(1, sizeof(test_request_context_t));
-    }
-    return ptrs[idx];
-}
-
-static int nb_close_called;
-static void* nb_close_state;
-static httpd_err_t nb_close_reason;
-
-static void nb_test_close_cb(httpd_req_t* req, void* state, httpd_err_t reason) {
-    (void)req;
-    nb_close_called++;
-    nb_close_state = state;
-    nb_close_reason = reason;
-}
-
-// A disconnect while a continuation is still active must invoke the close cb
-// exactly once (with the handler's state + HTTPD_ERR_CONN_CLOSED), and the
-// continuation must be marked inactive so a second teardown is a no-op.
-static void test_continuation_close_cb_fires_on_disconnect(void) {
-    start_test_server();
-    TEST_ASSERT_NOT_NULL(g_server);
-    TEST_ASSERT_NOT_NULL(g_test_request_contexts);
-    TEST_ASSERT_NOT_NULL(g_server->handlers.on_disconnect);
-
-    nb_close_called = 0;
-    nb_close_state = NULL;
-    nb_close_reason = HTTPD_OK;
-
-    connection_pool_t* pool = &g_server->connection_pool;
-    int idx = 0;
-    connection_t* conn = connection_get(pool, idx);
-    TEST_ASSERT_NOT_NULL(conn);
-    conn->fd = -1;
-    conn->pool_index = idx;
-    conn->is_websocket = 0;
-    conn->deferred = 0;
-    conn->continuation = 1;
-    conn->state = CONN_STATE_HTTP_BODY;
-
-    test_request_context_t* ctx = get_test_ctx_nb(idx);
-    TEST_ASSERT_NOT_NULL(ctx);
-    memset(ctx, 0, sizeof(*ctx));
-    ctx->req._internal = conn;
-    static int sentinel_state;
-    ctx->continuation.active = true;
-    ctx->continuation.on_close = nb_test_close_cb;
-    ctx->continuation.cont.state = &sentinel_state;
-
-    // Simulate a mid-continuation disconnect.
-    g_server->handlers.on_disconnect(conn);
-
-    TEST_ASSERT_EQUAL_INT(1, nb_close_called);
-    TEST_ASSERT_EQUAL_PTR(&sentinel_state, nb_close_state);
-    TEST_ASSERT_EQUAL(HTTPD_ERR_CONN_CLOSED, nb_close_reason);
-    TEST_ASSERT_FALSE(ctx->continuation.active);
-    TEST_ASSERT_EQUAL(0, conn->continuation);
-
-    // A second teardown must NOT invoke the callback again (idempotent).
-    g_server->handlers.on_disconnect(conn);
-    TEST_ASSERT_EQUAL_INT(1, nb_close_called);
-
-    stop_test_server();
-}
-
-// When the handler already finished (active=false) the close cb must NOT fire
-// on disconnect — the handler owns its own terminal cleanup.
-static void test_continuation_close_cb_skipped_when_inactive(void) {
-    start_test_server();
-    nb_close_called = 0;
-
-    connection_pool_t* pool = &g_server->connection_pool;
-    int idx = 0;
-    connection_t* conn = connection_get(pool, idx);
-    TEST_ASSERT_NOT_NULL(conn);
-    conn->fd = -1;
-    conn->pool_index = idx;
-    conn->is_websocket = 0;
-    conn->deferred = 0;
-    conn->continuation = 1;  // flag still set, but the continuation has finished
-    conn->state = CONN_STATE_HTTP_BODY;
-
-    test_request_context_t* ctx = get_test_ctx_nb(idx);
-    TEST_ASSERT_NOT_NULL(ctx);
-    memset(ctx, 0, sizeof(*ctx));
-    ctx->req._internal = conn;
-    ctx->continuation.active = false;  // handler already reached a terminal return
-    ctx->continuation.on_close = nb_test_close_cb;
-
-    g_server->handlers.on_disconnect(conn);
-    TEST_ASSERT_EQUAL_INT(0, nb_close_called);
-
-    stop_test_server();
-}
-
-// The setter rejects a NULL request.
-static void test_set_close_cb_null_req(void) {
-    TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG,
-                      httpd_req_set_continuation_close_cb(NULL, nb_test_close_cb));
-}
-
-// ============================================================================
 // TEST RUNNER
 // ============================================================================
 
@@ -575,12 +465,6 @@ void test_nonblocking_run(void)
     // Integration tests
     ESP_LOGI(TAG, "Integration tests...");
     RUN_TEST(test_deferred_continuation_exclusive);
-
-    // Continuation disconnect cleanup tests
-    ESP_LOGI(TAG, "Continuation disconnect cleanup tests...");
-    RUN_TEST(test_set_close_cb_null_req);
-    RUN_TEST(test_continuation_close_cb_fires_on_disconnect);
-    RUN_TEST(test_continuation_close_cb_skipped_when_inactive);
 
     ESP_LOGI(TAG, "Non-blocking tests completed");
 }

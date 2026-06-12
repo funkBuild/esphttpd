@@ -17,7 +17,12 @@
 #include "lwip/pbuf.h"
 #include "lwip/tcpip.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include <string.h>
+
+#if !defined(CONFIG_LWIP_TCPIP_CORE_LOCKING) && !defined(CONFIG_ESPHTTPD_TEST_MODE)
+#error "CONFIG_HTTPD_USE_RAW_API requires CONFIG_LWIP_TCPIP_CORE_LOCKING: without it LOCK_TCPIP_CORE() is a no-op and cross-task WebSocket sends race tcpip_thread"
+#endif
 
 static const char TAG[] = "RAW_TCP";
 
@@ -40,6 +45,35 @@ static err_t raw_recv_cb(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t 
 static err_t raw_sent_cb(void* arg, struct tcp_pcb* tpcb, u16_t len);
 static void raw_err_cb(void* arg, err_t err);
 static err_t raw_poll_cb(void* arg, struct tcp_pcb* tpcb);
+
+// Idempotent connection teardown, callable from every close path: remote FIN
+// (recv NULL pbuf), error callback, poll timeout, and handler-initiated
+// CONN_STATE_CLOSED (which previously had NO finalizer in raw mode - the pcb
+// and pool slot leaked permanently). The pool's active bit doubles as the
+// "already finalized" flag.
+// Returns ERR_ABRT if the pcb had to be aborted (callers inside lwIP
+// callbacks must propagate this so lwIP doesn't touch the freed pcb).
+static err_t raw_finalize(connection_t* conn) {
+    if (!s_loop || !s_loop->pool) return ERR_OK;
+    if (!connection_is_active(s_loop->pool, conn->pool_index)) {
+        return ERR_OK;  // already finalized
+    }
+
+    if ((conn->state == CONN_STATE_WEBSOCKET || conn->state == CONN_STATE_WS_CLOSING)
+        && s_handlers && s_handlers->on_ws_disconnect) {
+        s_handlers->on_ws_disconnect(conn);
+    }
+    conn->state = CONN_STATE_CLOSED;
+    if (s_handlers && s_handlers->on_disconnect) {
+        s_handlers->on_disconnect(conn);
+    }
+
+    bool aborted = raw_tcp_close(conn);
+    connection_mark_inactive(s_loop->pool, conn->pool_index);
+    connection_mark_write_pending(s_loop->pool, conn->pool_index, false);
+    connection_mark_ws_inactive(s_loop->pool, conn->pool_index);
+    return aborted ? ERR_ABRT : ERR_OK;
+}
 
 int raw_tcp_listen(event_loop_t* loop, const event_handlers_t* handlers) {
     struct tcp_pcb* pcb = tcp_new();
@@ -134,38 +168,17 @@ static err_t raw_recv_cb(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t 
         return ERR_ARG;
     }
 
-    // NULL pbuf means connection closed by remote
+    // NULL pbuf means connection closed by remote. raw_finalize is idempotent
+    // and also covers the case where a handler set CONN_STATE_CLOSED without
+    // any teardown having run yet (the old early-return guard skipped cleanup
+    // for those, leaking the pcb in CLOSE_WAIT and the pool slot forever).
     if (!p) {
-        // Guard against double-disconnect
-        if (conn->state == CONN_STATE_CLOSED || conn->state == CONN_STATE_FREE) {
-            return ERR_OK;
-        }
-
-        // Call WebSocket disconnect handler if applicable
-        if ((conn->state == CONN_STATE_WEBSOCKET || conn->state == CONN_STATE_WS_CLOSING)
-            && s_handlers->on_ws_disconnect) {
-            s_handlers->on_ws_disconnect(conn);
-        }
-        conn->state = CONN_STATE_CLOSED;
-
-        // Call disconnect handler and clean up (matching raw_err_cb behavior)
-        if (s_handlers->on_disconnect) {
-            s_handlers->on_disconnect(conn);
-        }
-
-        bool aborted = raw_tcp_close(conn);
-        if (s_loop && s_loop->pool) {
-            connection_mark_inactive(s_loop->pool, conn->pool_index);
-            connection_mark_write_pending(s_loop->pool, conn->pool_index, false);
-            connection_mark_ws_inactive(s_loop->pool, conn->pool_index);
-        }
-        return aborted ? ERR_ABRT : ERR_OK;
+        return raw_finalize(conn);
     }
 
     if (err != ERR_OK) {
         pbuf_free(p);
-        conn->state = CONN_STATE_CLOSED;
-        return ERR_OK;
+        return raw_finalize(conn);
     }
 
     conn->last_activity = s_loop->tick_count;
@@ -233,11 +246,16 @@ static err_t raw_recv_cb(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t 
         free(buffer);
     }
 
-    // Acknowledge received data to lwIP (skip if connection was closed by handler)
+    // Handler closed the connection during dispatch: finalize now instead of
+    // leaving the pcb open with a dead pool slot
+    if (conn->state == CONN_STATE_CLOSING || conn->state == CONN_STATE_CLOSED) {
+        pbuf_free(p);
+        return raw_finalize(conn);
+    }
+
+    // Acknowledge received data to lwIP
     // Use conn->raw.pcb instead of local tpcb to avoid stale pointer if handler closed the PCB
-    if (conn->raw.pcb && conn->state != CONN_STATE_CLOSING
-                      && conn->state != CONN_STATE_CLOSED
-                      && conn->state != CONN_STATE_FREE) {
+    if (conn->raw.pcb && conn->state != CONN_STATE_FREE) {
         tcp_recved(conn->raw.pcb, (u16_t)((total_len <= UINT16_MAX) ? total_len : UINT16_MAX));
     }
     pbuf_free(p);
@@ -261,8 +279,12 @@ static err_t raw_sent_cb(void* arg, struct tcp_pcb* tpcb, u16_t len) {
         conn->raw.write_pending = false;
     }
 
-    // Notify upper layer that send buffer space is available
-    if (s_handlers->on_write_ready) {
+    // Notify upper layer that send buffer space is available — but only when
+    // it has queued work (O(1) bit test). Short responses with nothing
+    // pending otherwise ran the whole on_write_ready prologue on every ACK.
+    if (s_loop && s_loop->pool &&
+        connection_has_write_pending(s_loop->pool, conn->pool_index) &&
+        s_handlers->on_write_ready) {
         s_handlers->on_write_ready(conn);
     }
 
@@ -275,42 +297,50 @@ static void raw_err_cb(void* arg, err_t err) {
 
     ESP_LOGD(TAG, "Connection [%d] error: %d", conn->pool_index, err);
 
-    // lwIP has already freed the pcb when err_cb is called
+    // lwIP has already freed the pcb when err_cb is called; NULL it so
+    // raw_finalize's raw_tcp_close doesn't touch it
     conn->raw.pcb = NULL;
 
-    // Guard against double-disconnect (err_cb + poll_cb race)
-    if (conn->state == CONN_STATE_CLOSED || conn->state == CONN_STATE_FREE) {
-        return;
-    }
-
-    // Call WebSocket disconnect handler if this was a WebSocket connection
-    if ((conn->state == CONN_STATE_WEBSOCKET || conn->state == CONN_STATE_WS_CLOSING)
-        && s_handlers->on_ws_disconnect) {
-        s_handlers->on_ws_disconnect(conn);
-    }
-
-    conn->state = CONN_STATE_CLOSED;
-
-    // Call disconnect handler
-    if (s_handlers->on_disconnect) {
-        s_handlers->on_disconnect(conn);
-    }
-
-    // Clean up from pool
-    if (s_loop && s_loop->pool) {
-        connection_mark_inactive(s_loop->pool, conn->pool_index);
-        connection_mark_write_pending(s_loop->pool, conn->pool_index, false);
-        connection_mark_ws_inactive(s_loop->pool, conn->pool_index);
-    }
+    raw_finalize(conn);
 }
 
 static err_t raw_poll_cb(void* arg, struct tcp_pcb* tpcb) {
     connection_t* conn = (connection_t*)arg;
     if (!conn || !s_loop) return ERR_OK;
 
-    // Note: tick_count is NOT incremented here. It is per-connection, which would
-    // cause timeouts to fire N-times faster with N connections. The caller or a
-    // dedicated timer should increment tick_count once per poll interval instead.
+    // Advance the shared timeout clock from real elapsed time. Poll fires
+    // per-connection, but the time-based advance is idempotent so it ticks
+    // once per interval regardless of connection count. (Previously NOTHING
+    // incremented tick_count in raw mode, so every timeout below was dead and
+    // idle/slow-loris connections held pool slots forever.)
+    {
+        int64_t now_us = esp_timer_get_time();
+        int64_t tick_us = (int64_t)CONFIG_HTTPD_RAW_POLL_INTERVAL * 500 * 1000;
+        if (tick_us <= 0) tick_us = 1000000;
+        if (s_loop->last_tick_us == 0) s_loop->last_tick_us = now_us;
+        while (now_us - s_loop->last_tick_us >= tick_us) {
+            s_loop->last_tick_us += tick_us;
+            s_loop->tick_count++;
+        }
+    }
+
+    // Finalize handler-initiated closes: upper-layer error paths set
+    // CONN_STATE_CLOSED and nothing else in raw mode recycles them
+    if (conn->state == CONN_STATE_CLOSED || conn->state == CONN_STATE_CLOSING) {
+        return raw_finalize(conn);
+    }
+
+    // Kick the writer for write-pending connections: recovers transfers that
+    // stalled because a file-IO submit was dropped (queue full) with no
+    // outstanding ACKs left to re-trigger raw_sent_cb
+    if (s_loop->pool &&
+        connection_has_write_pending(s_loop->pool, conn->pool_index) &&
+        s_handlers && s_handlers->on_write_ready) {
+        s_handlers->on_write_ready(conn);
+        if (conn->state == CONN_STATE_CLOSED) {
+            return raw_finalize(conn);
+        }
+    }
 
     // Check for connection timeout
     uint32_t timeout_ticks = s_loop->timeout_ticks;
@@ -326,28 +356,11 @@ static err_t raw_poll_cb(void* arg, struct tcp_pcb* tpcb) {
     }
 
     if (s_loop->tick_count - conn->last_activity > timeout_ticks) {
-        // Guard against double-disconnect (err_cb may have already handled this)
-        if (conn->state == CONN_STATE_CLOSED || conn->state == CONN_STATE_FREE) {
-            return ERR_OK;
-        }
-
         ESP_LOGD(TAG, "Connection [%d] timed out%s", conn->pool_index,
                  conn->state == CONN_STATE_WS_CLOSING ? " (ws close handshake)" : "");
-        conn->state = CONN_STATE_CLOSED;
-
-        // Handle disconnect
-        if (s_handlers->on_disconnect) {
-            s_handlers->on_disconnect(conn);
-        }
-
-        bool aborted = raw_tcp_close(conn);
-        if (s_loop->pool) {
-            connection_mark_inactive(s_loop->pool, conn->pool_index);
-            connection_mark_write_pending(s_loop->pool, conn->pool_index, false);
-            connection_mark_ws_inactive(s_loop->pool, conn->pool_index);
-        }
-        // Must return ERR_ABRT if PCB was aborted so lwIP doesn't access freed PCB
-        if (aborted) return ERR_ABRT;
+        // Must return ERR_ABRT if the PCB was aborted so lwIP doesn't access
+        // the freed PCB (raw_finalize reports this)
+        return raw_finalize(conn);
     }
 
     return ERR_OK;

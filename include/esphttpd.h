@@ -255,7 +255,17 @@ struct httpd_request {
     uint8_t headers_sent : 1;        ///< Response status line sent
     uint8_t body_started : 1;        ///< Body transmission started (headers finalized)
     uint8_t content_length_set : 1;  ///< Content-Length header manually set by user
+    uint8_t content_type_set : 1;    ///< Content-Type header manually set by user
     uint8_t is_websocket : 1;        ///< WebSocket upgrade requested
+
+    // Staged response headers (internal). httpd_resp_set_header() writes here
+    // and the block is transmitted together with the status line when the
+    // response starts, so middleware-set headers no longer freeze the status
+    // code. NULL for bare request structs (set_header then transmits
+    // immediately, legacy behavior).
+    uint8_t* _resp_hdr_buf;          ///< Staging buffer (internal)
+    uint16_t _resp_hdr_cap;          ///< Staging buffer capacity (internal)
+    uint16_t _resp_hdr_len;          ///< Staged bytes (internal)
 
     // User data
     void* user_data;                 ///< User-defined context
@@ -569,7 +579,10 @@ size_t httpd_req_get_content_length(httpd_req_t* req);
  * @param req Request context
  * @param buf Buffer to receive data
  * @param len Maximum bytes to receive
- * @return Number of bytes received, 0 on EOF, negative on error
+ * @return Number of bytes received, 0 when the body is complete (EOF),
+ *         HTTPD_ERR_WOULD_BLOCK when no data is available yet but the body
+ *         is incomplete (use httpd_req_defer()/httpd_req_continue() to
+ *         receive multi-segment bodies), other negative value on error
  */
 int httpd_req_recv(httpd_req_t* req, void* buf, size_t len);
 
@@ -970,6 +983,9 @@ httpd_err_t httpd_req_defer_to_file(httpd_req_t* req, const char* path, httpd_do
 typedef struct {
     void* state;                     ///< Handler-specific state (user-provided)
     uint8_t phase;                   ///< Handler phase (user-defined)
+    bool aborted;                    ///< Connection closed before body completed:
+                                     ///< this is the final invocation - release
+                                     ///< handler state, do NOT send a response
     size_t expected_bytes;           ///< Bytes expected in current phase
     size_t received_bytes;           ///< Bytes received in current phase
 } httpd_req_continuation_t;
@@ -1059,43 +1075,6 @@ httpd_err_t httpd_req_continue(httpd_req_t* req, httpd_continuation_t handler,
  * @return true if httpd_req_continue() was called
  */
 bool httpd_req_is_continuation(httpd_req_t* req);
-
-/**
- * @brief Continuation close/abort callback
- *
- * Invoked exactly once if the connection is torn down (client disconnect,
- * read/write error, timeout) while a continuation is still active — i.e. the
- * handler last returned HTTPD_ERR_WOULD_BLOCK and never reached a terminal
- * (HTTPD_OK / error) return. Unlike the data handler, the continuation data
- * path is NOT called again on disconnect, so without this callback any
- * handler-owned resources (heap state, open OTA sessions, locks) would leak.
- *
- * The callback must NOT send a response (the connection is already gone); it
- * should only release/free handler-owned resources. It is mutually exclusive
- * with the handler's own terminal cleanup: once the handler returns HTTPD_OK or
- * an error the continuation is marked inactive, so this callback will not fire.
- *
- * @param req    Request context (connection already closed — do not send)
- * @param state  The handler_state passed to httpd_req_continue()
- * @param reason Why the continuation is being closed (e.g. HTTPD_ERR_CONN_CLOSED)
- */
-typedef void (*httpd_continuation_close_cb_t)(httpd_req_t* req, void* state,
-                                              httpd_err_t reason);
-
-/**
- * @brief Register a close/abort callback for an active continuation
- *
- * Call immediately after httpd_req_continue(). The callback fires only if the
- * connection is torn down while the continuation is still active; on normal
- * completion the handler cleans up itself and the callback is not invoked.
- *
- * @param req Request context (must already be in continuation mode)
- * @param cb  Close callback (NULL clears it)
- * @return HTTPD_OK on success, HTTPD_ERR_INVALID_ARG if req is NULL or not in
- *         continuation mode
- */
-httpd_err_t httpd_req_set_continuation_close_cb(httpd_req_t* req,
-                                                httpd_continuation_close_cb_t cb);
 
 // ============================================================================
 // Authentication

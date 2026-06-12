@@ -239,6 +239,10 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                     }
                     // Parse the method
                     conn->method = http_parse_method(ctx->method, ctx->method_len);
+                    // HTTP/1.1 defaults to keep-alive; a Connection header
+                    // overrides this below. Without the default, "no header"
+                    // and "Connection: close" were indistinguishable.
+                    conn->keep_alive = 1;
                     ctx->state = PARSE_STATE_URL;
                     ctx->url = NULL;
                     ctx->url_len = 0;
@@ -323,7 +327,14 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                     }
                 } else if (__builtin_expect(c == '\n', 0)) {
                     if (ctx->header_key_len == 0) {
+                        // Bare-LF empty line: headers end at THIS byte. The
+                        // CRLF path defers completion one iteration so the LF
+                        // of CRLF is consumed; a bare LF has no following byte
+                        // to defer to — finalize now, otherwise a "...\n\n"
+                        // request stalls in PARSE_NEED_MORE and header_bytes
+                        // overcounts by one when a body follows.
                         ctx->state = PARSE_STATE_HEADERS_COMPLETE;
+                        goto headers_complete;
                     } else {
                         return PARSE_ERROR;
                     }
@@ -372,6 +383,31 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                         break;
                     }
                 }
+                // Resolve a CR held back at the previous buffer-slice end: if
+                // this byte is LF the CR was the CRLF terminator (excluded
+                // from the value); otherwise it was value data and is counted
+                // now before scanning resumes.
+                if (__builtin_expect(ctx->value_pending_cr, 0)) {
+                    ctx->value_pending_cr = 0;
+                    if (c == '\n') {
+                        if (ctx->current_header_key && ctx->current_header_value) {
+                            http_process_header(conn,
+                                              ctx->current_header_key, ctx->header_key_len,
+                                              ctx->current_header_value, ctx->header_value_len,
+                                              ctx);
+                        }
+                        ctx->header_count++;
+                        ctx->current_header_value = NULL;
+                        ctx->state = PARSE_STATE_HEADER_KEY;
+                        ctx->current_header_key = NULL;
+                        ctx->header_key_len = 0;
+                        break;  // i++ moves past the LF
+                    }
+                    if (__builtin_expect((size_t)ctx->header_value_len + 1 >= 2048, 0)) {
+                        return PARSE_ERROR;
+                    }
+                    ctx->header_value_len += 1;
+                }
                 // Bulk scan: find \r\n or bare \n to end the header value
                 // Bare \r not followed by \n is treated as part of the value
                 const uint8_t* lf = (const uint8_t*)memchr(&buffer[i], '\n', buffer_len - i);
@@ -409,8 +445,16 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                         i = end - buffer; // i++ moves past \n to next line
                     }
                 } else {
-                    // No terminator found - consume remaining buffer
+                    // No terminator found - consume remaining buffer.
+                    // Hold back a trailing CR: it may be the first half of a
+                    // CRLF split across TCP segments; whether it terminates
+                    // the line or belongs to the value is decided when the
+                    // next byte arrives.
                     size_t span = buffer_len - i;
+                    if (buffer[buffer_len - 1] == '\r') {
+                        span -= 1;
+                        ctx->value_pending_cr = 1;
+                    }
                     // Check overflow: reject excessively long header values
                     if (__builtin_expect((size_t)ctx->header_value_len + span >= 2048, 0)) {
                         return PARSE_ERROR;
@@ -423,6 +467,7 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
             }
 
             case PARSE_STATE_HEADERS_COMPLETE:
+            headers_complete:
                 conn->state = CONN_STATE_HTTP_HEADERS;
                 conn->header_bytes = i + 1;
 

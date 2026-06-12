@@ -125,6 +125,9 @@ typedef struct {
     uint32_t active_mask;        // Bitmask of active connections
     uint32_t write_pending_mask; // Bitmask of connections with pending writes
     uint32_t ws_active_mask;     // Bitmask of active WebSocket connections (O(k) iteration)
+    uint16_t generation[MAX_CONNECTIONS]; // Bumped on disconnect: detects slot
+                                          // reuse for in-flight async work
+                                          // (e.g. the raw-mode file-IO worker)
 } connection_pool_t;
 
 // Connection management functions
@@ -149,6 +152,7 @@ static inline void connection_mark_active(connection_pool_t* pool, int index) {
 
 static inline void connection_mark_inactive(connection_pool_t* pool, int index) {
     pool->active_mask &= ~(1U << index);
+    pool->generation[index]++;  // invalidate stale references to this slot
 }
 
 static inline bool connection_has_write_pending(connection_pool_t* pool, int index) {

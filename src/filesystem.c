@@ -300,23 +300,26 @@ int filesystem_serve_file(filesystem_t* fs,
 
     // Get file metadata
     file_metadata_t metadata;
-    if (!filesystem_get_metadata(fs, actual_path, &metadata)) {
-        // Try index.html for directories
-        if (path_len > 0 && path[path_len - 1] == '/') {
-            static const char index_suffix[] = "index.html";
-            if (path_len + sizeof(index_suffix) > sizeof(index_path)) return -1;
-            memcpy(index_path, path, path_len);
-            memcpy(index_path + path_len, index_suffix, sizeof(index_suffix));
-            if (!filesystem_get_metadata(fs, index_path, &metadata)) {
-                return -1;
-            }
-            actual_path = index_path;
-        } else {
+    bool have_meta = filesystem_get_metadata(fs, actual_path, &metadata);
+
+    // Directory paths serve their index.html. stat() SUCCEEDS for directories
+    // on LittleFS/SPIFFS VFS, so the directory case must be handled here as
+    // well — not only when the stat fails (previously "GET /" always 404'd
+    // even with an index.html present).
+    if ((!have_meta || metadata.is_directory) &&
+        path_len > 0 && path[path_len - 1] == '/') {
+        static const char index_suffix[] = "index.html";
+        if (path_len + sizeof(index_suffix) > sizeof(index_path)) return -1;
+        memcpy(index_path, path, path_len);
+        memcpy(index_path + path_len, index_suffix, sizeof(index_suffix));
+        if (!filesystem_get_metadata(fs, index_path, &metadata)) {
             return -1;
         }
+        actual_path = index_path;
+        have_meta = true;
     }
 
-    if (metadata.is_directory) {
+    if (!have_meta || metadata.is_directory) {
         // Could return directory listing if enabled
         return -1;
     }
@@ -380,7 +383,17 @@ int filesystem_send_file(filesystem_t* fs,
     // Send headers via non-blocking send
     if (fs_send(conn, headers, header_len) < 0) {
         close(file_fd);
+        if (fs->open_files > 0) fs->open_files--;
         return -1;
+    }
+
+    // Zero-length file: the response is complete after the headers
+    // (Content-Length: 0). Starting a file stream with 0 bytes remaining
+    // would never terminate in on_write_ready.
+    if (metadata->size == 0) {
+        close(file_fd);
+        if (fs->open_files > 0) fs->open_files--;
+        return 0;
     }
 
     // Stream file content - use non-blocking file streaming when available
@@ -413,7 +426,7 @@ int filesystem_stream_file(int file_fd,
                           uint8_t* buffer,
                           size_t buffer_size) {
     size_t total_sent = 0;
-    ssize_t bytes_read;
+    ssize_t bytes_read = 0;
 
     while (total_sent < file_size &&
            (bytes_read = read(file_fd, buffer,
@@ -436,6 +449,13 @@ int filesystem_stream_file(int file_fd,
             sent_from_buffer += bytes_sent;
         }
         total_sent += sent_from_buffer;
+    }
+
+    if (bytes_read < 0) {
+        // Mid-file read error: Content-Length was already promised, so a
+        // short success return would leave the peer waiting forever
+        ESP_LOGE(TAG, "File read error after %zu bytes: %s", total_sent, strerror(errno));
+        return -1;
     }
 
     return (total_sent <= (size_t)INT_MAX) ? (int)total_sent : INT_MAX;

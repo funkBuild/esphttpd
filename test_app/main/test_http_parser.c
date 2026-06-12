@@ -335,8 +335,92 @@ static void test_parse_lf_only(void)
                                               strlen(request),
                                               &ctx);
 
-    // Should either parse or need proper CRLF
-    TEST_ASSERT_TRUE(result == PARSE_COMPLETE || result == PARSE_NEED_MORE || result == PARSE_ERROR);
+    // Bare-LF line endings are tolerated (RFC 7230 §3.5); the request ends at
+    // the final LF and must complete without waiting for more data
+    TEST_ASSERT_EQUAL(PARSE_COMPLETE, result);
+    TEST_ASSERT_EQUAL(HTTP_GET, conn.method);
+}
+
+// Regression: bare-LF request WITH a body — headers-complete used to be
+// processed one byte late, overcounting header_bytes by 1 (the first body
+// byte was silently consumed as a header byte)
+static void test_parse_lf_only_with_body(void)
+{
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "POST /x HTTP/1.1\n"
+                         "Content-Length: 4\n"
+                         "\n"
+                         "BODY";
+
+    parse_result_t result = http_parse_request(&conn,
+                                              (const uint8_t*)request,
+                                              strlen(request),
+                                              &ctx);
+
+    TEST_ASSERT_EQUAL(PARSE_OK, result);
+    TEST_ASSERT_EQUAL(4, conn.content_length);
+    // header_bytes must point exactly at the first body byte
+    TEST_ASSERT_EQUAL(strlen(request) - 4, conn.header_bytes);
+}
+
+// Regression: header line whose CRLF is split across two buffer slices used
+// to leak the CR into the header value ("abc123\r" instead of "abc123"),
+// which broke the WebSocket handshake among other things
+static void test_parse_value_cr_lf_split_across_slices(void)
+{
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    // The parser is fed slices of one contiguous accumulation buffer (as the
+    // real caller does with recv_buf); split lands between \r and \n
+    const char* request = "GET /ws HTTP/1.1\r\n"
+                         "Sec-WebSocket-Key: abc123\r\n"
+                         "Upgrade: websocket\r\n"
+                         "\r\n";
+    uint8_t buf[128];
+    size_t total = strlen(request);
+    memcpy(buf, request, total);
+    size_t split = strstr(request, "abc123\r") - request + strlen("abc123\r");
+
+    parse_result_t r1 = http_parse_request(&conn, buf, split, &ctx);
+    TEST_ASSERT_EQUAL(PARSE_NEED_MORE, r1);
+
+    parse_result_t r2 = http_parse_request(&conn, buf + split, total - split, &ctx);
+    TEST_ASSERT_EQUAL(PARSE_COMPLETE, r2);
+
+    // The stored key must not contain the stray CR
+    TEST_ASSERT_EQUAL_STRING("abc123", ctx.ws_client_key);
+    TEST_ASSERT_EQUAL(1, conn.is_websocket);
+    TEST_ASSERT_EQUAL(1, conn.upgrade_ws);
+}
+
+// A held-back CR that turns out to be value data (next byte is not LF) must
+// be preserved and parsing must continue without losing bytes
+static void test_parse_value_embedded_cr_split_across_slices(void)
+{
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    // Held-back CR turns out to be value data (next byte is not LF); the
+    // following header must still parse correctly (no byte loss/desync)
+    const char* request = "GET / HTTP/1.1\r\n"
+                         "X-Odd: ab\rcd\r\n"
+                         "Content-Length: 5\r\n"
+                         "\r\n";
+    uint8_t buf[128];
+    size_t total = strlen(request);
+    memcpy(buf, request, total);
+    size_t split = strstr(request, "ab\r") - request + strlen("ab\r");
+
+    parse_result_t r1 = http_parse_request(&conn, buf, split, &ctx);
+    TEST_ASSERT_EQUAL(PARSE_NEED_MORE, r1);
+
+    parse_result_t r2 = http_parse_request(&conn, buf + split, total - split, &ctx);
+    // GET with Content-Length > 0 does not enter body state; headers complete
+    TEST_ASSERT_TRUE(r2 == PARSE_COMPLETE || r2 == PARSE_OK);
+    TEST_ASSERT_EQUAL(5, conn.content_length);
 }
 
 // Test HTTP/0.9 style request (method URL only)
@@ -1280,6 +1364,9 @@ void test_http_parser_run(void)
     RUN_TEST(test_parse_single_char_method);
     RUN_TEST(test_parse_no_crlf);
     RUN_TEST(test_parse_lf_only);
+    RUN_TEST(test_parse_lf_only_with_body);
+    RUN_TEST(test_parse_value_cr_lf_split_across_slices);
+    RUN_TEST(test_parse_value_embedded_cr_split_across_slices);
     RUN_TEST(test_parse_http09_style);
     RUN_TEST(test_parse_unknown_http_version);
     RUN_TEST(test_parse_extra_spaces);

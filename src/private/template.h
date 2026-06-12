@@ -63,6 +63,12 @@ void template_init(template_context_t* ctx,
 
 // Process template data (streaming)
 // Returns number of bytes written to output
+//
+// LIMITATION: the API reports bytes WRITTEN but not bytes CONSUMED. If the
+// output fills before the input is exhausted (substituted values larger than
+// their placeholders, HTML escaping expansion), the unprocessed input tail is
+// dropped by callers that don't re-feed it. Size output generously relative
+// to input (worst case 6x for escape_html) when expansion is possible.
 int template_process(template_context_t* ctx,
                     const uint8_t* input,
                     size_t input_len,

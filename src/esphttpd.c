@@ -31,6 +31,8 @@
 #include <strings.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <inttypes.h>
+#include "esp_timer.h"
 #ifndef CONFIG_HTTPD_USE_RAW_API
 #include <sys/socket.h>
 #else
@@ -232,11 +234,13 @@ static inline void init_channel_hash(struct httpd_server* server) {
 }
 
 // Query parameter cache entry (pointers into query string)
+// 16-bit lengths: URIs can be up to 2048 bytes, so a JWT/OAuth token in a
+// query value easily exceeds 255 bytes (uint8_t silently truncated them)
 typedef struct {
     const char* key;
     const char* value;
-    uint8_t key_len;
-    uint8_t value_len;
+    uint16_t key_len;
+    uint16_t value_len;
 } query_param_entry_t;
 
 // Per-connection request context
@@ -290,7 +294,6 @@ typedef struct {
     struct {
         httpd_continuation_t handler;     // Continuation handler callback
         httpd_req_continuation_t cont;    // Continuation state
-        httpd_continuation_close_cb_t on_close;  // Disconnect/abort cleanup callback
         bool active;                      // Continuation mode active
     } continuation;
     char _zero_end[0];                    // Marker: memset stops here
@@ -298,6 +301,8 @@ typedef struct {
     // === Scratch buffers that DON'T need zeroing per request ===
     // (only accessed up to their respective counts, or written before read)
     req_header_entry_t headers[MAX_REQ_HEADERS];  // Header index (accessed up to header_count)
+    uint8_t resp_hdr_buf[512];            // Staged response headers (accessed up to resp_hdr_len);
+                                          // transmitted with the status line when the response starts
     uint8_t inline_recv_buf[512];         // Embedded buffer for single-packet requests
     char inline_uri_buf[64];              // Embedded buffer for typical URI lengths (heap fallback for longer)
     query_param_entry_t query_params[MAX_QUERY_PARAMS];  // Lazy parsed (accessed up to query_param_count)
@@ -333,12 +338,13 @@ void* g_test_send_buffers = NULL;      // Non-static for test access
 #else
 static struct httpd_server* volatile g_server = NULL;
 #endif
-static filesystem_t fs_instance;
 
 // Forward declarations
 static request_context_t* get_request_context(connection_t* conn);
 static void store_header_in_req(request_context_t* ctx, const uint8_t* key, uint16_t key_len,
                                 const uint8_t* value, uint16_t value_len);
+static void reset_request_recv_state(connection_t* conn);
+static size_t request_body_wire_received(request_context_t* ctx);
 
 // ============================================================================
 // Forward Declarations
@@ -352,7 +358,7 @@ static void on_ws_connect(connection_t* conn);
 static void on_ws_disconnect(connection_t* conn);
 static void on_disconnect(connection_t* conn);
 static void on_write_ready(connection_t* conn);
-#ifndef CONFIG_HTTPD_USE_RAW_API
+#if !defined(CONFIG_HTTPD_USE_RAW_API) && !defined(CONFIG_ESPHTTPD_TEST_MODE)
 static void server_task(void* pvParameters);
 #endif
 
@@ -369,24 +375,39 @@ static inline __attribute__((always_inline)) send_buffer_t* get_send_buffer(conn
 // File read request sent to the worker task
 typedef struct {
     uint8_t pool_index;      // Connection pool index
+    uint16_t generation;     // Pool slot generation at submit (detects reuse)
     int file_fd;             // File descriptor to read from
-    uint8_t* dest;           // Destination buffer (inside send_buffer ring)
     size_t max_len;          // Maximum bytes to read
 } file_io_request_t;
 
-// File read result returned from worker
-typedef struct {
-    uint8_t pool_index;      // Connection pool index
-    ssize_t bytes_read;      // Bytes read, or -1 on error
-} file_io_result_t;
-
 static QueueHandle_t s_file_io_request_queue = NULL;
-static QueueHandle_t s_file_io_result_queue = NULL;
 static TaskHandle_t s_file_io_task = NULL;
+// Set while a read for this slot is in the worker's hands. on_disconnect
+// checks it to hand fd ownership to the worker instead of closing underneath
+// an in-flight read.
+static volatile bool s_file_io_pending[MAX_CONNECTIONS];
 
-// Worker task: reads file data outside tcpip_thread
+// Worker task: reads file data outside tcpip_thread.
+//
+// The read lands in a worker-owned bounce buffer, never directly in the
+// connection's ring buffer: the previous design captured a raw pointer into
+// sb->buffer at submit time, which a disconnect could free (and a recycled
+// pool slot could reallocate) before the read completed - a use-after-free
+// plus cross-connection data corruption. The result is committed under the
+// tcpip lock only after validating the slot generation.
+//
+// (A former 4-deep result queue was filled here with xQueueSend(portMAX_DELAY)
+// and never drained anywhere - the worker deadlocked permanently on the 5th
+// chunk of any larger file. Results are applied inline; the queue is gone.)
 static void file_io_worker_task(void* pvParameters) {
     file_io_request_t req;
+    uint8_t* bounce = (uint8_t*)malloc(SEND_BUFFER_SIZE);
+    if (!bounce) {
+        ESP_LOGE(TAG, "File I/O worker: bounce buffer alloc failed");
+        s_file_io_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
 
     for (;;) {
         if (xQueueReceive(s_file_io_request_queue, &req, portMAX_DELAY) != pdTRUE) {
@@ -398,35 +419,69 @@ static void file_io_worker_task(void* pvParameters) {
             break;
         }
 
-        file_io_result_t result = {
-            .pool_index = req.pool_index,
-            .bytes_read = read(req.file_fd, req.dest, req.max_len)
-        };
+        size_t to_read = (req.max_len <= SEND_BUFFER_SIZE) ? req.max_len : SEND_BUFFER_SIZE;
+        ssize_t bytes_read = read(req.file_fd, bounce, to_read);
 
-        // Post result back and trigger on_write_ready via tcpip callback
-        xQueueSend(s_file_io_result_queue, &result, portMAX_DELAY);
-
-        // Signal tcpip_thread to process the result
+        // Commit under the tcpip lock, only if the connection is still the
+        // one that submitted the read
         HTTPD_LOCK_TCPIP();
+        bool committed = false;
         if (g_server) {
-            connection_t* conn = connection_get(&g_server->connection_pool, req.pool_index);
-            if (conn && connection_is_active(&g_server->connection_pool, req.pool_index)) {
+            connection_pool_t* pool = &g_server->connection_pool;
+            connection_t* conn = connection_get(pool, req.pool_index);
+            if (conn && connection_is_active(pool, req.pool_index) &&
+                pool->generation[req.pool_index] == req.generation) {
                 send_buffer_t* sb = get_send_buffer(conn);
-                if (sb && result.bytes_read > 0) {
-                    send_buffer_commit(sb, result.bytes_read);
-                    sb->file_remaining -= result.bytes_read;
-                    if (sb->file_remaining == 0) {
+                if (sb && send_buffer_is_streaming(sb) && sb->file_fd == req.file_fd) {
+                    committed = true;
+                    s_file_io_pending[req.pool_index] = false;
+                    if (bytes_read > 0) {
+                        uint8_t* write_ptr;
+                        size_t contiguous = send_buffer_write_ptr(sb, &write_ptr);
+                        if (contiguous >= (size_t)bytes_read) {
+                            memcpy(write_ptr, bounce, bytes_read);
+                            send_buffer_commit(sb, bytes_read);
+                            sb->file_remaining -= bytes_read;
+                            if (sb->file_remaining == 0) {
+                                send_buffer_stop_file(sb);
+                            }
+                        } else {
+                            // Ring shrank between submit and commit (should not
+                            // happen - only this worker refills while streaming)
+                            ESP_LOGE(TAG, "File I/O commit: ring space lost, aborting stream");
+                            send_buffer_stop_file(sb);
+                            conn->state = CONN_STATE_CLOSED;
+                        }
+                    } else {
+                        // EOF before file_remaining reached 0, or read error:
+                        // the promised Content-Length cannot be honored
+                        if (bytes_read == 0) {
+                            ESP_LOGW(TAG, "File I/O: unexpected EOF (%" PRIu32 " bytes short)",
+                                     sb->file_remaining);
+                        } else {
+                            ESP_LOGE(TAG, "File I/O read error: %s", strerror(errno));
+                        }
                         send_buffer_stop_file(sb);
+                        conn->state = CONN_STATE_CLOSED;
                     }
-                } else if (result.bytes_read < 0) {
-                    if (sb) send_buffer_stop_file(sb);
+                    if (conn->state != CONN_STATE_CLOSED) {
+                        on_write_ready(conn);
+                    }
                 }
-                on_write_ready(conn);
             }
+        }
+        if (!committed) {
+            // The connection died (or the slot was recycled) while the read
+            // was in flight. on_disconnect saw s_file_io_pending and left the
+            // fd open for us - close it here.
+            s_file_io_pending[req.pool_index] = false;
+            close(req.file_fd);
+            ESP_LOGD(TAG, "File I/O result dropped (conn [%u] gone)", (unsigned)req.pool_index);
         }
         HTTPD_UNLOCK_TCPIP();
     }
 
+    free(bounce);
     // Worker received stop sentinel - self-delete
     vTaskDelete(NULL);
 }
@@ -434,8 +489,7 @@ static void file_io_worker_task(void* pvParameters) {
 static void file_io_worker_start(void) {
     if (s_file_io_task) return;  // Already running
 
-    s_file_io_request_queue = xQueueCreate(4, sizeof(file_io_request_t));
-    s_file_io_result_queue = xQueueCreate(4, sizeof(file_io_result_t));
+    s_file_io_request_queue = xQueueCreate(MAX_CONNECTIONS, sizeof(file_io_request_t));
 
     xTaskCreate(file_io_worker_task, "httpd_fio", 2048, NULL, 5, &s_file_io_task);
     ESP_LOGI(TAG, "File I/O worker task started");
@@ -458,27 +512,31 @@ static void file_io_worker_stop(void) {
         vQueueDelete(s_file_io_request_queue);
         s_file_io_request_queue = NULL;
     }
-    if (s_file_io_result_queue) {
-        vQueueDelete(s_file_io_result_queue);
-        s_file_io_result_queue = NULL;
-    }
 }
 
-// Submit a file read to the worker task (non-blocking)
-static bool file_io_submit_read(uint8_t pool_index, int file_fd, uint8_t* dest, size_t max_len) {
+// Submit a file read to the worker task (non-blocking).
+// Returns false if the queue is full - the caller must leave write-pending
+// set so raw_poll_cb retries (silently dropping the submit stalled transfers
+// forever).
+static bool file_io_submit_read(uint8_t pool_index, int file_fd, size_t max_len) {
     if (!s_file_io_request_queue) {
         file_io_worker_start();
     }
     if (!s_file_io_request_queue) return false;
+    if (s_file_io_pending[pool_index]) return true;  // already one in flight
 
     file_io_request_t req = {
         .pool_index = pool_index,
         .file_fd = file_fd,
-        .dest = dest,
+        .generation = g_server ? g_server->connection_pool.generation[pool_index] : 0,
         .max_len = max_len
     };
 
-    return xQueueSend(s_file_io_request_queue, &req, 0) == pdTRUE;
+    if (xQueueSend(s_file_io_request_queue, &req, 0) != pdTRUE) {
+        return false;
+    }
+    s_file_io_pending[pool_index] = true;
+    return true;
 }
 
 #endif // CONFIG_HTTPD_USE_RAW_API
@@ -486,6 +544,26 @@ static bool file_io_submit_read(uint8_t pool_index, int file_fd, uint8_t* dest, 
 // ============================================================================
 // Utility Functions
 // ============================================================================
+
+// ============================================================================
+// Cross-task send serialization (socket mode)
+// ============================================================================
+// httpd_ws_send/broadcast/publish are documented as callable from any task,
+// but in socket mode the app task's send path and the server task's
+// on_write_ready both consume the same ring buffer (sb->tail), both call
+// send() on the same fd mid-frame, and on_write_ready can free the buffer
+// while another task queues into it. A recursive mutex serializes them
+// (recursive: completion callbacks inside on_write_ready may legitimately
+// call httpd_ws_send again). Raw mode instead relies on LOCK_TCPIP_CORE(),
+// enforced by a compile guard in raw_tcp.c.
+#ifndef CONFIG_HTTPD_USE_RAW_API
+static SemaphoreHandle_t s_send_mutex = NULL;
+#define SEND_LOCK()   do { if (s_send_mutex) xSemaphoreTakeRecursive(s_send_mutex, portMAX_DELAY); } while (0)
+#define SEND_UNLOCK() do { if (s_send_mutex) xSemaphoreGiveRecursive(s_send_mutex); } while (0)
+#else
+#define SEND_LOCK()   do { } while (0)
+#define SEND_UNLOCK() do { } while (0)
+#endif
 
 // Drain send buffer - sends as much buffered data as possible
 // Returns true if buffer is now empty, false if more data pending
@@ -521,7 +599,7 @@ static bool drain_send_buffer(connection_t* conn) {
 
 // Non-blocking send - tries to send data, queues remainder if socket/tcp buffer would block
 // Returns number of bytes sent/queued, or -1 on error
-static ssize_t send_nonblocking(connection_t* __restrict conn, const void* __restrict data, size_t len, int flags) {
+static ssize_t send_nonblocking_impl(connection_t* __restrict conn, const void* __restrict data, size_t len, int flags) {
     if (!conn || !data || len == 0) {
         return 0;
     }
@@ -534,14 +612,14 @@ static ssize_t send_nonblocking(connection_t* __restrict conn, const void* __res
     const uint8_t* ptr = (const uint8_t*)data;
     size_t remaining = len;
 
-    // If there's already queued data, we must queue to maintain order
+    // If there's already queued or mem-streamed data, we must queue to maintain order
     // Only attempt drain for larger writes (>64 bytes) where making room is worthwhile
-    if (send_buffer_has_data(sb)) {
+    if (send_buffer_has_data(sb) || send_buffer_is_mem_streaming(sb)) {
         if (len > 64) {
             drain_send_buffer(conn);
         }
         // Still have queued data - must queue this too to maintain order
-        if (send_buffer_has_data(sb)) {
+        if (send_buffer_has_data(sb) || send_buffer_is_mem_streaming(sb)) {
             goto queue_data;
         }
     }
@@ -586,6 +664,18 @@ queue_data:
         }
     }
 
+    // If a memory stream is already pending, new bytes must queue behind it.
+    // The ring drains to the socket before on_write_ready refills it from the
+    // stream, so queueing into the ring here would reorder the response.
+    if (send_buffer_is_mem_streaming(sb)) {
+        if (!send_buffer_start_mem(sb, ptr, remaining)) {
+            ESP_LOGE(TAG, "Failed to append %zu bytes to memory stream", remaining);
+            return -1;
+        }
+        connection_mark_write_pending(&g_server->connection_pool, conn->pool_index, true);
+        return (ssize_t)len;
+    }
+
     // Queue data in chunks when remaining exceeds buffer capacity.
     // Between chunks, drain the buffer to the socket to free space.
     while (remaining > 0) {
@@ -619,6 +709,15 @@ queue_data:
     connection_mark_write_pending(&g_server->connection_pool, conn->pool_index, true);
 
     return (ssize_t)len;
+}
+
+// Serialized entry point (see SEND_LOCK above): callable from the server task
+// and from app tasks via the WebSocket send APIs
+static ssize_t send_nonblocking(connection_t* __restrict conn, const void* __restrict data, size_t len, int flags) {
+    SEND_LOCK();
+    ssize_t result = send_nonblocking_impl(conn, data, len, flags);
+    SEND_UNLOCK();
+    return result;
 }
 
 // WebSocket send callback - wraps send_nonblocking for use by websocket.c
@@ -1006,6 +1105,8 @@ static void init_request_context(request_context_t* ctx, connection_t* conn) {
     ctx->req.fd = conn->fd;
     ctx->req._internal = conn;
     ctx->req.status_code = 200;
+    ctx->req._resp_hdr_buf = ctx->resp_hdr_buf;
+    ctx->req._resp_hdr_cap = sizeof(ctx->resp_hdr_buf);
     ctx->server = g_server;
 }
 
@@ -1113,6 +1214,13 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
     // Initialize components (event_loop_init also initializes the connection pool)
     event_loop_init(&server->event_loop, &server->connection_pool, &el_config);
 
+#ifndef CONFIG_HTTPD_USE_RAW_API
+    // Serializes app-task WebSocket sends against the server task's writer
+    if (!s_send_mutex) {
+        s_send_mutex = xSemaphoreCreateRecursiveMutex();
+    }
+#endif
+
     // Pre-allocate per-connection context arrays (one contiguous block each)
     // This eliminates malloc/free on every connect/disconnect and prevents heap fragmentation
     preallocated_request_contexts = (request_context_t*)calloc(MAX_CONNECTIONS, sizeof(request_context_t));
@@ -1202,6 +1310,11 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
     if (raw_ret < 0) {
         server->initialized = false;
         g_server = NULL;
+        // Undo everything allocated/registered above: without these a retry
+        // leaked the radix tree and stacked a duplicate CORS middleware
+        radix_tree_destroy(server->legacy_routes);
+        server->legacy_routes = NULL;
+        server->middleware_count = 0;
         free(preallocated_request_contexts);
         free(preallocated_ws_contexts);
         free(preallocated_send_buffers);
@@ -1224,6 +1337,11 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
     if (ret != pdPASS) {
         server->initialized = false;
         g_server = NULL;
+        // Undo everything allocated/registered above: without these a retry
+        // leaked the radix tree and stacked a duplicate CORS middleware
+        radix_tree_destroy(server->legacy_routes);
+        server->legacy_routes = NULL;
+        server->middleware_count = 0;
         free(preallocated_request_contexts);
         free(preallocated_ws_contexts);
         free(preallocated_send_buffers);
@@ -1283,13 +1401,32 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
 
         // Free dynamically-allocated sub-buffers within pre-allocated contexts
         if (request_contexts[i]) {
-            if (request_contexts[i]->uri_buf_is_heap) {
-                free(request_contexts[i]->uri_buf);
+            request_context_t* c = request_contexts[i];
+
+            // Notify in-flight async work before tearing down (mirrors
+            // on_disconnect): without this, defer file handles stay open and
+            // user completion callbacks never run when the server stops
+            // mid-request
+            if (c->defer.active && c->defer.on_done) {
+                c->defer.on_done(&c->req, HTTPD_ERR_CONN_CLOSED);
             }
-            free(request_contexts[i]->header_buf);
-            free(request_contexts[i]->body_buf);
-            if (request_contexts[i]->recv_buf_is_heap) {
-                free(request_contexts[i]->recv_buf);
+            c->defer.active = false;
+            if (c->async_send.active && c->async_send.on_done) {
+                c->async_send.on_done(&c->req, HTTPD_ERR_CONN_CLOSED);
+            }
+            c->async_send.active = false;
+            if (c->data_provider.active && c->data_provider.on_complete) {
+                c->data_provider.on_complete(&c->req, HTTPD_ERR_CONN_CLOSED);
+            }
+            c->data_provider.active = false;
+
+            if (c->uri_buf_is_heap) {
+                free(c->uri_buf);
+            }
+            free(c->header_buf);
+            free(c->body_buf);
+            if (c->recv_buf_is_heap) {
+                free(c->recv_buf);
             }
             request_contexts[i] = NULL;
         }
@@ -1300,9 +1437,9 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
         }
 
         if (connection_send_buffers[i]) {
-            if (connection_send_buffers[i]->allocated) {
-                send_buffer_free(connection_send_buffers[i]);
-            }
+            // Unconditional: also releases a pending memory stream or an open
+            // streaming file fd, not just the ring allocation
+            send_buffer_free(connection_send_buffers[i]);
             connection_send_buffers[i] = NULL;
         }
     }
@@ -1369,7 +1506,9 @@ bool httpd_is_running(httpd_handle_t handle) {
     return server && server->running;
 }
 
-#ifndef CONFIG_HTTPD_USE_RAW_API
+// Only referenced when a real server task is created: raw mode listens via
+// lwIP callbacks and test mode runs the event loop from the test harness
+#if !defined(CONFIG_HTTPD_USE_RAW_API) && !defined(CONFIG_ESPHTTPD_TEST_MODE)
 static void server_task(void* pvParameters) {
     struct httpd_server* server = (struct httpd_server*)pvParameters;
     event_loop_run(&server->event_loop, &server->handlers);
@@ -1501,12 +1640,12 @@ httpd_err_t httpd_on_error(httpd_handle_t handle, httpd_err_handler_t handler) {
 // Send a complete CORS preflight response as a single write.
 // Combines status line + all CORS headers + Content-Length: 0 + blank line into one buffer.
 static httpd_err_t send_cors_preflight(httpd_req_t* req, connection_t* conn, const char* cors_origin) {
-    // Pre-built constant parts of CORS preflight response
+    // Pre-built constant parts of CORS preflight response.
+    // No Content-Length: RFC 7230 §3.3.2 forbids it on 204 responses.
     static const char cors_headers[] =
         "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS\r\n"
         "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
         "Access-Control-Max-Age: 86400\r\n"
-        "Content-Length: 0\r\n"
         "\r\n";
 
     // Build complete response in one buffer: status + origin header + static headers
@@ -1698,8 +1837,8 @@ int httpd_req_recv(httpd_req_t* req, void* buf, size_t len) {
         } else {
             // received < 0
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // No data available right now - return what we have so far
-                // (which may be 0 if no pre-buffered data either)
+                // No data available right now - fall through; the
+                // WOULD_BLOCK check below reports it distinguishably
             } else {
                 // Real error
                 ESP_LOGE(TAG, "recv error: %s", strerror(errno));
@@ -1708,6 +1847,15 @@ int httpd_req_recv(httpd_req_t* req, void* buf, size_t len) {
         }
     }
 #endif
+
+    // Nothing available but the body is not complete: more segments are in
+    // flight. Returning 0 here used to be indistinguishable from EOF, so
+    // handlers silently truncated multi-segment uploads. Handlers that need
+    // the full body must use defer/continuation (they cannot wait inline on
+    // the single server task).
+    if (total_received == 0 && req->body_received < req->content_length) {
+        return HTTPD_ERR_WOULD_BLOCK;
+    }
 
     return (int)total_received;
 }
@@ -1736,27 +1884,60 @@ httpd_err_t httpd_resp_set_header(httpd_req_t* req, const char* key, const char*
     connection_t* conn = (connection_t*)req->_internal;
     if (!conn) return HTTPD_ERR_CONN_CLOSED;
 
-    // If headers not yet started, send status first
-    if (!req->headers_sent) {
-        char fallback_buf[64];
-        int len;
-        const char* sl = get_status_line(req->status_code, fallback_buf, sizeof(fallback_buf), &len);
-        if (send_nonblocking(conn, sl, len, MSG_MORE) < 0) {
-            return HTTPD_ERR_IO;
-        }
-        req->headers_sent = true;
+    size_t key_len = strlen(key);
+    size_t val_len = strlen(value);
+
+    // Reject CR/LF in keys/values: a handler echoing client input here would
+    // otherwise allow response splitting / header injection
+    if (memchr(key, '\r', key_len) || memchr(key, '\n', key_len) ||
+        memchr(value, '\r', val_len) || memchr(value, '\n', val_len)) {
+        return HTTPD_ERR_INVALID_ARG;
     }
 
-    char header[256];
-    size_t key_len = strlen(key);
-
-    // Track if user is manually setting Content-Length
+    // Track if user is manually setting Content-Length or Content-Type
     // Short-circuit: check length + first char before expensive strcasecmp
     if (key_len == 14 && (key[0] | 0x20) == 'c' && strcasecmp(key, "Content-Length") == 0) {
         req->content_length_set = true;
     }
-    size_t val_len = strlen(value);
+    if (key_len == 12 && (key[0] | 0x20) == 'c' && strcasecmp(key, "Content-Type") == 0) {
+        req->content_type_set = true;
+    }
+
     size_t total = key_len + 2 + val_len + 2; // "key: value\r\n"
+
+    // Headers are STAGED and transmitted together with the status line when
+    // the response starts (first body-producing call). Sending eagerly — as
+    // this function previously did — locked in the status code before the
+    // handler chose it: middleware calling set_header froze "200 OK" on the
+    // wire, so a later set_status(404) was silently ignored and error paths
+    // emitted a second status line mid-stream.
+    if (req->_resp_hdr_buf && !req->headers_sent) {
+        if ((size_t)req->_resp_hdr_len + total > req->_resp_hdr_cap) {
+            return HTTPD_ERR_NO_MEM;
+        }
+        uint8_t* p = req->_resp_hdr_buf + req->_resp_hdr_len;
+        memcpy(p, key, key_len);
+        p[key_len] = ':';
+        p[key_len + 1] = ' ';
+        memcpy(p + key_len + 2, value, val_len);
+        p[key_len + 2 + val_len] = '\r';
+        p[key_len + 2 + val_len + 1] = '\n';
+        req->_resp_hdr_len += total;
+        return HTTPD_OK;
+    }
+
+    // Legacy path (bare request structs without a staging buffer): transmit
+    // immediately, emitting the status line first if needed
+    if (!req->headers_sent) {
+        char fallback_buf[64];
+        int slen;
+        const char* sl = get_status_line(req->status_code, fallback_buf, sizeof(fallback_buf), &slen);
+        if (send_nonblocking(conn, sl, slen, MSG_MORE) < 0) {
+            return HTTPD_ERR_IO;
+        }
+        req->headers_sent = true;
+    }
+    char header[256];
     if (total > sizeof(header)) return HTTPD_ERR_INVALID_ARG;
     memcpy(header, key, key_len);
     header[key_len] = ':';
@@ -1767,9 +1948,34 @@ httpd_err_t httpd_resp_set_header(httpd_req_t* req, const char* key, const char*
     if (send_nonblocking(conn, header, total, MSG_MORE) < 0) {
         return HTTPD_ERR_IO;
     }
-
     return HTTPD_OK;
 }
+
+// Copy the status line plus any headers staged via httpd_resp_set_header
+// into buf so callers can append Content-Length/Transfer-Encoding and the
+// blank line, then transmit the whole header block in ONE send (each
+// send_nonblocking costs a 20-110us socket round). Marks headers_sent and
+// drains the staging buffer. Returns bytes written, or -1 if buf is too
+// small (cap must be >= 64 + _resp_hdr_cap).
+// Size for callers: status line (<64) + staged headers (<=512) + appendix.
+#define RESP_HDR_BLOCK_BUF (64 + 512 + 64)
+static int build_status_and_staged_headers(httpd_req_t* req, char* buf, size_t cap) {
+    char fallback_buf[64];
+    int slen;
+    const char* sl = get_status_line(req->status_code, fallback_buf, sizeof(fallback_buf), &slen);
+    size_t staged = (req->_resp_hdr_buf) ? req->_resp_hdr_len : 0;
+    if ((size_t)slen + staged > cap) {
+        return -1;
+    }
+    memcpy(buf, sl, slen);
+    if (staged > 0) {
+        memcpy(buf + slen, req->_resp_hdr_buf, staged);
+        req->_resp_hdr_len = 0;
+    }
+    req->headers_sent = true;
+    return slen + (int)staged;
+}
+
 
 httpd_err_t httpd_resp_set_type(httpd_req_t* req, const char* type) {
     return httpd_resp_set_header(req, "Content-Type", type);
@@ -1785,8 +1991,9 @@ httpd_err_t httpd_resp_send(httpd_req_t* req, const char* body, ssize_t len) {
 
     // Fast path: coalesce small responses into a single send
     // Only when no headers have been sent yet and Content-Length wasn't manually set
-    if (!req->headers_sent && !req->content_length_set && body_len <= 256) {
-        char resp_buf[512];
+    if (!req->headers_sent && !req->content_length_set && body_len <= 256 &&
+        req->_resp_hdr_len <= 384) {
+        char resp_buf[768];  // status (~64) + staged headers (<=384) + CL + body (<=256)
         size_t pos = 0;
 
         // Status line
@@ -1795,6 +2002,13 @@ httpd_err_t httpd_resp_send(httpd_req_t* req, const char* body, ssize_t len) {
         const char* sl = get_status_line(req->status_code, fallback_buf, sizeof(fallback_buf), &slen);
         memcpy(resp_buf, sl, slen);
         pos += slen;
+
+        // Headers staged via httpd_resp_set_header
+        if (req->_resp_hdr_buf && req->_resp_hdr_len > 0) {
+            memcpy(resp_buf + pos, req->_resp_hdr_buf, req->_resp_hdr_len);
+            pos += req->_resp_hdr_len;
+            req->_resp_hdr_len = 0;
+        }
 
         // Content-Length header via memcpy (avoid snprintf)
         static const char cl_prefix[] = "Content-Length: ";
@@ -1835,36 +2049,30 @@ httpd_err_t httpd_resp_send(httpd_req_t* req, const char* body, ssize_t len) {
         return HTTPD_OK;
     }
 
-    // Standard path: multiple sends for large bodies or when headers were already partially sent
-
-    // Send status line if not sent
-    if (!req->headers_sent) {
-        char fallback_buf[64];
-        int slen;
-        const char* sl = get_status_line(req->status_code, fallback_buf, sizeof(fallback_buf), &slen);
-        if (send_nonblocking(conn, sl, slen, MSG_MORE) < 0) {
+    // Standard path (large bodies / staged headers): build the entire header
+    // block — status line + staged headers + Content-Length + blank line —
+    // and hand it to the socket in ONE send instead of up to four
+    {
+        char block[RESP_HDR_BLOCK_BUF];
+        int pos = 0;
+        if (!req->headers_sent) {
+            pos = build_status_and_staged_headers(req, block, sizeof(block));
+            if (pos < 0) return HTTPD_ERR_NO_MEM;
+        }
+        if (!req->content_length_set) {
+            static const char cl_pfx[] = "Content-Length: ";
+            memcpy(block + pos, cl_pfx, sizeof(cl_pfx) - 1);
+            pos += sizeof(cl_pfx) - 1;
+            pos += format_uint(block + pos, body_len);
+            block[pos++] = '\r';
+            block[pos++] = '\n';
+        }
+        // End headers
+        block[pos++] = '\r';
+        block[pos++] = '\n';
+        if (send_nonblocking(conn, block, pos, (body && body_len > 0) ? MSG_MORE : 0) < 0) {
             return HTTPD_ERR_IO;
         }
-        req->headers_sent = true;
-    }
-
-    // Add Content-Length unless the user already set it manually via httpd_resp_set_header
-    if (!req->content_length_set) {
-        char cl_header[64];
-        static const char cl_pfx[] = "Content-Length: ";
-        memcpy(cl_header, cl_pfx, sizeof(cl_pfx) - 1);
-        int cl_len = sizeof(cl_pfx) - 1;
-        cl_len += format_uint(cl_header + cl_len, body_len);
-        cl_header[cl_len++] = '\r';
-        cl_header[cl_len++] = '\n';
-        if (send_nonblocking(conn, cl_header, cl_len, MSG_MORE) < 0) {
-            return HTTPD_ERR_IO;
-        }
-    }
-
-    // End headers
-    if (send_nonblocking(conn, "\r\n", 2, MSG_MORE) < 0) {
-        return HTTPD_ERR_IO;
     }
     req->body_started = true;
 
@@ -1888,27 +2096,19 @@ httpd_err_t httpd_resp_send_chunk(httpd_req_t* req, const char* chunk, ssize_t l
     send_buffer_t* sb = get_send_buffer(conn);
     if (!sb) return HTTPD_ERR_NO_MEM;
 
-    // Finalize headers if body hasn't started yet
+    // Finalize headers if body hasn't started yet: status line + staged
+    // headers + Transfer-Encoding + blank line in one send
     if (!req->body_started) {
-        // Build complete header block: status line + Transfer-Encoding + blank line
-        static const char te_chunked[] = "Transfer-Encoding: chunked\r\n\r\n";
-        char header_block[128];
-        int header_len;
+        char block[RESP_HDR_BLOCK_BUF];
+        int pos = 0;
         if (!req->headers_sent) {
-            char fallback_buf[64];
-            int sl_len;
-            const char* sl = get_status_line(req->status_code, fallback_buf, sizeof(fallback_buf), &sl_len);
-            memcpy(header_block, sl, sl_len);
-            memcpy(header_block + sl_len, te_chunked, sizeof(te_chunked) - 1);
-            header_len = sl_len + (int)(sizeof(te_chunked) - 1);
-            req->headers_sent = true;
-        } else {
-            header_len = sizeof(te_chunked) - 1;
-            memcpy(header_block, te_chunked, header_len);
+            pos = build_status_and_staged_headers(req, block, sizeof(block));
+            if (pos < 0) return HTTPD_ERR_NO_MEM;
         }
-
-        // Queue headers atomically (small enough to always fit)
-        if (send_nonblocking(conn, header_block, header_len, MSG_MORE) < 0) {
+        static const char te_chunked[] = "Transfer-Encoding: chunked\r\n\r\n";
+        memcpy(block + pos, te_chunked, sizeof(te_chunked) - 1);
+        pos += sizeof(te_chunked) - 1;
+        if (send_nonblocking(conn, block, pos, MSG_MORE) < 0) {
             return HTTPD_ERR_IO;
         }
         req->body_started = true;
@@ -2016,6 +2216,17 @@ httpd_err_t httpd_resp_send_error(httpd_req_t* req, int status, const char* mess
     connection_t* conn = (connection_t*)req->_internal;
     if (!conn) return HTTPD_ERR_CONN_CLOSED;
 
+    // A status line is already on the wire: emitting a second one would
+    // corrupt the response stream (the peer would parse it as garbage
+    // headers/body). Drop the error body and abort the connection so the
+    // peer sees a clean failure instead.
+    if (req->headers_sent || req->body_started) {
+        ESP_LOGW(TAG, "Error %d after response started - closing connection", status);
+        req->_resp_hdr_len = 0;  // discard staged headers
+        conn->state = CONN_STATE_CLOSED;
+        return HTTPD_ERR_IO;
+    }
+
     req->status_code = status;
     const char* msg = message ? message : httpd_status_text(status);
     size_t msg_len = strlen(msg);
@@ -2025,8 +2236,8 @@ httpd_err_t httpd_resp_send_error(httpd_req_t* req, int status, const char* mess
     if (msg_len > 256) msg_len = 256;
 
     // Build entire error response in a single buffer to avoid multiple send calls.
-    // Format: status_line + Content-Type + Content-Length + blank line + body
-    char resp[384];
+    // Format: status_line + staged headers + Content-Type + Content-Length + blank line + body
+    char resp[896];
     size_t pos = 0;
 
     // Status line
@@ -2035,6 +2246,14 @@ httpd_err_t httpd_resp_send_error(httpd_req_t* req, int status, const char* mess
     const char* sl = get_status_line(status, fallback_buf, sizeof(fallback_buf), &slen);
     memcpy(resp + pos, sl, slen);
     pos += slen;
+
+    // Headers staged via httpd_resp_set_header (e.g. CORS origin from
+    // middleware - browsers need it on error responses too)
+    if (req->_resp_hdr_buf && req->_resp_hdr_len > 0) {
+        memcpy(resp + pos, req->_resp_hdr_buf, req->_resp_hdr_len);
+        pos += req->_resp_hdr_len;
+        req->_resp_hdr_len = 0;
+    }
 
     // Content-Type: text/plain\r\n
     static const char ct_plain[] = "Content-Type: text/plain\r\n";
@@ -2096,9 +2315,11 @@ httpd_err_t httpd_resp_sendfile(httpd_req_t* req, const char* path) {
         return httpd_resp_send_error(req, 404, "File not found");
     }
 
-    // Set content type based on extension
-    const char* mime_type = filesystem_get_mime_type(path);
-    httpd_resp_set_type(req, mime_type);
+    // Set content type based on extension (unless the handler already chose one)
+    if (!req->content_type_set) {
+        const char* mime_type = filesystem_get_mime_type(path);
+        httpd_resp_set_type(req, mime_type);
+    }
 
     // Set Content-Length from stat result (avoids chunked transfer encoding overhead)
     char cl_str[24];
@@ -2113,10 +2334,24 @@ httpd_err_t httpd_resp_sendfile(httpd_req_t* req, const char* path) {
         return HTTPD_ERR_CONN_CLOSED;
     }
 
-    // End headers (status line + Content-Type + Content-Length already sent by set_header calls)
-    if (send_nonblocking(conn, "\r\n", 2, st.st_size > 0 ? MSG_MORE : 0) < 0) {
-        fclose(f);
-        return HTTPD_ERR_IO;
+    // Entire header block — status line + staged headers (Content-Type and
+    // Content-Length were staged above) + blank line — in one send
+    {
+        char block[RESP_HDR_BLOCK_BUF];
+        int pos = 0;
+        if (!req->headers_sent) {
+            pos = build_status_and_staged_headers(req, block, sizeof(block));
+            if (pos < 0) {
+                fclose(f);
+                return HTTPD_ERR_NO_MEM;
+            }
+        }
+        block[pos++] = '\r';
+        block[pos++] = '\n';
+        if (send_nonblocking(conn, block, pos, st.st_size > 0 ? MSG_MORE : 0) < 0) {
+            fclose(f);
+            return HTTPD_ERR_IO;
+        }
     }
     req->body_started = true;
 
@@ -2142,11 +2377,11 @@ httpd_err_t httpd_resp_send_json(httpd_req_t* req, const char* json) {
 
     size_t json_len = json ? strlen(json) : 0;
 
-    // Fast path: coalesce status + Content-Type + Content-Length + body into one send.
-    // httpd_resp_set_type() would call httpd_resp_set_header() which sends the status
-    // line and sets headers_sent=true, defeating the coalescing in httpd_resp_send().
-    // By building everything inline, we avoid that and send in a single syscall.
-    if (!req->headers_sent && !req->content_length_set && json_len <= 256) {
+    // Fast path: coalesce status + Content-Type + Content-Length + body into
+    // one send. Skipped when headers were staged or a Content-Type was set by
+    // the handler - the standard path below merges those correctly.
+    if (!req->headers_sent && !req->content_length_set && !req->content_type_set &&
+        req->_resp_hdr_len == 0 && json_len <= 256) {
         // 512 buf covers: status line (~24) + Content-Type (~38) +
         // Content-Length (~24) + CRLF (2) + body (<=256) = ~344 max
         char resp_buf[512];
@@ -2202,8 +2437,10 @@ httpd_err_t httpd_resp_send_json(httpd_req_t* req, const char* json) {
     }
 
     // Fallback: use standard header + send path for large bodies or
-    // when headers were already partially sent
-    httpd_resp_set_type(req, "application/json");
+    // when headers were already staged
+    if (!req->content_type_set) {
+        httpd_resp_set_type(req, "application/json");
+    }
     return httpd_resp_send(req, json, (ssize_t)json_len);
 }
 
@@ -2223,50 +2460,27 @@ httpd_err_t httpd_resp_send_async(httpd_req_t* req, const char* body, ssize_t le
 
     size_t body_len = (len >= 0) ? (size_t)len : (body ? strlen(body) : 0);
 
-    // Build all headers in one buffer to minimize syscalls
-    if (!req->headers_sent) {
-        char header_buf[128];
-        char fallback_buf[64];
-        int sl_len;
-        const char* sl = get_status_line(req->status_code, fallback_buf, sizeof(fallback_buf), &sl_len);
-        memcpy(header_buf, sl, sl_len);
-        int header_len;
-        if (req->content_length_set) {
-            memcpy(header_buf + sl_len, "\r\n", 2);
-            header_len = sl_len + 2;
-        } else {
-            static const char cl_pfx[] = "Content-Length: ";
-            char* p = header_buf + sl_len;
-            memcpy(p, cl_pfx, sizeof(cl_pfx) - 1);
-            p += sizeof(cl_pfx) - 1;
-            p += format_uint(p, body_len);
-            *p++ = '\r'; *p++ = '\n';
-            *p++ = '\r'; *p++ = '\n';
-            header_len = (int)(p - header_buf);
+    // Entire header block — status line + staged headers + Content-Length +
+    // blank line — in one send
+    {
+        char block[RESP_HDR_BLOCK_BUF];
+        int pos = 0;
+        if (!req->headers_sent) {
+            pos = build_status_and_staged_headers(req, block, sizeof(block));
+            if (pos < 0) return HTTPD_ERR_NO_MEM;
         }
-
-        // Single syscall for all headers
-        if (send_nonblocking(conn, header_buf, header_len, body_len > 0 ? MSG_MORE : 0) < 0) {
+        if (!req->content_length_set) {
+            static const char cl_pfx[] = "Content-Length: ";
+            memcpy(block + pos, cl_pfx, sizeof(cl_pfx) - 1);
+            pos += sizeof(cl_pfx) - 1;
+            pos += format_uint(block + pos, body_len);
+            block[pos++] = '\r';
+            block[pos++] = '\n';
+        }
+        block[pos++] = '\r';
+        block[pos++] = '\n';
+        if (send_nonblocking(conn, block, pos, body_len > 0 ? MSG_MORE : 0) < 0) {
             return HTTPD_ERR_IO;
-        }
-        req->headers_sent = true;
-    } else {
-        // Headers already partially sent, send Content-Length (if not already set) and terminator
-        if (req->content_length_set) {
-            if (send_nonblocking(conn, "\r\n", 2, body_len > 0 ? MSG_MORE : 0) < 0) {
-                return HTTPD_ERR_IO;
-            }
-        } else {
-            char cl_buf[80];
-            static const char cl_pfx[] = "Content-Length: ";
-            memcpy(cl_buf, cl_pfx, sizeof(cl_pfx) - 1);
-            int cl_len = sizeof(cl_pfx) - 1;
-            cl_len += format_uint(cl_buf + cl_len, body_len);
-            cl_buf[cl_len++] = '\r'; cl_buf[cl_len++] = '\n';
-            cl_buf[cl_len++] = '\r'; cl_buf[cl_len++] = '\n';
-            if (send_nonblocking(conn, cl_buf, cl_len, body_len > 0 ? MSG_MORE : 0) < 0) {
-                return HTTPD_ERR_IO;
-            }
         }
     }
 
@@ -2277,7 +2491,17 @@ httpd_err_t httpd_resp_send_async(httpd_req_t* req, const char* body, ssize_t le
         }
     }
 
-    // Set up async completion tracking
+    // If nothing was queued (the whole response fit in the socket buffer -
+    // the common case), no write-ready event will ever fire in socket mode,
+    // so the completion callback must run now instead of never.
+    send_buffer_t* sb = get_send_buffer(conn);
+    if (!sb || (!send_buffer_has_data(sb) && !send_buffer_is_mem_streaming(sb))) {
+        if (on_done) on_done(req, HTTPD_OK);
+        return HTTPD_OK;
+    }
+
+    // Set up async completion tracking (fires from on_write_ready when the
+    // queued data drains)
     ctx->async_send.on_done = on_done;
     ctx->async_send.active = true;
 
@@ -2338,43 +2562,32 @@ httpd_err_t httpd_resp_send_provider(httpd_req_t* req, ssize_t content_length,
     // Determine if using chunked encoding
     bool use_chunked = (content_length < 0);
 
-    // Send headers - if headers not started yet, send status line first
-    if (!req->headers_sent) {
-        char fallback_buf[64];
-        int slen;
-        const char* sl = get_status_line(req->status_code, fallback_buf, sizeof(fallback_buf), &slen);
-        if (send_nonblocking(conn, sl, slen, MSG_MORE) < 0) {
+    // Entire header block — status line + staged headers + framing header +
+    // blank line — in one send
+    {
+        char block[RESP_HDR_BLOCK_BUF];
+        int pos = 0;
+        if (!req->headers_sent) {
+            pos = build_status_and_staged_headers(req, block, sizeof(block));
+            if (pos < 0) return HTTPD_ERR_NO_MEM;
+        }
+        if (use_chunked) {
+            static const char te_chunked[] = "Transfer-Encoding: chunked\r\n";
+            memcpy(block + pos, te_chunked, sizeof(te_chunked) - 1);
+            pos += sizeof(te_chunked) - 1;
+        } else if (!req->content_length_set) {
+            static const char cl_pfx[] = "Content-Length: ";
+            memcpy(block + pos, cl_pfx, sizeof(cl_pfx) - 1);
+            pos += sizeof(cl_pfx) - 1;
+            pos += format_uint(block + pos, (size_t)content_length);
+            block[pos++] = '\r';
+            block[pos++] = '\n';
+        }
+        block[pos++] = '\r';
+        block[pos++] = '\n';
+        if (send_nonblocking(conn, block, pos, 0) < 0) {
             return HTTPD_ERR_IO;
         }
-        req->headers_sent = true;
-    }
-
-    // Send Content-Length or Transfer-Encoding header (skip if user already set Content-Length)
-    char header_buf[64];
-    int header_len;
-    if (use_chunked) {
-        static const char te_chunked[] = "Transfer-Encoding: chunked\r\n";
-        memcpy(header_buf, te_chunked, sizeof(te_chunked) - 1);
-        header_len = sizeof(te_chunked) - 1;
-    } else if (req->content_length_set) {
-        header_len = 0;
-    } else {
-        static const char cl_pfx[] = "Content-Length: ";
-        memcpy(header_buf, cl_pfx, sizeof(cl_pfx) - 1);
-        header_len = sizeof(cl_pfx) - 1;
-        header_len += format_uint(header_buf + header_len, (size_t)content_length);
-        header_buf[header_len++] = '\r';
-        header_buf[header_len++] = '\n';
-    }
-    if (header_len > 0) {
-        if (send_nonblocking(conn, header_buf, header_len, MSG_MORE) < 0) {
-            return HTTPD_ERR_IO;
-        }
-    }
-
-    // End headers
-    if (send_nonblocking(conn, "\r\n", 2, 0) < 0) {
-        return HTTPD_ERR_IO;
     }
 
     // Allocate send buffer for the data provider
@@ -2441,8 +2654,11 @@ ssize_t httpd_req_pipe_to_file(httpd_req_t* req, const char* path) {
     fclose(fp);
 
     if (received < 0) {
-        ESP_LOGE(TAG, "Error receiving request body");
-        return HTTPD_ERR_IO;
+        // Propagate WOULD_BLOCK distinguishably: the body has segments still
+        // in flight and this synchronous helper cannot wait for them - the
+        // caller should use httpd_req_defer_to_file() instead
+        ESP_LOGE(TAG, "Error receiving request body (%d)", received);
+        return received;
     }
 
     ESP_LOGI(TAG, "Piped %zd bytes to file: %s", total_written, path);
@@ -2546,12 +2762,17 @@ httpd_err_t httpd_req_defer(httpd_req_t* req, httpd_body_cb_t on_body, httpd_don
         ctx->body_buf_pos = 0;
     }
 
-    // Check if body is already complete (small POST that fit in header buffer)
-    if (req->content_length > 0 && req->body_received >= req->content_length) {
+    // Check if body is already complete. This must also cover
+    // content_length == 0 (defer on a GET or an empty POST): no body bytes
+    // will ever arrive to trigger on_http_body, so the old `> 0` guard left
+    // on_done un-fired until the idle timeout killed the connection. Bytes
+    // left unconsumed in body_buf (on_body == NULL) also count as received.
+    if (request_body_wire_received(ctx) >= req->content_length) {
         ESP_LOGD(TAG, "Body already complete, calling on_done");
         on_done(req, HTTPD_OK);
         ctx->defer.active = false;
         conn->deferred = 0;
+        // finish_sync_request re-arms the connection when the handler returns
     }
 
     return HTTPD_OK;
@@ -2659,7 +2880,6 @@ httpd_err_t httpd_req_continue(httpd_req_t* req, httpd_continuation_t handler,
     ctx->continuation.cont.phase = 0;
     ctx->continuation.cont.expected_bytes = 0;
     ctx->continuation.cont.received_bytes = 0;
-    ctx->continuation.on_close = NULL;
     ctx->continuation.active = true;
     conn->continuation = 1;
 
@@ -2688,9 +2908,11 @@ httpd_err_t httpd_req_continue(httpd_req_t* req, httpd_continuation_t handler,
 
     // Check result
     if (err == HTTPD_ERR_WOULD_BLOCK) {
-        // Handler wants to wait for more data - this is expected
-        // Check if body is already complete
-        if (req->content_length > 0 && req->body_received >= req->content_length) {
+        // Handler wants to wait for more data - this is expected.
+        // Body-complete must also cover content_length == 0 (continuation on
+        // a bodyless request): no body bytes will ever arrive, so the old
+        // `> 0` guard hung the request until the idle timeout.
+        if (request_body_wire_received(ctx) >= req->content_length) {
             ESP_LOGD(TAG, "Body already complete, calling handler with completion");
             // Call handler one more time to signal completion
             err = handler(req, NULL, 0, &ctx->continuation.cont);
@@ -2722,19 +2944,6 @@ bool httpd_req_is_continuation(httpd_req_t* req) {
     return ctx->continuation.active;
 }
 
-httpd_err_t httpd_req_set_continuation_close_cb(httpd_req_t* req,
-                                                httpd_continuation_close_cb_t cb) {
-    if (!req) {
-        return HTTPD_ERR_INVALID_ARG;
-    }
-    request_context_t* ctx = (request_context_t*)((char*)req - offsetof(request_context_t, req));
-    if (!ctx->continuation.active) {
-        return HTTPD_ERR_INVALID_ARG;
-    }
-    ctx->continuation.on_close = cb;
-    return HTTPD_OK;
-}
-
 // ============================================================================
 // Authentication
 // ============================================================================
@@ -2762,7 +2971,9 @@ bool httpd_check_basic_auth(httpd_req_t* req, const char* username, const char* 
     if (!auth_header) return false;
 
     // Check for "Basic " prefix
-    if (memcmp(auth_header, "Basic ", 6) != 0) return false;
+    // strncmp (not memcmp): stops at the NUL of a short value instead of
+    // reading past the end of the heap-backed header buffer
+    if (strncmp(auth_header, "Basic ", 6) != 0) return false;
 
     const char* encoded = auth_header + 6;
 
@@ -3308,6 +3519,115 @@ static httpd_err_t handle_error(httpd_err_t err, httpd_req_t* req) {
 // Event Handlers
 // ============================================================================
 
+// ---------------------------------------------------------------------------
+// Request logging: one ">>" line when a parsed request is dispatched and one
+// "<<" line when its handler returns (status + handler time). Handlers run
+// inline on the single server task, so a long gap between a request's ">>"
+// and "<<" is exactly the window in which every other request (e.g. quick
+// back-to-back requests from the web UI) is starved. Note "<<" marks the
+// HANDLER returning — provider/deferred responses may continue streaming
+// from the event loop afterwards.
+// ---------------------------------------------------------------------------
+static const char* http_method_name(http_method_t m) {
+    switch (m) {
+        case HTTP_GET:     return "GET";
+        case HTTP_POST:    return "POST";
+        case HTTP_PUT:     return "PUT";
+        case HTTP_DELETE:  return "DELETE";
+        case HTTP_HEAD:    return "HEAD";
+        case HTTP_OPTIONS: return "OPTIONS";
+        case HTTP_PATCH:   return "PATCH";
+        default:           return "OTHER";
+    }
+}
+
+// Threshold above which a handler is logged at INFO as slow. Handlers run
+// inline on the single server task, so anything above this is starving every
+// other connection for that long.
+#define HTTPD_SLOW_HANDLER_MS 50
+
+// "<<" goes to INFO only for slow handlers and error responses - exactly the
+// starvation/failure signal the instrumentation exists for. Routine 2xx
+// requests log at DEBUG: at 115200 baud each ~90-char line costs ~8ms of
+// blocking UART time on the server task, which under back-to-back load is
+// itself a bigger stall than most handlers.
+#define HTTPD_LOG_REQUEST_END(ctx_, conn_, start_us_, note_)                              \
+    do {                                                                                  \
+        int64_t _handler_ms = (esp_timer_get_time() - (start_us_)) / 1000;                \
+        if (_handler_ms >= HTTPD_SLOW_HANDLER_MS || (ctx_)->req.status_code >= 400) {     \
+            ESP_LOGI(TAG, "<< %s %s %" PRIu16 " %" PRId64 "ms%s (conn %" PRIu8 ")",       \
+                     http_method_name((ctx_)->req.method), (ctx_)->req.path,              \
+                     (ctx_)->req.status_code, _handler_ms, (note_),                       \
+                     (conn_)->pool_index);                                                \
+        } else {                                                                          \
+            ESP_LOGD(TAG, "<< %s %s %" PRIu16 " %" PRId64 "ms%s (conn %" PRIu8 ")",       \
+                     http_method_name((ctx_)->req.method), (ctx_)->req.path,              \
+                     (ctx_)->req.status_code, _handler_ms, (note_),                       \
+                     (conn_)->pool_index);                                                \
+        }                                                                                 \
+    } while (0)
+
+// Re-arm the receive side of a connection for the next keep-alive/pipelined
+// request once the current request is fully received. The response may still
+// be draining from the send buffer; only receive-side state is touched.
+// connection_t is only zeroed at accept, so without this a keep-alive
+// connection inherits the previous request's state: a stale CONN_STATE_HTTP_BODY
+// routes the next request into on_http_body (request silently dropped), a
+// stale content_length treats the next request's bytes as body, and a stale
+// upgrade_ws sends a plain GET down the WebSocket upgrade path.
+static void reset_request_recv_state(connection_t* conn) {
+    conn->state = CONN_STATE_NEW;
+    conn->content_length = 0;
+    conn->bytes_received = 0;
+    conn->header_bytes = 0;
+    conn->url_len = 0;
+    conn->upgrade_ws = 0;
+    conn->is_websocket = 0;
+    conn->keep_alive = 0;
+}
+
+// Bytes of the current request's body that have arrived on the wire, whether
+// or not the handler consumed them: req.body_received counts consumed bytes,
+// and any unconsumed remainder of the pre-received body still sits in body_buf.
+static size_t request_body_wire_received(request_context_t* ctx) {
+    size_t unconsumed = (ctx->body_buf && ctx->body_buf_len > ctx->body_buf_pos)
+                      ? ctx->body_buf_len - ctx->body_buf_pos : 0;
+    return ctx->req.body_received + unconsumed;
+}
+
+// Honor "Connection: close" once the response has been fully handed to the
+// socket. If bytes are still draining asynchronously the connection is left
+// open (the idle timeout reaps it) - closing now would truncate the response.
+static void maybe_close_for_connection_close(connection_t* conn, request_context_t* ctx,
+                                             bool close_requested) {
+    if (!close_requested) return;
+    if (ctx->data_provider.active || ctx->async_send.active) return;
+    send_buffer_t* sb = get_send_buffer(conn);
+    if (sb && (send_buffer_has_data(sb) || send_buffer_is_streaming(sb) ||
+               send_buffer_is_mem_streaming(sb))) {
+        return;
+    }
+    conn->state = CONN_STATE_CLOSED;
+}
+
+// Called when a synchronous handler has finished dispatch. If the request is
+// fully received, re-arm the connection for the next request; otherwise stay
+// in CONN_STATE_HTTP_BODY so on_http_body can drain the rest before re-arming.
+static void finish_sync_request(connection_t* conn, request_context_t* ctx) {
+    if (conn->deferred || conn->continuation) return;  // async paths re-arm on completion
+    if (conn->state == CONN_STATE_WEBSOCKET || conn->state == CONN_STATE_WS_CLOSING ||
+        conn->state == CONN_STATE_CLOSED) {
+        return;
+    }
+    if (ctx->req.content_length > 0 &&
+        request_body_wire_received(ctx) < ctx->req.content_length) {
+        return;  // body still in flight; on_http_body drains it and re-arms
+    }
+    bool close_requested = !conn->keep_alive;
+    reset_request_recv_state(conn);
+    maybe_close_for_connection_close(conn, ctx, close_requested);
+}
+
 static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
     request_context_t* ctx = get_request_context(conn);
     if (!ctx) return;
@@ -3327,7 +3647,13 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
         // Header data too large
         ESP_LOGE(TAG, "Request headers too large (%zu bytes)", new_total);
         ctx->parsing_in_progress = false;
+        // Advertise the close: keep-alive clients (Node 19+ pools by default)
+        // would otherwise reuse the dying socket and hit a reset
+        httpd_resp_set_header(&ctx->req, "Connection", "close");
         httpd_resp_send_error(&ctx->req, 431, "Request Header Fields Too Large");
+        // Unrecoverable framing state: the rest of the oversized request
+        // would otherwise be re-parsed as a fresh request (RFC 7230 §6.6)
+        conn->state = CONN_STATE_CLOSED;
         return;
     }
     if (!ctx->recv_buf) {
@@ -3405,7 +3731,13 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
 
     if (result == PARSE_ERROR) {
         ctx->parsing_in_progress = false;
+        // Advertise the close: keep-alive clients (Node 19+ pools by default)
+        // would otherwise reuse the dying socket and hit a reset
+        httpd_resp_set_header(&ctx->req, "Connection", "close");
         httpd_resp_send_error(&ctx->req, 400, "Bad Request");
+        // Unrecoverable framing error: close instead of re-parsing the rest
+        // of the malformed request as a fresh one (RFC 7230 §6.6)
+        conn->state = CONN_STATE_CLOSED;
         return;
     }
 
@@ -3463,9 +3795,12 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
     // Set method
     ctx->req.method = (http_method_t)conn->method;
 
-    // Check for WebSocket upgrade
-    ctx->req.is_websocket = conn->upgrade_ws;
-    if (conn->upgrade_ws) {
+    // Check for WebSocket upgrade. Requires BOTH the Upgrade header and a
+    // stored Sec-WebSocket-Key (conn->is_websocket) - matching the parser's
+    // own condition. Gating on upgrade_ws alone sent a 101 computed from an
+    // empty key when the client omitted Sec-WebSocket-Key.
+    ctx->req.is_websocket = conn->upgrade_ws && conn->is_websocket;
+    if (ctx->req.is_websocket) {
         // Point to WebSocket key in parser context (persists for request lifetime)
         ctx->req.ws_key = ctx->parser_ctx.ws_client_key;
     }
@@ -3477,6 +3812,13 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
     // conn->header_bytes contains the number of header bytes (including final CRLF)
     if (conn->content_length > 0 && ctx->recv_buf_len > conn->header_bytes) {
         size_t body_in_buffer = ctx->recv_buf_len - conn->header_bytes;
+        // Clamp to the declared Content-Length: bytes beyond it belong to the
+        // next pipelined request and must not be delivered as body data.
+        if (body_in_buffer > conn->content_length) {
+            ESP_LOGW(TAG, "Dropping %zu pipelined bytes beyond request body",
+                     body_in_buffer - conn->content_length);
+            body_in_buffer = conn->content_length;
+        }
         // Dynamically allocate body buffer for pre-received data
         ctx->body_buf = (uint8_t*)malloc(body_in_buffer);
         if (ctx->body_buf) {
@@ -3506,12 +3848,22 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
     ctx->req.base_url = NULL;
     ctx->req.base_url_len = 0;
 
+    // Request start log + handler timing (see request-logging block above
+    // on_http_request). DEBUG level: the "<<" line carries the full signal
+    // (path, status, handler time) and routine ">>" lines at INFO cost ~8ms
+    // of blocking UART each on the server task.
+    const int64_t req_start_us = esp_timer_get_time();
+    ESP_LOGD(TAG, ">> %s %s (conn %" PRIu8 ")", http_method_name(ctx->req.method),
+             ctx->req.path, conn->pool_index);
+
     // Handle CORS preflight requests before route matching
     // This allows OPTIONS requests to succeed even without explicit OPTIONS routes
     // Send complete response in single write (avoids 5x snprintf + 5x send overhead)
     if (g_server->config.enable_cors && ctx->req.method == HTTP_OPTIONS) {
         const char* cors_origin = g_server->config.cors_origin ? g_server->config.cors_origin : "*";
         send_cors_preflight(&ctx->req, conn, cors_origin);
+        HTTPD_LOG_REQUEST_END(ctx, conn, req_start_us, " cors-preflight");
+        finish_sync_request(conn, ctx);
         return;
     }
 
@@ -3532,7 +3884,11 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
                 // Send WebSocket handshake response FIRST (HTTP 101 Switching Protocols)
                 // This MUST happen before the handler can send any WebSocket frames
                 if (ws_send_handshake_response(conn, ctx->req.ws_key) < 0) {
-                    // Handshake failed - close connection
+                    // Handshake failed - actually close: the parser left the
+                    // connection in CONN_STATE_WEBSOCKET, so returning without
+                    // closing fed subsequent bytes to on_ws_frame on a
+                    // half-open connection
+                    conn->state = CONN_STATE_CLOSED;
                     return;
                 }
                 conn->state = CONN_STATE_WEBSOCKET;
@@ -3548,15 +3904,28 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
                     .len = 0
                 };
                 ws_ctx->route->handler(&ws_ctx->ws, &event);
+                ESP_LOGI(TAG, "<< GET %s ws-upgrade (conn %" PRIu8 ")", ctx->req.path,
+                         conn->pool_index);
                 return;
             }
+        }
+
+        // Upgrade requested but no legacy WebSocket route matched. The parser
+        // put the connection in CONN_STATE_WEBSOCKET; restore HTTP state so
+        // the fallthrough (router lookup / 404) doesn't leave the connection
+        // wedged feeding bytes to on_ws_frame with no route. req.is_websocket
+        // stays set so mounted-router WS routes can still match below.
+        if (conn->state == CONN_STATE_WEBSOCKET) {
+            conn->state = CONN_STATE_HTTP_HEADERS;
         }
     }
 
     // Try mounted routers first
     bool route_found = false;
     radix_match_t match;
-    httpd_middleware_t route_mw[CONFIG_HTTPD_MAX_ROUTE_MIDDLEWARE];
+    // Sized to radix_lookup's clamp: it accumulates per-NODE middleware across
+    // the traversal up to MAX_TOTAL, not the per-route MAX_ROUTE limit
+    httpd_middleware_t route_mw[CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE];
     uint8_t route_mw_count = 0;
     httpd_router_t matched_router = NULL;  // httpd_router_t is already a pointer
 
@@ -3625,7 +3994,10 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
             ctx->req.param_count = param_count;
 
             // Build middleware chain: server global only (no router middleware for legacy routes)
-            uint8_t mw_count = g_server->middleware_count;
+            // Clamp to the chain buffer size (mw_chain has MAX_TOTAL entries while
+            // middleware_count can reach MAX_SERVER_MIDDLEWARES, a separate Kconfig range)
+            uint8_t mw_count = g_server->middleware_count < CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE
+                              ? g_server->middleware_count : CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE;
 
             // Use memcpy instead of loop for middleware chain copying
             if (mw_count > 0) {
@@ -3645,6 +4017,8 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
             if (err != HTTPD_OK) {
                 handle_error(err, &ctx->req);
             }
+            HTTPD_LOG_REQUEST_END(ctx, conn, req_start_us, "");
+            finish_sync_request(conn, ctx);
 
             return;
         }
@@ -3696,9 +4070,13 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
         ctx->req._mw.router = matched_router;
 
         if (match.is_websocket) {
-            // WebSocket route - handle differently
-            // TODO: Implement WebSocket with new router system
+            // WebSocket routes via mounted routers are not implemented.
+            // Previously this logged a warning and sent NOTHING - the client
+            // hung with zero bytes on the wire until its own timeout.
             ESP_LOGW(TAG, "WebSocket routes not yet implemented in new router system");
+            handle_error(HTTPD_ERR_WS_REJECTED, &ctx->req);
+            HTTPD_LOG_REQUEST_END(ctx, conn, req_start_us, " ws-router-unimplemented");
+            conn->state = CONN_STATE_CLOSED;
         } else {
             ctx->req._mw.final_handler = match.handler;
             ctx->req._mw.final_user_ctx = match.user_ctx;
@@ -3708,6 +4086,8 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
             if (err != HTTPD_OK) {
                 handle_error(err, &ctx->req);
             }
+            HTTPD_LOG_REQUEST_END(ctx, conn, req_start_us, "");
+            finish_sync_request(conn, ctx);
         }
 
         return;
@@ -3715,30 +4095,53 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
 
     // No route found
     handle_error(HTTPD_ERR_NOT_FOUND, &ctx->req);
+    HTTPD_LOG_REQUEST_END(ctx, conn, req_start_us, " no-route");
+    finish_sync_request(conn, ctx);
 }
 
 static void on_http_body(connection_t* conn, uint8_t* buffer, size_t len) {
-    // Quick check using connection bitfields - avoids context lookup for sync handlers
-    // This is the hot path optimization: bitfields are O(1) vs get_request_context
-    if (!conn->deferred && !conn->continuation) {
-        // Non-deferred/non-continuation: body is received via non-blocking httpd_req_recv()
-        return;
-    }
-
     request_context_t* ctx = get_request_context(conn);
     if (!ctx) return;
 
+    // Clamp deliveries to the declared Content-Length: with a pipelining
+    // client, bytes beyond the body are the start of the next request and
+    // must not be delivered to body callbacks or dropped.
+    size_t wire = request_body_wire_received(ctx);
+    size_t remaining = (ctx->req.content_length > wire)
+                     ? ctx->req.content_length - wire : 0;
+    size_t body_len = (len < remaining) ? len : remaining;
+    size_t surplus = len - body_len;
+
+    if (!conn->deferred && !conn->continuation) {
+        // Sync handler already returned (it reads via httpd_req_recv during
+        // dispatch). Drain body bytes it did not consume so the connection can
+        // re-arm for the next keep-alive request instead of staying wedged in
+        // CONN_STATE_HTTP_BODY forever.
+        ctx->req.body_received += body_len;  // drained, never delivered
+        if (request_body_wire_received(ctx) >= ctx->req.content_length) {
+            bool close_requested = !conn->keep_alive;
+            reset_request_recv_state(conn);
+            if (surplus > 0) {
+                // Start of the next pipelined request
+                on_http_request(conn, buffer + body_len, surplus);
+            } else {
+                maybe_close_for_connection_close(conn, ctx, close_requested);
+            }
+        }
+        return;
+    }
+
     // Handle continuation-based body reception (non-blocking)
     if (conn->continuation && ctx->continuation.active) {
-        ESP_LOGD(TAG, "Continuation body: received %zu bytes", len);
+        ESP_LOGD(TAG, "Continuation body: received %zu bytes", body_len);
 
         // Call continuation handler
-        httpd_err_t err = ctx->continuation.handler(&ctx->req, buffer, len,
+        httpd_err_t err = ctx->continuation.handler(&ctx->req, buffer, body_len,
                                                      &ctx->continuation.cont);
 
         // Track received bytes
-        ctx->req.body_received += len;
-        ctx->continuation.cont.received_bytes += len;
+        ctx->req.body_received += body_len;
+        ctx->continuation.cont.received_bytes += body_len;
 
         ESP_LOGD(TAG, "Continuation body: total %zu/%zu, handler returned %d",
                  ctx->req.body_received, ctx->req.content_length, err);
@@ -3764,7 +4167,18 @@ static void on_http_body(connection_t* conn, uint8_t* buffer, size_t len) {
             // Handler finished successfully
             ctx->continuation.active = false;
             conn->continuation = 0;
-            // Connection stays open for the response to be sent
+            // Re-arm for the next keep-alive request once the body is fully
+            // received; otherwise the sync-drain path above consumes the rest.
+            if (request_body_wire_received(ctx) >= ctx->req.content_length) {
+                bool close_requested = !conn->keep_alive;
+                reset_request_recv_state(conn);
+                if (surplus > 0) {
+                    // Start of the next pipelined request
+                    on_http_request(conn, buffer + body_len, surplus);
+                } else {
+                    maybe_close_for_connection_close(conn, ctx, close_requested);
+                }
+            }
         }
         return;
     }
@@ -3774,14 +4188,14 @@ static void on_http_body(connection_t* conn, uint8_t* buffer, size_t len) {
 
     // Skip if paused (flow control) - still track bytes to avoid hanging on content-length
     if (ctx->defer.paused) {
-        ESP_LOGW(TAG, "Deferred body paused, discarding %zu bytes", len);
-        ctx->req.body_received += len;
+        ESP_LOGW(TAG, "Deferred body paused, discarding %zu bytes", body_len);
+        ctx->req.body_received += body_len;
         return;
     }
 
     // Call body callback if set
     if (ctx->defer.on_body) {
-        httpd_err_t err = ctx->defer.on_body(&ctx->req, buffer, len);
+        httpd_err_t err = ctx->defer.on_body(&ctx->req, buffer, body_len);
         if (err != HTTPD_OK) {
             // Error in callback - call done with error and close
             ESP_LOGW(TAG, "Deferred body callback returned error: %d", err);
@@ -3796,21 +4210,31 @@ static void on_http_body(connection_t* conn, uint8_t* buffer, size_t len) {
     }
 
     // Track received bytes
-    ctx->req.body_received += len;
+    ctx->req.body_received += body_len;
 
     ESP_LOGD(TAG, "Deferred body: received %zu bytes, total %zu/%zu",
-             len, ctx->req.body_received, ctx->req.content_length);
+             body_len, ctx->req.body_received, ctx->req.content_length);
 
-    // Check if body is complete
+    // Check if body is complete (wire-received: bytes left unconsumed in
+    // body_buf when on_body == NULL also count)
     if (ctx->req.content_length > 0 &&
-        ctx->req.body_received >= ctx->req.content_length) {
+        request_body_wire_received(ctx) >= ctx->req.content_length) {
         ESP_LOGD(TAG, "Deferred body complete, calling on_done");
         if (ctx->defer.on_done) {
             ctx->defer.on_done(&ctx->req, HTTPD_OK);
         }
         ctx->defer.active = false;
         conn->deferred = 0;
-        // Connection stays open for the response to be sent
+        // Re-arm for the next keep-alive request (response may still be
+        // draining from the send buffer; only receive state is reset).
+        bool close_requested = !conn->keep_alive;
+        reset_request_recv_state(conn);
+        if (surplus > 0) {
+            // Start of the next pipelined request
+            on_http_request(conn, buffer + body_len, surplus);
+        } else {
+            maybe_close_for_connection_close(conn, ctx, close_requested);
+        }
     }
 }
 
@@ -3836,6 +4260,18 @@ static void on_ws_frame(connection_t* conn, uint8_t* buffer, size_t len) {
         if (result == WS_FRAME_COMPLETE) {
             // Frame complete - deliver message to handler
             ws_opcode_internal_t opcode = (ws_opcode_internal_t)conn->ws_opcode;
+
+            // Fragmented messages are not supported (there is no cross-frame
+            // reassembly buffer). Fail the connection cleanly per RFC 6455
+            // instead of the previous behavior: delivering each fragment as
+            // an independent message and mislabeling continuations as TEXT.
+            if (!ws_is_control_frame(opcode) &&
+                (!conn->ws_fin || opcode == WS_OPCODE_CONTINUATION)) {
+                ESP_LOGW(TAG, "Fragmented WS message (opcode 0x%x fin %d) - closing: reassembly unsupported",
+                         opcode, (int)conn->ws_fin);
+                httpd_ws_close(&ws_ctx->ws, 1011, "fragmented messages unsupported");
+                return;
+            }
 
             // Map internal opcode to public type
             ws_type_t frame_type;
@@ -3952,15 +4388,13 @@ static void on_disconnect(connection_t* conn) {
         }
     }
 
-    // Handle disconnect for an in-flight continuation. The continuation data
-    // path is not called again on disconnect, so notify the handler here so it
-    // can release any resources it owns (heap state, OTA sessions, locks).
+    // Handle disconnect for continuation-mode requests: the handler owns
+    // heap state (passed via handler_state) plus possibly files/transactions,
+    // and previously was never told the upload aborted - leaking all of it.
     if (conn->continuation && ctx && ctx->continuation.active) {
-        if (ctx->continuation.on_close) {
-            ESP_LOGW(TAG, "Connection closed during continuation request");
-            ctx->continuation.on_close(&ctx->req, ctx->continuation.cont.state,
-                                       HTTPD_ERR_CONN_CLOSED);
-        }
+        ESP_LOGW(TAG, "Connection closed during continuation request");
+        ctx->continuation.cont.aborted = true;
+        ctx->continuation.handler(&ctx->req, NULL, 0, &ctx->continuation.cont);
         ctx->continuation.active = false;
         conn->continuation = 0;
     }
@@ -4014,7 +4448,21 @@ static void on_disconnect(connection_t* conn) {
         memset(ws_contexts[idx], 0, sizeof(ws_context_t));
     }
 
-    // Reset send buffer - free internal ring buffer and memory stream, keep struct
+#ifdef CONFIG_HTTPD_USE_RAW_API
+    // Hand fd ownership to the file-IO worker when a read is in flight:
+    // closing it here would let the fd number be reused and the worker's
+    // pending read would pull bytes from an unrelated file
+    if (s_file_io_pending[idx] && connection_send_buffers[idx]) {
+        connection_send_buffers[idx]->file_fd = -1;  // worker closes its copy
+        connection_send_buffers[idx]->streaming = 0;
+        connection_send_buffers[idx]->file_remaining = 0;
+    }
+#endif
+
+    // Reset send buffer - free internal ring buffer and memory stream, keep
+    // struct. Serialized against app-task WebSocket sends, which would
+    // otherwise race the free with a concurrent queue into the same buffer.
+    SEND_LOCK();
     if (connection_send_buffers[idx]) {
         if (connection_send_buffers[idx]->allocated || connection_send_buffers[idx]->mem_owned) {
             send_buffer_free(connection_send_buffers[idx]);
@@ -4022,10 +4470,11 @@ static void on_disconnect(connection_t* conn) {
             send_buffer_init(connection_send_buffers[idx]);
         }
     }
+    SEND_UNLOCK();
 }
 
 // Called by event loop when socket is writable and has pending data
-static void on_write_ready(connection_t* conn) {
+static void on_write_ready_impl(connection_t* conn) {
     send_buffer_t* sb = get_send_buffer(conn);
     request_context_t* ctx = get_request_context(conn);
 
@@ -4036,6 +4485,12 @@ static void on_write_ready(connection_t* conn) {
     for (;;) {
         // If streaming a file, refill the buffer first (zero-copy: read directly into ring buffer)
     if (send_buffer_is_streaming(sb)) {
+        // An exhausted stream (including a zero-length file) has nothing to
+        // refill; without this stop the loop's is-streaming continue below
+        // spins forever and trips the task watchdog.
+        if (sb->file_remaining == 0) {
+            send_buffer_stop_file(sb);
+        } else {
         uint8_t* write_ptr;
         size_t contiguous = send_buffer_write_ptr(sb, &write_ptr);
 
@@ -4046,12 +4501,18 @@ static void on_write_ready(connection_t* conn) {
             }
 
 #ifdef CONFIG_HTTPD_USE_RAW_API
+            (void)write_ptr;  // worker computes a fresh write pointer at commit
             // Cannot block in tcpip_thread - submit to file I/O worker
             // Worker will call on_write_ready again after read completes
             if (!send_buffer_has_data(sb)) {
-                // Only submit if we don't already have data to send
-                file_io_submit_read(conn->pool_index, sb->file_fd, write_ptr, to_read);
-                return;  // Will resume when worker signals back
+                // Only submit if we don't already have data to send.
+                // On a full queue, leave write-pending set: raw_poll_cb
+                // retries the submit on the next poll interval.
+                if (!file_io_submit_read(conn->pool_index, sb->file_fd, to_read)) {
+                    ESP_LOGD(TAG, "File I/O queue full, retrying via poll (conn [%d])",
+                             conn->pool_index);
+                }
+                return;  // Will resume when worker signals back (or poll retries)
             }
             // If we have data to send, send it first - worker will refill later
 #else
@@ -4066,11 +4527,23 @@ static void on_write_ready(connection_t* conn) {
                     send_buffer_stop_file(sb);
                     ESP_LOGD(TAG, "File streaming complete for conn [%d]", conn->pool_index);
                 }
+            } else if (bytes_read == 0) {
+                // EOF before file_remaining reached zero: the file shrank
+                // while being served. Stop streaming (the promised
+                // Content-Length cannot be honored) instead of re-reading
+                // EOF in an infinite loop, and close the connection so the
+                // peer is not left waiting for missing bytes.
+                ESP_LOGW(TAG, "Unexpected EOF streaming file (%" PRIu32 " bytes short)",
+                         sb->file_remaining);
+                send_buffer_stop_file(sb);
+                conn->state = CONN_STATE_CLOSED;
             } else if (bytes_read < 0 && errno != EAGAIN) {
                 ESP_LOGE(TAG, "File read error: %s", strerror(errno));
                 send_buffer_stop_file(sb);
+                conn->state = CONN_STATE_CLOSED;
             }
 #endif
+        }
         }
     }
 
@@ -4231,10 +4704,10 @@ static void on_write_ready(connection_t* conn) {
     if (!send_buffer_has_data(sb)) {
         connection_mark_write_pending(&g_server->connection_pool, conn->pool_index, false);
 
-        // If buffer was allocated but now empty, we can free it
-        if (sb->allocated) {
-            send_buffer_free(sb);
-        }
+        // Keep the ring allocation for the connection's lifetime: freeing it
+        // here made every buffered response on a keep-alive connection pay a
+        // 4KB free+malloc cycle. on_disconnect/httpd_stop release it.
+        // (head/tail are already reset to 0 by send_buffer_consume on empty.)
 
         // Check for async send completion
         if (ctx && ctx->async_send.active) {
@@ -4263,4 +4736,12 @@ static void on_write_ready(connection_t* conn) {
             }
         }
     }
+}
+
+// Serialized entry point (see SEND_LOCK above): the event loop's writer must
+// not interleave with app-task WebSocket sends on the same ring buffer
+static void on_write_ready(connection_t* conn) {
+    SEND_LOCK();
+    on_write_ready_impl(conn);
+    SEND_UNLOCK();
 }

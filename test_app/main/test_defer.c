@@ -709,12 +709,58 @@ static void test_defer_zero_content_length(void) {
     httpd_err_t err = httpd_req_defer(&ctx->req, test_body_callback, test_done_callback);
     TEST_ASSERT_EQUAL(HTTPD_OK, err);
 
-    // With zero content length, body is "complete" but condition checks content_length > 0
-    // So done callback should NOT be called immediately
+    // Zero content length means there is no body to wait for: on_done must
+    // fire immediately. (Regression: the old `content_length > 0` completion
+    // guard never fired here, so the request hung until the idle timeout.)
+    TEST_ASSERT_TRUE(done_callback_called);
+    TEST_ASSERT_EQUAL(HTTPD_OK, done_callback_error);
+    TEST_ASSERT_FALSE(ctx->defer.active);
+    TEST_ASSERT_EQUAL(0, conn->deferred);
+
+    stop_test_server();
+}
+
+// Regression: peer disconnect during a deferred upload must deliver
+// HTTPD_ERR_CONN_CLOSED to on_done (releases user resources/file handles)
+static void test_defer_disconnect_calls_on_done(void) {
+    start_test_server();
+    reset_test_state();
+
+    TEST_ASSERT_NOT_NULL(g_server);
+    TEST_ASSERT_NOT_NULL(g_test_request_contexts);
+
+    connection_pool_t* pool = &g_server->connection_pool;
+    int idx = 0;
+    connection_t* conn = connection_get(pool, idx);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    conn->fd = 999;
+    conn->state = CONN_STATE_HTTP_HEADERS;
+    conn->deferred = 0;
+    conn->defer_paused = 0;
+    conn->pool_index = idx;
+    conn->content_length = 100;
+    conn->bytes_received = 0;
+
+    test_request_context_t* ctx = get_test_ctx(idx);
+    TEST_ASSERT_NOT_NULL(ctx);
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->req._internal = conn;
+    ctx->req.content_length = 100;
+
+    httpd_err_t err = httpd_req_defer(&ctx->req, test_body_callback, test_done_callback);
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
+    TEST_ASSERT_TRUE(ctx->defer.active);
     TEST_ASSERT_FALSE(done_callback_called);
 
-    // Should still be in deferred mode (waiting for end of stream)
-    TEST_ASSERT_TRUE(ctx->defer.active);
+    // Simulate the event loop's disconnect path
+    TEST_ASSERT_NOT_NULL(g_server->handlers.on_disconnect);
+    g_server->handlers.on_disconnect(conn);
+
+    TEST_ASSERT_TRUE(done_callback_called);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_CONN_CLOSED, done_callback_error);
+    TEST_ASSERT_FALSE(ctx->defer.active);
+    TEST_ASSERT_EQUAL(0, conn->deferred);
 
     stop_test_server();
 }
@@ -809,6 +855,7 @@ void test_defer_run(void) {
     RUN_TEST(test_defer_body_callback_error);
     RUN_TEST(test_defer_null_body_callback);
     RUN_TEST(test_defer_zero_content_length);
+    RUN_TEST(test_defer_disconnect_calls_on_done);
     RUN_TEST(test_defer_no_connection);
     RUN_TEST(test_defer_pause_no_connection);
     RUN_TEST(test_defer_resume_no_connection);

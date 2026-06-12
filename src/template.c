@@ -2,6 +2,7 @@
 #include <string.h>
 #include <limits.h>
 #include <unistd.h>
+#include <errno.h>
 #include "esp_log.h"
 
 static const char TAG[] = "TEMPLATE";
@@ -132,12 +133,12 @@ int template_process(template_context_t* ctx,
                     size_t to_copy = ctx->delim_pos;
                     size_t avail = output_size - out_pos;
                     if (to_copy > avail) {
-                        // Not enough space - output what we can, keep remainder buffered
-                        memcpy(output + out_pos, start_delim, avail);
-                        out_pos += avail;
-                        // Shift remaining delimiter chars (rare path)
-                        ctx->delim_pos -= avail;
-                        break;  // Output full, exit loop
+                        // Not enough output space for the whole buffered
+                        // delimiter: stop without consuming the current char.
+                        // (Emitting a prefix and restarting from start_delim[0]
+                        // next call produced wrong bytes for non-repeating
+                        // delimiters and skipped an input character.)
+                        goto output_full;
                     }
                     memcpy(output + out_pos, start_delim, to_copy);
                     out_pos += to_copy;
@@ -219,6 +220,7 @@ int template_process(template_context_t* ctx,
         in_pos++;
     }
 
+output_full:
     // Don't null terminate - let caller handle it
     // The function should return the number of bytes written
     // without including null terminator
@@ -309,6 +311,13 @@ int template_process_file(template_context_t* ctx,
         }
     }
 
+    if (bytes_read < 0) {
+        // Mid-file read error must not look like success - the output is
+        // incomplete and the caller would serve/store a truncated result
+        ESP_LOGE(TAG, "Template input read error: %s", strerror(errno));
+        return -1;
+    }
+
     // Flush any trailing partial content from the state machine
     int flushed = template_flush(ctx, out_buffer, half_size);
     if (flushed > 0) {
@@ -369,7 +378,8 @@ int template_escape_html(const uint8_t* input,
 int template_var_env(const char* var_name, uint8_t* output,
                     size_t output_size, void* user_data) {
     // Skip "env." prefix if present
-    if (memcmp(var_name, "env.", 4) == 0) {
+    // strncmp (not memcmp): stops at the NUL of names shorter than 4 bytes
+    if (strncmp(var_name, "env.", 4) == 0) {
         var_name += 4;
     }
 
