@@ -1,11 +1,30 @@
 #include "private/template.h"
 #include <string.h>
+#include <stdlib.h>
 #include <limits.h>
 #include <unistd.h>
 #include <errno.h>
 #include "esp_log.h"
 
 static const char TAG[] = "TEMPLATE";
+
+// Upper bound for the per-context reusable escape scratch buffer. Values
+// needing more room than this fall back to a one-shot heap buffer sized to
+// the real output room (identical to the previous per-variable behavior), so
+// large values still render in full - we just don't pin an oversized
+// allocation on the context. In practice template_process_file works in
+// half-buffer chunks of ~2KB, well under this cap.
+#define TEMPLATE_ESCAPE_SCRATCH_MAX 4096
+
+// Idempotent release of the reusable escape scratch. Safe to call at any
+// point (free(NULL) is a no-op) and after this the context is back in the
+// "no scratch" state, so a later processing run simply re-allocates.
+static void template_free_escape_scratch(template_context_t* ctx) {
+    if (!ctx) return;
+    free(ctx->escape_scratch);
+    ctx->escape_scratch = NULL;
+    ctx->escape_scratch_size = 0;
+}
 
 // Template parser states
 enum {
@@ -58,13 +77,28 @@ void template_init(template_context_t* ctx,
     ctx->state = TEMPLATE_STATE_TEXT;
     ctx->var_name_len = 0;
     ctx->delim_pos = 0;
+
+    // Escape scratch starts empty on EVERY init path. We must NOT free a
+    // previous pointer here: callers (e.g. the test apps) pass uninitialized
+    // stack contexts to template_init, so any pre-existing field value may be
+    // garbage. Consequence: re-initializing a context that processed large
+    // escaped values without an intervening template_flush leaks the scratch
+    // (documented on the struct field).
+    ctx->escape_scratch = NULL;
+    ctx->escape_scratch_size = 0;
 }
 
-int template_process(template_context_t* ctx,
-                    const uint8_t* input,
-                    size_t input_len,
-                    uint8_t* output,
-                    size_t output_size) {
+// Internal process loop. Identical to the public template_process() but also
+// reports, via *consumed, how many input bytes were consumed. This is required
+// because the return value is bytes WRITTEN, which diverges from bytes consumed
+// whenever substitution or HTML-escaping expands the data. template_process_file
+// relies on *consumed to advance through its input without dropping the tail.
+static int template_process_impl(template_context_t* ctx,
+                                 const uint8_t* input,
+                                 size_t input_len,
+                                 uint8_t* output,
+                                 size_t output_size,
+                                 size_t* consumed) {
     size_t in_pos = 0;
     size_t out_pos = 0;
 
@@ -78,6 +112,7 @@ int template_process(template_context_t* ctx,
     if (!start_delim || !end_delim || delim_len_start == 0 || delim_len_end == 0) {
         size_t to_copy = input_len < output_size ? input_len : output_size;
         memcpy(output, input, to_copy);
+        if (consumed) *consumed = to_copy;
         return to_copy;
     }
 
@@ -91,6 +126,7 @@ int template_process(template_context_t* ctx,
             // No delimiter found - copy entire input
             size_t to_copy = input_len < output_size ? input_len : output_size;
             memcpy(output, input, to_copy);
+            if (consumed) *consumed = to_copy;
             return to_copy;
         }
         // Copy text before delimiter
@@ -163,19 +199,67 @@ int template_process(template_context_t* ctx,
                         if (ctx->callback) {
                             size_t avail = output_size - out_pos;
                             if (ctx->config.escape_html) {
-                                // Write to temp buffer, then escape into output
-                                uint8_t tmp[128];
-                                size_t tmp_avail = sizeof(tmp) < avail ? sizeof(tmp) : avail;
-                                int written = ctx->callback(ctx->var_name,
-                                                           tmp, tmp_avail,
-                                                           ctx->user_data);
-                                if (written > 0) {
-                                    size_t src_len = ((size_t)written <= tmp_avail) ? (size_t)written : tmp_avail;
-                                    int escaped = template_escape_html(tmp, src_len,
-                                                                      output + out_pos, avail);
-                                    if (escaped > 0) out_pos += escaped;
-                                } else if (written < 0) {
-                                    ESP_LOGW(TAG, "Variable callback error for '%s'", ctx->var_name);
+                                // Render the variable value, then HTML-escape it
+                                // into the output. A value can be at most `avail`
+                                // bytes before it would overflow output even with
+                                // no escaping, so a scratch buffer of `avail`
+                                // bytes captures the full value. Sizing to `avail`
+                                // (rather than a fixed 128-byte cap) prevents
+                                // truncating large values such as JSON blobs.
+                                if (avail > 0) {
+                                    uint8_t stack_tmp[128];
+                                    uint8_t* tmp = stack_tmp;
+                                    size_t tmp_size = sizeof(stack_tmp);
+                                    uint8_t* oneshot = NULL;
+                                    if (avail > tmp_size) {
+                                        // Value could exceed the modest stack
+                                        // buffer: back it with a heap buffer sized
+                                        // to the real output room. On OOM fall back
+                                        // to the stack buffer (value capped at 128
+                                        // raw bytes but never overruns output).
+                                        if (avail <= TEMPLATE_ESCAPE_SCRATCH_MAX) {
+                                            // Reusable per-context scratch: grown to
+                                            // the largest `avail` seen this run and
+                                            // reused for every subsequent variable.
+                                            // Previously this path did a malloc/free
+                                            // round trip of ~2KB PER VARIABLE (20
+                                            // variables = 20 round trips). Freed by
+                                            // template_flush at end of run.
+                                            if (ctx->escape_scratch_size < avail) {
+                                                free(ctx->escape_scratch); // contents are transient
+                                                ctx->escape_scratch = malloc(avail);
+                                                ctx->escape_scratch_size =
+                                                    ctx->escape_scratch ? avail : 0;
+                                            }
+                                            if (ctx->escape_scratch) {
+                                                tmp = ctx->escape_scratch;
+                                                tmp_size = avail;
+                                            }
+                                        } else {
+                                            // avail exceeds the scratch cap: keep the
+                                            // previous behavior exactly (one-shot heap
+                                            // buffer sized to the real output room)
+                                            // rather than pinning a huge allocation on
+                                            // the context.
+                                            oneshot = malloc(avail);
+                                            if (oneshot) {
+                                                tmp = oneshot;
+                                                tmp_size = avail;
+                                            }
+                                        }
+                                    }
+                                    int written = ctx->callback(ctx->var_name,
+                                                               tmp, tmp_size,
+                                                               ctx->user_data);
+                                    if (written > 0) {
+                                        size_t src_len = ((size_t)written <= tmp_size) ? (size_t)written : tmp_size;
+                                        int escaped = template_escape_html(tmp, src_len,
+                                                                          output + out_pos, avail);
+                                        if (escaped > 0) out_pos += escaped;
+                                    } else if (written < 0) {
+                                        ESP_LOGW(TAG, "Variable callback error for '%s'", ctx->var_name);
+                                    }
+                                    free(oneshot); // NULL-safe; only set on the >cap path
                                 }
                             } else {
                                 int written = ctx->callback(ctx->var_name,
@@ -224,7 +308,19 @@ output_full:
     // Don't null terminate - let caller handle it
     // The function should return the number of bytes written
     // without including null terminator
+    if (consumed) *consumed = in_pos;
     return (out_pos <= (size_t)INT_MAX) ? (int)out_pos : INT_MAX;
+}
+
+int template_process(template_context_t* ctx,
+                    const uint8_t* input,
+                    size_t input_len,
+                    uint8_t* output,
+                    size_t output_size) {
+    // Public entry point: preserves the historic "bytes written" return value
+    // and drops the consumed count (callers that must not lose input use
+    // template_process_file, which threads the consumed count internally).
+    return template_process_impl(ctx, input, input_len, output, output_size, NULL);
 }
 
 int template_flush(template_context_t* ctx,
@@ -270,6 +366,11 @@ int template_flush(template_context_t* ctx,
         ctx->delim_pos = 0;
     }
 
+    // Flush is the terminal call of a processing run: release the reusable
+    // escape scratch so a parked/idle context holds no heap. Idempotent, so
+    // an extra flush (or a follow-up run re-allocating it) is fine.
+    template_free_escape_scratch(ctx);
+
     // Null terminate if there's room
     if (out_pos < output_size) {
         output[out_pos] = '\0';
@@ -291,23 +392,57 @@ int template_process_file(template_context_t* ctx,
     int total_written = 0;
     ssize_t bytes_read;
 
+    if (half_size == 0) {
+        ESP_LOGE(TAG, "Template buffer too small");
+        // Free any scratch carried over from a prior abandoned run; every
+        // exit from file processing leaves the context heap-free because the
+        // caller may not call template_flush after an error return.
+        template_free_escape_scratch(ctx);
+        return -1;
+    }
+
     while ((bytes_read = read(in_fd, in_buffer, half_size)) > 0) {
-        int bytes_processed = template_process(ctx,
-                                              in_buffer,
-                                              bytes_read,
-                                              out_buffer,
-                                              half_size);
-        if (bytes_processed > 0) {
-            ssize_t written = 0;
-            while (written < bytes_processed) {
-                ssize_t w = write(out_fd, out_buffer + written, bytes_processed - written);
-                if (w <= 0) {
-                    ESP_LOGE(TAG, "Failed to write output");
-                    return -1;
+        // A single template_process() call returns bytes WRITTEN, which can be
+        // fewer input bytes than were read once substitution/HTML-escaping
+        // expands the data and fills the output half. Loop over the input
+        // slice, draining it fully through template_process_impl() with a fresh
+        // output buffer each pass, using the consumed count to advance. This
+        // prevents silently dropping the unconsumed input tail.
+        size_t avail_in = (size_t)bytes_read;
+        size_t in_off = 0;
+        while (in_off < avail_in) {
+            size_t consumed = 0;
+            int bytes_processed = template_process_impl(ctx,
+                                                  in_buffer + in_off,
+                                                  avail_in - in_off,
+                                                  out_buffer,
+                                                  half_size,
+                                                  &consumed);
+            if (bytes_processed > 0) {
+                ssize_t written = 0;
+                while (written < bytes_processed) {
+                    ssize_t w = write(out_fd, out_buffer + written, bytes_processed - written);
+                    if (w <= 0) {
+                        ESP_LOGE(TAG, "Failed to write output");
+                        // Early error exit bypasses template_flush - free the
+                        // scratch here so the error path cannot leak it.
+                        template_free_escape_scratch(ctx);
+                        return -1;
+                    }
+                    written += w;
                 }
-                written += w;
+                total_written += bytes_processed;
             }
-            total_written += bytes_processed;
+            if (consumed == 0) {
+                // No forward progress: a fresh output half of half_size bytes
+                // cannot hold even one expanded unit of the next input (e.g. a
+                // single escaped char or a buffered delimiter). Surface an error
+                // instead of spinning forever.
+                ESP_LOGE(TAG, "Template output buffer too small to make progress");
+                template_free_escape_scratch(ctx);
+                return -1;
+            }
+            in_off += consumed;
         }
     }
 
@@ -315,6 +450,7 @@ int template_process_file(template_context_t* ctx,
         // Mid-file read error must not look like success - the output is
         // incomplete and the caller would serve/store a truncated result
         ESP_LOGE(TAG, "Template input read error: %s", strerror(errno));
+        template_free_escape_scratch(ctx);
         return -1;
     }
 

@@ -1237,6 +1237,116 @@ static void test_radix_mixed_param_wildcard(void) {
     radix_tree_destroy(tree);
 }
 
+// ========== Backtracking: sibling branches must not shadow valid routes ==========
+
+// A static sibling that dead-ends must not shadow a valid param route that
+// only reveals itself deeper in the path.
+static void test_radix_backtrack_static_sibling_then_param(void) {
+    ESP_LOGI(TAG, "Test: static sibling backtracks to param route");
+
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    // Static "/files/shared" and param "/files/:name/download"
+    radix_insert(tree, "/files/shared", HTTP_GET, test_handler_1, (void*)1, NULL, 0);
+    radix_insert(tree, "/files/:name/download", HTTP_GET, test_handler_2, (void*)2, NULL, 0);
+
+    // "/files/shared/download": static "shared" matches then dead-ends, so the
+    // matcher must backtrack and take the :name/download branch.
+    radix_match_t m1;
+    radix_lookup(tree, "/files/shared/download", HTTP_GET, false, &m1, NULL, NULL);
+    TEST_ASSERT_TRUE(m1.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_2, m1.handler);
+    TEST_ASSERT_EQUAL(1, m1.param_count);
+    TEST_ASSERT_EQUAL_STRING_LEN("name", m1.params[0].key, m1.params[0].key_len);
+    TEST_ASSERT_EQUAL_STRING_LEN("shared", m1.params[0].value, m1.params[0].value_len);
+
+    // The static leaf itself still matches with no params.
+    radix_match_t m2;
+    radix_lookup(tree, "/files/shared", HTTP_GET, false, &m2, NULL, NULL);
+    TEST_ASSERT_TRUE(m2.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_1, m2.handler);
+    TEST_ASSERT_EQUAL(0, m2.param_count);
+
+    // Another name still routes through the param branch.
+    radix_match_t m3;
+    radix_lookup(tree, "/files/report/download", HTTP_GET, false, &m3, NULL, NULL);
+    TEST_ASSERT_TRUE(m3.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_2, m3.handler);
+    TEST_ASSERT_EQUAL(1, m3.param_count);
+    TEST_ASSERT_EQUAL_STRING_LEN("report", m3.params[0].value, m3.params[0].value_len);
+
+    radix_tree_destroy(tree);
+}
+
+// A wildcard must be a last resort: a param route sharing the prefix must be
+// reachable even for a multi-segment request that the wildcard could also eat.
+static void test_radix_backtrack_param_vs_wildcard_multi_segment(void) {
+    ESP_LOGI(TAG, "Test: param route wins over wildcard for multi-segment path");
+
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    // Param "/files/:id/edit" and catch-all "/files/*"
+    radix_insert(tree, "/files/:id/edit", HTTP_GET, test_handler_1, (void*)1, NULL, 0);
+    radix_insert(tree, "/files/*", HTTP_GET, test_handler_2, (void*)2, NULL, 0);
+
+    // "/files/7/edit": the more specific :id/edit route must win even though the
+    // wildcard could consume "7/edit".
+    radix_match_t m1;
+    radix_lookup(tree, "/files/7/edit", HTTP_GET, false, &m1, NULL, NULL);
+    TEST_ASSERT_TRUE(m1.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_1, m1.handler);
+    TEST_ASSERT_EQUAL(1, m1.param_count);
+    TEST_ASSERT_EQUAL_STRING_LEN("id", m1.params[0].key, m1.params[0].key_len);
+    TEST_ASSERT_EQUAL_STRING_LEN("7", m1.params[0].value, m1.params[0].value_len);
+
+    // A path the param route cannot satisfy falls through to the wildcard.
+    radix_match_t m2;
+    radix_lookup(tree, "/files/7/delete", HTTP_GET, false, &m2, NULL, NULL);
+    TEST_ASSERT_TRUE(m2.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_2, m2.handler);
+    TEST_ASSERT_EQUAL(1, m2.param_count);
+    TEST_ASSERT_EQUAL_STRING_LEN("*", m2.params[0].key, m2.params[0].key_len);
+    TEST_ASSERT_EQUAL_STRING_LEN("7/delete", m2.params[0].value, m2.params[0].value_len);
+
+    radix_tree_destroy(tree);
+}
+
+// A param binding made on a branch that is later abandoned must not leak into
+// the route that ultimately matches.
+static void test_radix_backtrack_param_no_leak(void) {
+    ESP_LOGI(TAG, "Test: abandoned param binding does not leak");
+
+    radix_tree_t* tree = radix_tree_create();
+    TEST_ASSERT_NOT_NULL(tree);
+
+    // Param branch "/a/:p/x" (binds :p) and catch-all "/a/*"
+    radix_insert(tree, "/a/:p/x", HTTP_GET, test_handler_1, (void*)1, NULL, 0);
+    radix_insert(tree, "/a/*", HTTP_GET, test_handler_2, (void*)2, NULL, 0);
+
+    // "/a/b/y": the :p branch binds p=b, then "x" != "y" dead-ends. The matcher
+    // rolls back p and takes the wildcard. Only "*" must remain in params.
+    radix_match_t m;
+    radix_lookup(tree, "/a/b/y", HTTP_GET, false, &m, NULL, NULL);
+    TEST_ASSERT_TRUE(m.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_2, m.handler);
+    TEST_ASSERT_EQUAL(1, m.param_count);  // No leaked "p" binding
+    TEST_ASSERT_EQUAL_STRING_LEN("*", m.params[0].key, m.params[0].key_len);
+    TEST_ASSERT_EQUAL_STRING_LEN("b/y", m.params[0].value, m.params[0].value_len);
+
+    // And the param branch still matches when it should.
+    radix_match_t m2;
+    radix_lookup(tree, "/a/b/x", HTTP_GET, false, &m2, NULL, NULL);
+    TEST_ASSERT_TRUE(m2.matched);
+    TEST_ASSERT_EQUAL_PTR(test_handler_1, m2.handler);
+    TEST_ASSERT_EQUAL(1, m2.param_count);
+    TEST_ASSERT_EQUAL_STRING_LEN("p", m2.params[0].key, m2.params[0].key_len);
+    TEST_ASSERT_EQUAL_STRING_LEN("b", m2.params[0].value, m2.params[0].value_len);
+
+    radix_tree_destroy(tree);
+}
+
 // ========== Issue #3: Method bounds check in radix_insert ==========
 
 static void test_radix_insert_invalid_method(void) {
@@ -1316,6 +1426,11 @@ void test_radix_tree_run(void) {
     RUN_TEST(test_radix_null_inputs);
     RUN_TEST(test_radix_param_with_static_suffix);
     RUN_TEST(test_radix_mixed_param_wildcard);
+
+    // Backtracking: sibling branches must not shadow valid routes
+    RUN_TEST(test_radix_backtrack_static_sibling_then_param);
+    RUN_TEST(test_radix_backtrack_param_vs_wildcard_multi_segment);
+    RUN_TEST(test_radix_backtrack_param_no_leak);
 
     // Bug fix regression tests
     RUN_TEST(test_radix_insert_invalid_method);

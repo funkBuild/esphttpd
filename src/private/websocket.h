@@ -29,6 +29,11 @@ typedef enum {
 // Grows dynamically via ensure_payload_buffer() for larger payloads
 #define WS_DEFAULT_BUFFER_SIZE 128
 
+// When a new frame starts and payload_buffer has been ratcheted above this
+// size by an earlier large frame, it is shrunk back to WS_DEFAULT_BUFFER_SIZE
+// (large buffers should not persist for the lifetime of the connection).
+#define WS_PAYLOAD_SHRINK_THRESHOLD 1024
+
 // WebSocket frame info (per-connection state)
 typedef struct {
     uint8_t state;               // ws_frame_state_t (only 7 enum values)
@@ -37,6 +42,7 @@ typedef struct {
     uint8_t length_bytes_needed; // Extended length bytes needed
     uint32_t payload_length;     // Accumulated payload length (max 65535)
     uint8_t* payload_buffer;     // Buffer to accumulate payload data
+    const uint8_t* payload_ptr;  // Valid payload location after WS_FRAME_COMPLETE (may point into the caller's recv slice or into payload_buffer); NULL only when payload_length==0. Valid only until the next ws_process_frame call.
     uint16_t payload_buffer_size; // Allocated size (max WS_MAX_PAYLOAD_SIZE=8192)
     uint16_t payload_received;   // Bytes of payload received so far
 } ws_frame_context_t;
@@ -71,13 +77,30 @@ void ws_mask_payload(uint8_t* payload,
 
 // Send callback type: used to route WebSocket sends through the server's
 // non-blocking send infrastructure instead of direct write() syscalls.
-// Signature: (connection, data, len) -> bytes sent/queued, or -1 on error
-typedef ssize_t (*ws_send_func_t)(connection_t* conn, const void* data, size_t len);
+// Signature: (connection, data, len, flags) -> bytes sent/queued, or -1 on
+// error. flags carries send(2) flags (e.g. MSG_MORE when another part of the
+// same frame immediately follows) and is forwarded to the underlying send().
+typedef ssize_t (*ws_send_func_t)(connection_t* conn, const void* data, size_t len, int flags);
 
 // Set the send function used by WebSocket frame sending.
 // Called by the server during init to route sends through send_nonblocking().
 // When NULL (default), falls back to blocking write(conn->fd, ...) for tests.
 void ws_set_send_func(ws_send_func_t func);
+
+// Two-buffer scatter-gather send callback: transmits [buf0][buf1] in order as
+// ONE logical send (a single writev on the server's socket path — no
+// MSG_MORE workaround, no copy). Returns total bytes sent/queued, or -1 on
+// error. Used by ws_send_frame for frames >256B: buf0 = frame header,
+// buf1 = payload.
+typedef ssize_t (*ws_send2_func_t)(connection_t* conn,
+                                   const void* buf0, size_t len0,
+                                   const void* buf1, size_t len1);
+
+// Set the two-buffer send function, registered by the server next to
+// ws_set_send_func. OPTIONAL: when NULL (default — tests/standalone), large
+// frames fall back to two ws_send_func_t calls with MSG_MORE on the header
+// part, so existing mocks keep working unchanged.
+void ws_set_send2_func(ws_send2_func_t func);
 
 // Send a WebSocket frame (builds header + payload and sends via send callback)
 int ws_send_frame(connection_t* conn,

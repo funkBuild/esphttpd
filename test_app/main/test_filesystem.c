@@ -315,7 +315,52 @@ static void test_validate_path_percent_valid_hex_lowercase(void) {
 // Test Runner
 // ============================================================================
 
+// Fix 6: max_open_files must count in-flight async streams. filesystem_send_file
+// increments open_files at handoff and no longer decrements immediately; the
+// count is released only when the send buffer actually closes the streamed fd,
+// via the close hook the server registers. This exercises that boundary without
+// needing a mounted filesystem (mock fd).
+extern void send_buffer_set_file_close_cb(void (*cb)(void));
+static filesystem_t* s_fs_count_owner = NULL;
+static void fs_count_release_cb(void) {
+    if (s_fs_count_owner && s_fs_count_owner->open_files > 0) {
+        s_fs_count_owner->open_files--;
+    }
+}
+
+static void test_open_files_tracks_in_flight_stream(void) {
+    filesystem_t fs;
+    memset(&fs, 0, sizeof(fs));
+    fs.max_open_files = 5;
+    fs.open_files = 0;
+
+    s_fs_count_owner = &fs;
+    send_buffer_set_file_close_cb(fs_count_release_cb);
+
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+
+    // Handoff: increment (as filesystem_send_file does) + transfer the still-open
+    // fd to the send buffer for the stream's lifetime.
+    fs.open_files++;
+    send_buffer_start_file(&sb, 91 /* mock fd */, 1024);
+
+    // In-flight stream is counted (the fix: NOT decremented at handoff).
+    TEST_ASSERT_EQUAL(1, fs.open_files);
+
+    // Completion closes the fd, which releases the count via the hook.
+    send_buffer_stop_file(&sb);
+    TEST_ASSERT_EQUAL(0, fs.open_files);
+
+    send_buffer_set_file_close_cb(NULL);
+    s_fs_count_owner = NULL;
+    send_buffer_free(&sb);
+}
+
 void test_filesystem_run(void) {
+    // In-flight stream accounting
+    RUN_TEST(test_open_files_tracks_in_flight_stream);
+
     // Valid path tests
     RUN_TEST(test_validate_path_simple);
     RUN_TEST(test_validate_path_nested);

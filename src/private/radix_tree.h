@@ -78,9 +78,13 @@ typedef struct {
     httpd_ws_handler_t ws_handler;        // WebSocket handler
     void* ws_user_ctx;
     uint32_t ws_ping_interval;
-    uint8_t http_method_mask;             // Bitmask of methods with handlers
     bool has_ws;                          // Has WebSocket handler
-    bool has_trailing_slash;              // Route registered with trailing slash (for strict mode)
+    // Route registered with a trailing slash (only consulted in strict mode).
+    // LIMITATION: "/x" and "/x/" traverse to the SAME node and therefore share
+    // this single flag. In strict mode they cannot both be represented on one
+    // node; whichever route is registered last wins, and the other becomes
+    // unreachable. Default routing is non-strict, where this flag is ignored.
+    bool has_trailing_slash;
 } node_handlers_t;
 
 // ============================================================================
@@ -91,9 +95,8 @@ typedef struct {
  * @brief Radix tree node structure
  */
 struct radix_node {
-    // All pointers first (28 bytes, 4-byte aligned)
+    // All pointers first (24 bytes, 4-byte aligned)
     char* segment;                        // Heap allocated, e.g. "users", ":id"
-    const char* param_name;               // For NODE_PARAM: points into segment after ':'
     radix_node_t** children;              // Dynamic array of child pointers (sorted by first char)
     radix_node_t* param_child;            // :param child
     radix_node_t* wildcard_child;         // * child
@@ -188,6 +191,12 @@ void radix_tree_set_case_sensitive(radix_tree_t* tree, bool case_sensitive);
  * @brief Set strict routing mode (trailing slash significance)
  * @param tree Tree to configure
  * @param strict True to distinguish /path from /path/, false to treat as same (default)
+ *
+ * @note LIMITATION: "/path" and "/path/" resolve to the same tree node and
+ *       share a single has_trailing_slash flag (see node_handlers_t). In strict
+ *       mode a node can only remember one variant, so registering BOTH "/path"
+ *       and "/path/" makes the earlier one unreachable (the later insert
+ *       overwrites the flag). Non-strict mode (the default) is unaffected.
  */
 void radix_tree_set_strict(radix_tree_t* tree, bool strict);
 

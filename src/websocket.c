@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <inttypes.h>
 #include <arpa/inet.h>
+#include "lwip/sockets.h"
 #include "esp_log.h"
 #include "mbedtls/sha1.h"
 #include "mbedtls/base64.h"
@@ -11,22 +12,43 @@
 static const char TAG[] = "WS_FRAME";
 static const char WS_GUID[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+// MSG_MORE hints the stack that another part of the same logical frame
+// follows immediately (header -> payload), so it can coalesce the two
+// sends into one segment. Not all socket layers define it.
+#ifdef MSG_MORE
+#define WS_MSG_MORE MSG_MORE
+#else
+#define WS_MSG_MORE 0
+#endif
+
 // Send function callback - set once by httpd_start() and cleared by httpd_stop().
 // No synchronization needed: writes occur only during server lifecycle transitions,
 // never concurrently with reads from the send path.
 static volatile ws_send_func_t s_send_func = NULL;
 
+// Optional two-buffer scatter-gather send callback (single writev for
+// [frame_header, payload]). Registered/cleared alongside s_send_func; when
+// NULL, large frames use the two-part MSG_MORE fallback below.
+static volatile ws_send2_func_t s_send2_func = NULL;
+
 void ws_set_send_func(ws_send_func_t func) {
     s_send_func = func;
 }
 
+void ws_set_send2_func(ws_send2_func_t func) {
+    s_send2_func = func;
+}
+
 // Internal helper: send data through the registered send function, or fall
 // back to write() when no send function is registered (test mode).
-static ssize_t ws_do_send(connection_t* conn, const void* data, size_t len) {
+// flags are forwarded to the send function (e.g. WS_MSG_MORE on the header
+// part of a two-part frame send); the write() fallback ignores them.
+static ssize_t ws_do_send(connection_t* conn, const void* data, size_t len, int flags) {
     if (s_send_func) {
-        return s_send_func(conn, data, len);
+        return s_send_func(conn, data, len, flags);
     }
-    // Fallback for tests and standalone usage
+    // Fallback for tests and standalone usage (flags not applicable)
+    (void)flags;
     return write(conn->fd, data, len);
 }
 
@@ -42,6 +64,7 @@ bool ws_frame_ctx_init(ws_frame_context_t* ctx) {
     ctx->length_bytes_needed = 0;
     ctx->payload_length = 0;
     ctx->payload_received = 0;
+    ctx->payload_ptr = NULL;
 
     // Pre-allocate buffer if not already present or too small
     if (ctx->payload_buffer_size < WS_DEFAULT_BUFFER_SIZE) {
@@ -77,6 +100,34 @@ static bool ensure_payload_buffer(ws_frame_context_t* ctx, size_t required_size)
     ctx->payload_buffer = new_buffer;
     ctx->payload_buffer_size = required_size;
     return true;
+}
+
+// Shrink the payload buffer back to WS_DEFAULT_BUFFER_SIZE when an earlier
+// large frame ratcheted it above WS_PAYLOAD_SHRINK_THRESHOLD, so large
+// allocations do not persist for the lifetime of the connection.
+// Only called at the start of a NEW frame: the previous frame's payload_ptr
+// is no longer valid by contract (it lives only until the next
+// ws_process_frame call), so freeing the buffer here cannot invalidate a
+// live payload reference. Callers must skip this for continuation frames
+// so fragmented-message accumulation is never disturbed.
+static void maybe_shrink_payload_buffer(ws_frame_context_t* ctx) {
+    if (ctx->payload_buffer_size <= WS_PAYLOAD_SHRINK_THRESHOLD) {
+        return;
+    }
+    // free + malloc rather than realloc: a shrinking realloc may keep the
+    // block in place and never release the large allocation.
+    free(ctx->payload_buffer);
+    ctx->payload_buffer = malloc(WS_DEFAULT_BUFFER_SIZE);
+    if (ctx->payload_buffer) {
+        ctx->payload_buffer_size = WS_DEFAULT_BUFFER_SIZE;
+    } else {
+        // Not fatal: ensure_payload_buffer() re-allocates on demand
+        // (realloc(NULL, n) == malloc(n)).
+        ctx->payload_buffer_size = 0;
+    }
+    // The stale pointer may reference the freed buffer; clear it so a
+    // misbehaving caller faults predictably instead of reading freed memory.
+    ctx->payload_ptr = NULL;
 }
 
 ws_frame_result_t ws_process_frame(connection_t* conn,
@@ -126,6 +177,12 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
 
         // Fast path only for small masked frames (most common: ~90% of client frames)
         if (__builtin_expect(payload_len < 126 && masked, 1)) {
+            // New frame starting: release a ratcheted payload buffer.
+            // Skipped for continuation frames so an in-progress fragmented
+            // message's accumulation buffer is never freed under it.
+            if (opcode != WS_OPCODE_CONTINUATION) {
+                maybe_shrink_payload_buffer(ctx);
+            }
             conn->ws_fin = fin;
             conn->ws_opcode = opcode;
             conn->ws_masked = 1;
@@ -168,6 +225,13 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
                     return WS_FRAME_ERROR;
                 }
 
+                // New frame starting: release a ratcheted payload buffer.
+                // Skipped for continuation frames so an in-progress fragmented
+                // message's accumulation buffer is never freed under it.
+                if (conn->ws_opcode != WS_OPCODE_CONTINUATION) {
+                    maybe_shrink_payload_buffer(ctx);
+                }
+
                 ctx->state = WS_STATE_LENGTH;
                 i++;
                 break;
@@ -177,6 +241,14 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
                 uint8_t second_byte = buffer[i];
                 conn->ws_masked = ws_is_masked(second_byte);
                 uint8_t payload_len = ws_get_payload_length(second_byte);
+
+                // RFC 6455 5.1: a server MUST fail the connection on any
+                // unmasked frame received from a client. Every frame reaching
+                // ws_process_frame is client->server, so the mask bit is required.
+                if (__builtin_expect(!conn->ws_masked, 0)) {
+                    ESP_LOGE(TAG, "Unmasked frame from client rejected");
+                    return WS_FRAME_ERROR;
+                }
 
                 // Most common case: payload_len < 126 (~95% of messages)
                 if (__builtin_expect(payload_len < 126, 1)) {
@@ -193,16 +265,29 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
                             }
                         }
                         conn->ws_payload_read = 0;
+                        ctx->payload_ptr = NULL;  // zero-length frame
                         ctx->state = WS_STATE_COMPLETE;
                         *bytes_consumed = i + 1;
                         return WS_FRAME_COMPLETE;
                     }
                     ctx->state = conn->ws_masked ? WS_STATE_MASK : WS_STATE_PAYLOAD;
                 } else if (payload_len == 126) {
+                    // RFC 6455 5.5: control frames MUST NOT use the 126/127
+                    // extended length forms (payload must be <= 125).
+                    if (__builtin_expect(ws_is_control_frame(conn->ws_opcode), 0)) {
+                        ESP_LOGE(TAG, "Control frame with 16-bit extended length");
+                        return WS_FRAME_ERROR;
+                    }
                     ctx->state = WS_STATE_LENGTH_EXT_16;
                     ctx->length_bytes_needed = 2;
                     conn->ws_payload_len = 0;
                 } else { // payload_len == 127
+                    // RFC 6455 5.5: control frames MUST NOT use the 126/127
+                    // extended length forms (payload must be <= 125).
+                    if (__builtin_expect(ws_is_control_frame(conn->ws_opcode), 0)) {
+                        ESP_LOGE(TAG, "Control frame with 64-bit extended length");
+                        return WS_FRAME_ERROR;
+                    }
                     ctx->state = WS_STATE_LENGTH_EXT_64;
                     ctx->length_bytes_needed = 8;
                     ctx->payload_length = 0;
@@ -242,6 +327,14 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
                 i++;
 
                 if (ctx->length_bytes_needed == 0) {
+                    // Control frames must have payload <= 125 (RFC 6455 5.5).
+                    // Control opcodes are already rejected at WS_STATE_LENGTH
+                    // before entering the extended-length forms; this is a
+                    // defense-in-depth guard mirroring the 16-bit path.
+                    if (ws_is_control_frame(conn->ws_opcode) && ctx->payload_length > 125) {
+                        ESP_LOGE(TAG, "Control frame payload too large");
+                        return WS_FRAME_ERROR;
+                    }
                     // We only support up to 64KB payloads
                     if (ctx->payload_length > 65535) {
                         ESP_LOGE(TAG, "Payload too large: %" PRIu32, ctx->payload_length);
@@ -280,17 +373,34 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
                 // Cache control frame check result to avoid duplicate function calls
                 bool is_control = ws_is_control_frame(conn->ws_opcode);
 
-                // Allocate payload buffer on first entry (if not a control frame)
-                if (ctx->payload_received == 0 && conn->ws_payload_len > 0 && !is_control) {
-                    if (!ensure_payload_buffer(ctx, conn->ws_payload_len)) {
-                        return WS_FRAME_ERROR;
-                    }
+                // Enforce the max payload size on first entry for every path.
+                // The copy path re-checks inside ensure_payload_buffer(); the
+                // zero-copy path never allocates, so it needs this gate.
+                if (ctx->payload_received == 0 && !is_control &&
+                    conn->ws_payload_len > WS_MAX_PAYLOAD_SIZE) {
+                    ESP_LOGE(TAG, "Payload too large: %" PRIu16 " > %d",
+                             conn->ws_payload_len, WS_MAX_PAYLOAD_SIZE);
+                    return WS_FRAME_ERROR;
                 }
 
                 size_t payload_remaining = conn->ws_payload_len - ctx->payload_received;
                 size_t buffer_remaining = buffer_len - i;
                 size_t to_process = payload_remaining < buffer_remaining ?
                                    payload_remaining : buffer_remaining;
+
+                // Zero-copy eligibility: a non-fragmented data frame whose
+                // entire payload sits in the current input slice (no payload
+                // bytes were buffered by a previous call and the frame
+                // completes right here). The payload is unmasked in place in
+                // the caller's buffer, so it can be delivered via payload_ptr
+                // without copying into payload_buffer. Fragments (FIN=0) and
+                // continuation frames always take the accumulation path.
+                bool zero_copy = !is_control &&
+                                 conn->ws_fin &&
+                                 conn->ws_opcode != WS_OPCODE_CONTINUATION &&
+                                 ctx->payload_received == 0 &&
+                                 to_process == payload_remaining;
+                const uint8_t* slice_payload = &buffer[i];
 
                 // Unmask in place if needed (ws_mask_payload handles zero-length gracefully)
                 if (conn->ws_masked) {
@@ -305,10 +415,18 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
                         return WS_FRAME_ERROR;
                     }
                     memcpy(ctx->payload_buffer + ctx->payload_received, &buffer[i], to_process);
-                } else {
-                    // Copy unmasked data to payload buffer for data frames
+                } else if (!zero_copy) {
+                    // Accumulation path: frame spans input slices or is part
+                    // of a fragmented message. Allocate on first entry.
+                    if (ctx->payload_received == 0 && conn->ws_payload_len > 0) {
+                        if (!ensure_payload_buffer(ctx, conn->ws_payload_len)) {
+                            return WS_FRAME_ERROR;
+                        }
+                    }
                     memcpy(ctx->payload_buffer + ctx->payload_received, &buffer[i], to_process);
                 }
+                // zero_copy: payload already unmasked in place in the
+                // caller's buffer - no copy needed.
 
                 ctx->payload_received += to_process;
                 i += to_process;
@@ -323,6 +441,17 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
                             return ctrl_result;
                         }
                     }
+                    // Publish the payload location for this frame:
+                    //  - NULL for zero-length payloads
+                    //  - into the caller's input slice for zero-copy frames
+                    //  - payload_buffer for accumulated/control frames
+                    if (ctx->payload_received == 0) {
+                        ctx->payload_ptr = NULL;
+                    } else if (zero_copy) {
+                        ctx->payload_ptr = slice_payload;
+                    } else {
+                        ctx->payload_ptr = ctx->payload_buffer;
+                    }
                     // Frame complete - sync ws_payload_read only when needed
                     conn->ws_payload_read = ctx->payload_received;
                     ctx->state = WS_STATE_COMPLETE;
@@ -333,10 +462,16 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
             }
 
             case WS_STATE_COMPLETE:
-                // Reset for next frame
+                // Degenerate re-entry: the caller did not reset the context
+                // after the previous WS_FRAME_COMPLETE. That frame was already
+                // reported and its payload_ptr may reference an input slice
+                // that no longer exists, so report an empty frame instead of
+                // re-delivering a stale pointer.
                 ctx->state = WS_STATE_OPCODE;
                 ctx->header_bytes = 0;
                 ctx->mask_bytes_read = 0;
+                ctx->payload_received = 0;
+                ctx->payload_ptr = NULL;
                 conn->ws_payload_read = 0;
                 conn->ws_payload_len = 0;
                 return WS_FRAME_COMPLETE;
@@ -439,25 +574,36 @@ int ws_send_frame(connection_t* conn, ws_opcode_internal_t opcode, const uint8_t
     }
 
     // Build complete frame into a single buffer to ensure atomic send.
-    // For small frames (<=256 bytes), use the stack. For larger frames,
-    // send header and payload as two separate calls - the send_buffer
-    // infrastructure ensures ordering.
+    // For small frames (<=256 bytes), use the stack. Larger frames go out as
+    // ONE scatter-gather call ([header, payload]) when the two-buffer send
+    // function is registered; otherwise as two separate calls — the
+    // send_buffer infrastructure ensures ordering either way.
     if (total_len <= 256) {
         uint8_t frame_buf[256];
         memcpy(frame_buf, header, header_len);
         if (payload_len > 0) {
             memcpy(frame_buf + header_len, payload, payload_len);
         }
-        if (ws_do_send(conn, frame_buf, total_len) < 0) {
+        if (ws_do_send(conn, frame_buf, total_len, 0) < 0) {
+            return -1;
+        }
+    } else if (s_send2_func) {
+        // Larger frame, scatter-gather path: [frame_header, payload] in ONE
+        // call (a single writev underneath) — zero copy, no MSG_MORE needed.
+        if (s_send2_func(conn, header, header_len, payload, payload_len) < 0) {
             return -1;
         }
     } else {
-        // Larger frame: send header then payload (send_buffer preserves order)
-        if (ws_do_send(conn, header, header_len) < 0) {
+        // Larger frame, fallback (no two-buffer func registered — tests and
+        // standalone usage): send header then payload (send_buffer preserves
+        // order). MSG_MORE on the header part tells the stack the payload
+        // follows immediately, so the two parts can share a segment.
+        if (ws_do_send(conn, header, header_len,
+                       payload_len > 0 ? WS_MSG_MORE : 0) < 0) {
             return -1;
         }
         if (payload_len > 0) {
-            if (ws_do_send(conn, payload, payload_len) < 0) {
+            if (ws_do_send(conn, payload, payload_len, 0) < 0) {
                 return -1;
             }
         }
@@ -595,5 +741,5 @@ int ws_send_handshake_response(connection_t* conn, const char* key) {
     memcpy(response + pos, ws_suffix, sizeof(ws_suffix) - 1);
     pos += sizeof(ws_suffix) - 1;
 
-    return (int)ws_do_send(conn, response, pos);
+    return (int)ws_do_send(conn, response, pos, 0);
 }

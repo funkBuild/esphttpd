@@ -6,6 +6,7 @@
 #include "websocket.h"
 #include "radix_tree.h"
 #include "esp_log.h"
+#include <stdlib.h>
 #include <string.h>
 
 static const char* TAG = "TEST_INTEGRATION";
@@ -105,6 +106,42 @@ static void test_keepalive_rearm_after_post(void) {
 
     TEST_ASSERT_EQUAL(2, ka_handler_calls);
     TEST_ASSERT_EQUAL(CONN_STATE_NEW, conn.state);
+
+    stop_test_server();
+}
+
+// A full receive buffer can contain hundreds of minimal pipelined requests.
+// Dispatch must be iterative: recursive dispatch makes remote input consume
+// one server-task stack frame per request.
+static void test_pipelined_requests_dispatch_iteratively(void) {
+    start_test_server();
+    ka_handler_calls = 0;
+
+    httpd_route_t route = {
+        .method = HTTP_GET, .pattern = "/ka", .handler = ka_handler };
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_route(test_handle, &route));
+
+    connection_t conn = {0};
+    conn.fd = -1;
+    conn.pool_index = 0;
+    conn.state = CONN_STATE_NEW;
+
+    static const char request[] = "GET /ka HTTP/1.1\r\n\r\n";
+    enum { REQUEST_COUNT = 200 };
+    const size_t request_len = sizeof(request) - 1;
+    const size_t all_len = REQUEST_COUNT * request_len;
+    uint8_t* all = malloc(all_len);
+    TEST_ASSERT_NOT_NULL(all);
+    for (int i = 0; i < REQUEST_COUNT; i++) {
+        memcpy(all + (size_t)i * request_len, request, request_len);
+    }
+
+    g_server->handlers.on_http_request(&conn, all, all_len);
+    free(all);
+
+    TEST_ASSERT_EQUAL(REQUEST_COUNT, ka_handler_calls);
+    TEST_ASSERT_EQUAL(CONN_STATE_NEW, conn.state);
+    TEST_ASSERT_EQUAL(0, conn.pipeline_dispatch_active);
 
     stop_test_server();
 }
@@ -742,6 +779,7 @@ void test_integration_run(void) {
     RUN_TEST(test_full_http_get_request);
     RUN_TEST(test_full_http_post_request);
     RUN_TEST(test_keepalive_rearm_after_post);
+    RUN_TEST(test_pipelined_requests_dispatch_iteratively);
     RUN_TEST(test_websocket_upgrade);
     RUN_TEST(test_websocket_frame_processing);
     RUN_TEST(test_route_matching_integration);

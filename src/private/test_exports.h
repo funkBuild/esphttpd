@@ -35,17 +35,18 @@ typedef struct {
     uint32_t ping_interval_ms;
 } test_httpd_ws_route_entry_t;
 
-// Mounted router entry (must match esphttpd.c)
+// Mounted router entry (must match esphttpd.c mounted_router_t)
 typedef struct {
     const char* prefix;
-    uint8_t prefix_len;
+    uint16_t prefix_len;
     httpd_router_t router;
 } test_mounted_router_t;
 
-// Channel hash entry (must match esphttpd.c)
+// Channel hash entry (must match esphttpd.c channel_hash_entry_t)
 typedef struct {
     char name[16];
     int8_t index;
+    uint8_t subscriber_count;
 } test_channel_hash_entry_t;
 
 // Internal server context exposed for tests
@@ -87,6 +88,9 @@ typedef struct {
     // State
     bool initialized;
     volatile bool running;
+#ifndef CONFIG_HTTPD_USE_RAW_API
+    volatile bool task_exited;  // Set by server_task before vTaskDelete
+#endif
 } esphttpd_server_t;
 
 // Global server instance accessible to tests
@@ -95,27 +99,32 @@ extern esphttpd_server_t* g_server;
 // Export _middleware_next for testing
 httpd_err_t _middleware_next_test(httpd_req_t* req);
 
-// Query parameter cache entry (must match esphttpd.c)
+// Query parameter cache entry (must match esphttpd.c query_param_entry_t:
+// 16-bit lengths - query values such as tokens can exceed 255 bytes)
 typedef struct {
     const char* key;
     const char* value;
-    uint8_t key_len;
-    uint8_t value_len;
+    uint16_t key_len;
+    uint16_t value_len;
 } test_query_param_entry_t;
 
-#define MAX_QUERY_PARAMS 8
-#define REQ_HEADER_BUF_SIZE 2048
+#ifndef CONFIG_HTTPD_MAX_QUERY_PARAMS
+#define CONFIG_HTTPD_MAX_QUERY_PARAMS 8
+#endif
+#define MAX_QUERY_PARAMS CONFIG_HTTPD_MAX_QUERY_PARAMS
 #ifndef CONFIG_HTTPD_MAX_REQ_HEADERS
 #define CONFIG_HTTPD_MAX_REQ_HEADERS 16
 #endif
 #define MAX_REQ_HEADERS CONFIG_HTTPD_MAX_REQ_HEADERS
 
-// Request header entry (must match esphttpd.c)
+// Request header entry (must match esphttpd.c req_header_entry_t: 16-bit
+// lengths; offsets index into recv_buf where keys/values are NUL-terminated
+// in place at parse-complete)
 typedef struct {
     uint16_t key_offset;
     uint16_t value_offset;
-    uint8_t key_len;
-    uint8_t value_len;
+    uint16_t key_len;
+    uint16_t value_len;
 } test_req_header_entry_t;
 
 // Per-connection request context (must match esphttpd.c request_context_t EXACTLY)
@@ -123,18 +132,21 @@ typedef struct {
 typedef struct {
     // === Fields that NEED zeroing per request (memset target) ===
     httpd_req_t req;                      // Public request struct
-    char* header_buf;                     // Header storage (dynamically allocated)
     char* uri_buf;                        // URI storage (dynamically allocated)
     struct httpd_server* server;          // Back pointer to server
-    void* matched_route;                  // Matched route
     // Pre-received body data (received with headers) - dynamically allocated
     uint8_t* body_buf;                    // Buffer for body data (NULL if not allocated)
     size_t body_buf_len;                  // Amount of data in body_buf
     size_t body_buf_pos;                  // Current read position in body_buf
-    // HTTP header accumulation buffer (for multi-recv parsing)
-    uint8_t* recv_buf;                    // Accumulated recv data (NULL if not parsing)
+    // HTTP recv accumulation buffer; also backs the in-place header index,
+    // so it is retained for the whole request (or post-upgrade WS
+    // connection) lifetime - must match esphttpd.c
+    uint8_t* recv_buf;                    // Accumulated recv data (NULL if no request yet)
     size_t recv_buf_len;                  // Amount of data accumulated
     size_t recv_buf_capacity;             // Allocated capacity
+    uint8_t* pipeline_buf;                // Bytes belonging to the next request
+    size_t pipeline_buf_len;
+    size_t pipeline_buf_capacity;
     http_parser_context_t parser_ctx;     // Persistent parser context across recv calls
     bool parsing_in_progress;             // True while headers are being accumulated
     bool recv_buf_is_heap;                // true if recv_buf was malloc'd (needs free)
@@ -173,6 +185,7 @@ typedef struct {
 
     // === Scratch buffers that DON'T need zeroing per request ===
     test_req_header_entry_t headers[MAX_REQ_HEADERS];  // Header index
+    uint8_t resp_hdr_buf[512];            // Staged response headers (must match esphttpd.c)
     uint8_t inline_recv_buf[512];         // Embedded buffer for single-packet requests
     char inline_uri_buf[64];             // Embedded buffer for typical URI lengths
     test_query_param_entry_t query_params[MAX_QUERY_PARAMS];

@@ -97,6 +97,56 @@ static void test_fd_set_management(void) {
     TEST_ASSERT_EQUAL(11, max_fd);
 }
 
+// Fix 1: a deferred connection that has paused (defer_paused=1) must be dropped
+// from the read set so the socket is not drained and lwIP back-pressures the
+// client. Its write fd must still be monitored. This mirrors the exact FD-set
+// construction in event_loop_iteration().
+static void test_paused_defer_read_fd_excluded(void) {
+    connection_pool_t pool = {0};
+    connection_pool_init(&pool);
+
+    // conn A: normal deferred body reception (not paused) - selectable for read.
+    connection_t* a = &pool.connections[0];
+    a->fd = 20;
+    a->state = CONN_STATE_HTTP_BODY;
+    a->deferred = 1;
+    a->defer_paused = 0;
+    connection_mark_active(&pool, 0);
+
+    // conn B: paused deferred upload with a pending write.
+    connection_t* b = &pool.connections[1];
+    b->fd = 21;
+    b->state = CONN_STATE_HTTP_BODY;
+    b->deferred = 1;
+    b->defer_paused = 1;
+    connection_mark_write_pending(&pool, 1, true);
+    connection_mark_active(&pool, 1);
+
+    fd_set read_fds, write_fds;
+    FD_ZERO(&read_fds);
+    FD_ZERO(&write_fds);
+
+    // Replicate event_loop_iteration()'s selection (including the pause guard).
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (connection_is_active(&pool, i)) {
+            connection_t* conn = &pool.connections[i];
+            if (!conn->defer_paused) {
+                FD_SET(conn->fd, &read_fds);
+            }
+            if (connection_has_write_pending(&pool, i)) {
+                FD_SET(conn->fd, &write_fds);
+            }
+        }
+    }
+
+    // Normal connection: read-selectable.
+    TEST_ASSERT_TRUE(FD_ISSET(20, &read_fds));
+    // Paused connection: NOT read-selectable (back-pressure) ...
+    TEST_ASSERT_FALSE(FD_ISSET(21, &read_fds));
+    // ... but still write-monitored so responses/timeouts progress.
+    TEST_ASSERT_TRUE(FD_ISSET(21, &write_fds));
+}
+
 // Test connection timeout tracking
 static void test_connection_timeout(void) {
     connection_pool_t pool = {0};
@@ -453,6 +503,60 @@ static void test_ws_closing_uses_shorter_timeout(void) {
     TEST_ASSERT_EQUAL(CONN_STATE_CLOSED, conn->state);
 }
 
+// Fix 2: a paused deferred upload must not be reaped by the idle-timeout scan.
+// Its read fd is deliberately excluded from the select set (back-pressure), so
+// last_activity — refreshed only on recv — goes stale by design; the timeout
+// scan refreshes it while defer_paused is set. An unpaused idle connection
+// must still time out, and a resumed connection must age normally again.
+static void test_paused_defer_not_reaped_by_timeout(void) {
+    event_loop_t loop = {0};
+    connection_pool_t pool = {0};
+
+    event_loop_config_t config = {
+        .timeout_ms = 30000,
+        .select_timeout_ms = 1000,
+        .io_buffer_size = 1024,
+    };
+
+    event_loop_init(&loop, &pool, &config);
+
+    // Paused deferred upload, idle far past the timeout
+    connection_t* paused = &pool.connections[0];
+    paused->fd = 10;
+    paused->state = CONN_STATE_HTTP_BODY;
+    paused->deferred = 1;
+    paused->defer_paused = 1;
+    paused->last_activity = 0;
+    connection_mark_active(&pool, 0);
+
+    // Unpaused connection, equally idle
+    connection_t* idle = &pool.connections[1];
+    idle->fd = 11;
+    idle->state = CONN_STATE_HTTP_BODY;
+    idle->deferred = 1;
+    idle->defer_paused = 0;
+    idle->last_activity = 0;
+    connection_mark_active(&pool, 1);
+
+    // Advance well past the 30-tick idle timeout
+    loop.tick_count = loop.timeout_ticks + 5;
+    event_loop_check_timeouts(&loop);
+
+    // Paused connection survives (app-controlled state)...
+    TEST_ASSERT_NOT_EQUAL(CONN_STATE_CLOSED, paused->state);
+    // ...and its activity clock is refreshed so a later resume gets a full window
+    TEST_ASSERT_EQUAL(loop.tick_count, paused->last_activity);
+    // The unpaused idle connection is still reaped
+    TEST_ASSERT_EQUAL(CONN_STATE_CLOSED, idle->state);
+
+    // After resume the connection ages normally and eventually times out
+    // (a client that died while paused is reaped after resume + timeout)
+    paused->defer_paused = 0;
+    loop.tick_count += loop.timeout_ticks + 1;
+    event_loop_check_timeouts(&loop);
+    TEST_ASSERT_EQUAL(CONN_STATE_CLOSED, paused->state);
+}
+
 // ==================== TEST RUNNER ====================
 
 void test_event_loop_run(void) {
@@ -460,6 +564,7 @@ void test_event_loop_run(void) {
 
     RUN_TEST(test_event_loop_init);
     RUN_TEST(test_fd_set_management);
+    RUN_TEST(test_paused_defer_read_fd_excluded);
     RUN_TEST(test_connection_timeout);
     RUN_TEST(test_event_loop_stop);
     RUN_TEST(test_event_dispatch);
@@ -480,6 +585,7 @@ void test_event_loop_run(void) {
     RUN_TEST(test_ws_close_timeout_configurable);
     RUN_TEST(test_ws_close_timeout_zero_gets_default);
     RUN_TEST(test_ws_closing_uses_shorter_timeout);
+    RUN_TEST(test_paused_defer_not_reaped_by_timeout);
 
     ESP_LOGI(TAG, "Event Loop tests completed");
 }

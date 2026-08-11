@@ -86,6 +86,8 @@ typedef struct {
     uint32_t bytes_received;     // Bytes received for current message
     uint32_t ws_mask_key;        // WebSocket masking key (when masked)
     uint32_t last_activity;      // Last activity timestamp (tick count)
+    uint32_t ws_ping_interval_ticks;
+    uint32_t ws_last_ping;
     void* user_ctx;              // User-defined context
 
     // 16-bit aligned fields (12 bytes)
@@ -117,6 +119,7 @@ typedef struct {
     uint8_t deferred : 1;       // Body handling deferred to callbacks (1 bit)
     uint8_t defer_paused : 1;   // Deferred receiving paused (flow control) (1 bit)
     uint8_t continuation : 1;   // Body handling via continuation callbacks (1 bit)
+    uint8_t pipeline_dispatch_active : 1; // Iterative pipeline drain in progress
 } connection_t;
 
 // Connection pool management

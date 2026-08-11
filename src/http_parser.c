@@ -1,8 +1,36 @@
 #include "private/http_parser.h"
 #include <string.h>
+#include <inttypes.h>
 #include "esp_log.h"
 
 static const char TAG[] = "HTTP_PARSER";
+
+// Per-request parse flags. Stored in the (otherwise unused) ctx->line_pos
+// field so no new struct member is added to the shared parser header. The
+// parser context is zero-initialized at the start of every request, so these
+// bits start clear. http_process_header() sets them and http_parse_request()
+// acts on them.
+#define PARSE_FLAG_CONTENT_LENGTH_SEEN  0x0001u  // A Content-Length header was parsed this request
+#define PARSE_FLAG_REJECT               0x0002u  // Request must be rejected (framing/smuggling)
+#define PARSE_FLAG_TE_SEEN              0x0004u  // A Transfer-Encoding header was seen this request
+#define PARSE_FLAG_LINE_CONSUMED        0x0008u  // Current header-value line already terminated
+                                                 // (processed or counted); the next '\n' seen with
+                                                 // a NULL value pointer is the LF of that line's
+                                                 // CRLF, NOT a bare-LF empty value
+
+// Upper bound accepted for a Content-Length value. conn->content_length is
+// uint32_t (private/connection.h) and req.content_length is size_t, which is
+// 32-bit on this target — so the hard type bound is UINT32_MAX. We cap at
+// half that (2 GiB, == SIZE_MAX/2 on the 32-bit target) so downstream
+// "remaining = content_length - body_received" style arithmetic and ssize_t
+// conversions can never wrap or go negative, and clamping-to-UINT32_MAX can
+// never silently mis-frame. No legitimate request to this device (16 MB
+// flash) comes anywhere near 2 GiB.
+#define HTTP_CONTENT_LENGTH_MAX         (UINT32_MAX / 2u)
+// Sentinel returned by http_parse_content_length for a malformed or
+// oversized value. Unambiguous: valid results are capped at
+// HTTP_CONTENT_LENGTH_MAX, which is below the sentinel.
+#define HTTP_CONTENT_LENGTH_INVALID     UINT32_MAX
 
 // External function to store headers (defined in esphttpd.c)
 extern void esphttpd_store_header(connection_t* conn,
@@ -122,28 +150,42 @@ header_type_t http_identify_header(const uint8_t* key, uint16_t len) {
     return HEADER_UNKNOWN;
 }
 
+// Strict RFC 7230 3.3.2 Content-Length parse: optional leading/trailing OWS
+// (SP/HTAB), then 1*DIGIT and nothing else. Any other character anywhere in
+// the value, an empty digit string, or a value above HTTP_CONTENT_LENGTH_MAX
+// returns HTTP_CONTENT_LENGTH_INVALID. Lenient parsing here was a request-
+// smuggling edge: "5, 7" parsed as 5 and "abc" parsed as 0, so two endpoints
+// disagreeing on the value could disagree on where the next request starts.
 uint32_t http_parse_content_length(const uint8_t* value, uint16_t len) {
-    // Guard against NULL or zero length
-    if (value == NULL || len == 0) {
-        return 0;
+    if (value == NULL) {
+        return HTTP_CONTENT_LENGTH_INVALID;
     }
-    // Fast path: if length > 10 digits, definitely overflows uint32_t (max 4294967295)
-    if (len > 10) {
-        return UINT32_MAX;
+    // Trim optional OWS (SP / HTAB only, per RFC 7230)
+    uint16_t start = 0;
+    uint16_t end = len;
+    while (start < end && (value[start] == ' ' || value[start] == '\t')) {
+        start++;
+    }
+    while (end > start && (value[end - 1] == ' ' || value[end - 1] == '\t')) {
+        end--;
+    }
+    if (start == end) {
+        // Empty digit string (e.g. "Content-Length:" or whitespace only)
+        return HTTP_CONTENT_LENGTH_INVALID;
     }
 
     uint64_t result = 0;
-    for (uint8_t i = 0; i < len; i++) {
+    for (uint16_t i = start; i < end; i++) {
         uint8_t c = value[i];
-        if (c >= '0' && c <= '9') {
-            result = result * 10 + (c - '0');
-            // Early exit on overflow
-            if (result > UINT32_MAX) {
-                return UINT32_MAX;
-            }
-        } else {
-            // Stop at first non-digit (handles trailing whitespace, etc.)
-            break;
+        if (c < '0' || c > '9') {
+            // Digits only: rejects "5, 7", "abc", "+5", "-1", internal spaces
+            return HTTP_CONTENT_LENGTH_INVALID;
+        }
+        result = result * 10 + (uint64_t)(c - '0');
+        // Early exit keeps result bounded (no uint64 overflow possible even
+        // for a maximum-length header value of digits)
+        if (result > HTTP_CONTENT_LENGTH_MAX) {
+            return HTTP_CONTENT_LENGTH_INVALID;
         }
     }
 
@@ -179,6 +221,34 @@ bool http_parse_keep_alive(const uint8_t* value, uint16_t len) {
     return true; // Default to keep-alive for HTTP/1.1
 }
 
+// Case-insensitively detect the "chunked" token anywhere in a Transfer-Encoding
+// value (e.g. "gzip, chunked"). We do not decode chunked bodies; we only need to
+// know whether the header advertises chunked framing so the request is rejected.
+static bool te_value_has_chunked(const uint8_t* value, uint16_t len) {
+    if (value == NULL || len < 7) {
+        return false;
+    }
+    for (uint16_t i = 0; i + 7 <= len; i++) {
+        if ((value[i] | 0x20) == 'c' && header_equals(value + i, 7, "chunked")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// An empty (or whitespace-only) header value never reaches
+// http_process_header: the value state machine only processes a line once a
+// non-whitespace value byte has been seen. For Content-Length that silence is
+// dangerous — "Content-Length:" would frame the request as body-less while a
+// proxy that parses it differently may not, so the empty-value line
+// terminators in http_parse_request call this to decide whether the header
+// being finalized is one whose value MUST be non-empty.
+static bool empty_header_value_forbidden(const http_parser_context_t* ctx) {
+    return ctx->current_header_key != NULL &&
+           http_identify_header(ctx->current_header_key, ctx->header_key_len)
+               == HEADER_CONTENT_LENGTH;
+}
+
 void http_process_header(connection_t* conn,
                         const uint8_t* key, uint16_t key_len,
                         const uint8_t* value, uint16_t value_len,
@@ -186,12 +256,70 @@ void http_process_header(connection_t* conn,
     // Store all headers for user access (pass connection for per-connection storage)
     esphttpd_store_header(conn, key, key_len, value, value_len);
 
+    // Transfer-Encoding is recognized but NOT decoded. Chunked bodies are
+    // rejected, not parsed: without this, a chunked request that omits
+    // Content-Length would be treated as body-less and its chunk data parsed
+    // as a pipelined next request (request smuggling / mis-framing). There is
+    // no HEADER_ enum value for Transfer-Encoding (it lives in a shared header
+    // we do not edit here), so match it by name and, if the value advertises
+    // the "chunked" token, flag the request for rejection. http_parse_request
+    // maps PARSE_FLAG_REJECT to PARSE_ERROR, which the caller turns into a
+    // clean HTTP error response + connection close.
+    if (key_len == 17 && header_equals(key, key_len, "Transfer-Encoding")) {
+        parser_ctx->line_pos |= PARSE_FLAG_TE_SEEN;
+        // RFC 7230 3.3.3: a message carrying BOTH Transfer-Encoding (any
+        // coding, not just chunked) and Content-Length is an unresolvable
+        // framing ambiguity (classic smuggling vector) - reject regardless of
+        // header arrival order. The CL-after-TE order is handled in the
+        // Content-Length case below via PARSE_FLAG_TE_SEEN.
+        if (parser_ctx->line_pos & PARSE_FLAG_CONTENT_LENGTH_SEEN) {
+            ESP_LOGW(TAG, "Rejecting Transfer-Encoding + Content-Length (smuggling vector)");
+            parser_ctx->line_pos |= PARSE_FLAG_REJECT;
+        }
+        if (te_value_has_chunked(value, value_len)) {
+            parser_ctx->line_pos |= PARSE_FLAG_REJECT;
+        }
+        // A non-chunked Transfer-Encoding WITHOUT Content-Length (e.g.
+        // "Transfer-Encoding: gzip" alone) keeps its long-standing behavior:
+        // no body framing is derived from it, so the request is treated as
+        // body-less. Intentionally unchanged.
+        return;
+    }
+
     header_type_t type = http_identify_header(key, key_len);
 
     switch (type) {
-        case HEADER_CONTENT_LENGTH:
-            conn->content_length = http_parse_content_length(value, value_len);
+        case HEADER_CONTENT_LENGTH: {
+            uint32_t cl = http_parse_content_length(value, value_len);
+            if (cl == HTTP_CONTENT_LENGTH_INVALID) {
+                // Malformed ("5, 7", "abc", empty/OWS-only) or above the
+                // 2 GiB cap: strict rejection, never a silent 0 or clamp
+                ESP_LOGW(TAG, "Rejecting malformed Content-Length value (len=%" PRIu16 ")",
+                         value_len);
+                parser_ctx->line_pos |= PARSE_FLAG_REJECT;
+                break;
+            }
+            if (parser_ctx->line_pos & PARSE_FLAG_TE_SEEN) {
+                // RFC 7230 3.3.3: Content-Length arriving after any
+                // Transfer-Encoding header - see the TE branch above
+                ESP_LOGW(TAG, "Rejecting Content-Length + Transfer-Encoding (smuggling vector)");
+                parser_ctx->line_pos |= PARSE_FLAG_REJECT;
+                break;
+            }
+            if (parser_ctx->line_pos & PARSE_FLAG_CONTENT_LENGTH_SEEN) {
+                // RFC 7230 3.3.3: a second Content-Length with a DIFFERENT
+                // value is an unresolvable framing ambiguity (smuggling
+                // vector) - reject the request. An identical repeat is
+                // harmless and accepted.
+                if (cl != conn->content_length) {
+                    parser_ctx->line_pos |= PARSE_FLAG_REJECT;
+                }
+            } else {
+                conn->content_length = cl;
+                parser_ctx->line_pos |= PARSE_FLAG_CONTENT_LENGTH_SEEN;
+            }
             break;
+        }
 
         case HEADER_CONNECTION:
             conn->keep_alive = http_parse_keep_alive(value, value_len);
@@ -346,15 +474,21 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                     ctx->current_header_value = NULL;
                     ctx->header_value_len = 0;
                 } else {
+                    // RFC 7230 3.2.4: no whitespace is allowed within a
+                    // field-name (nor between the name and the colon). A
+                    // malformed name like "Content Length:" or a leading space
+                    // (obsolete line folding) must be rejected, not silently
+                    // stripped - stripping mis-identifies the header.
+                    if (__builtin_expect(is_whitespace(c), 0)) {
+                        return PARSE_ERROR;
+                    }
                     if (!ctx->current_header_key) {
                         ctx->current_header_key = &buffer[i];
                         ctx->header_key_len = 0;
                     }
-                    if (!is_whitespace(c)) {
-                        ctx->header_key_len++;
-                        if (__builtin_expect(ctx->header_key_len > 64, 0)) { // Max header key length
-                            return PARSE_ERROR;
-                        }
+                    ctx->header_key_len++;
+                    if (__builtin_expect(ctx->header_key_len > 64, 0)) { // Max header key length
+                        return PARSE_ERROR;
                     }
                 }
                 break;
@@ -363,14 +497,32 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                 // First byte: check for leading whitespace to find value start
                 if (!ctx->current_header_value) {
                     if (c == '\r') {
+                        // Empty value line terminating - a Content-Length
+                        // with no digits must be rejected, not silently
+                        // treated as body-less (framing ambiguity)
+                        if (__builtin_expect(empty_header_value_forbidden(ctx), 0)) {
+                            return PARSE_ERROR;
+                        }
                         // Empty value - stay in HEADER_VALUE; \n will trigger
-                        // transition to HEADER_KEY on next iteration
+                        // transition to HEADER_KEY on next iteration. Mark the
+                        // line consumed so that \n is not re-checked as a
+                        // bare-LF empty value.
+                        ctx->line_pos |= PARSE_FLAG_LINE_CONSUMED;
                         ctx->header_count++;
                         break;
                     }
                     if (c == '\n') {
-                        // Empty value (LF-only) or \n after \r from previous
-                        // header - transition to HEADER_KEY
+                        // Two ways to get here: the LF of a CRLF whose line
+                        // was already handled (value processed above, or the
+                        // empty-value \r branch), or a genuine bare-LF empty
+                        // value ("Key:\n"). Only the latter still owns the
+                        // line and needs the empty-value check.
+                        if (!(ctx->line_pos & PARSE_FLAG_LINE_CONSUMED) &&
+                            __builtin_expect(empty_header_value_forbidden(ctx), 0)) {
+                            return PARSE_ERROR;
+                        }
+                        ctx->line_pos &= ~PARSE_FLAG_LINE_CONSUMED;
+                        // Transition to HEADER_KEY
                         ctx->state = PARSE_STATE_HEADER_KEY;
                         ctx->current_header_key = NULL;
                         ctx->header_key_len = 0;
@@ -379,6 +531,11 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                     if (!is_whitespace(c)) {
                         ctx->current_header_value = &buffer[i];
                         ctx->header_value_len = 0;
+                        // A value byte after an empty-value \r (malformed
+                        // "Key:\rX" line) starts a new value; drop any stale
+                        // consumed marker so later empty-value checks stay
+                        // accurate.
+                        ctx->line_pos &= ~PARSE_FLAG_LINE_CONSUMED;
                     } else {
                         break;
                     }
@@ -395,6 +552,9 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                                               ctx->current_header_key, ctx->header_key_len,
                                               ctx->current_header_value, ctx->header_value_len,
                                               ctx);
+                            if (__builtin_expect(ctx->line_pos & PARSE_FLAG_REJECT, 0)) {
+                                return PARSE_ERROR;
+                            }
                         }
                         ctx->header_count++;
                         ctx->current_header_value = NULL;
@@ -429,13 +589,20 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                                           ctx->current_header_key, ctx->header_key_len,
                                           ctx->current_header_value, ctx->header_value_len,
                                           ctx);
+                        if (__builtin_expect(ctx->line_pos & PARSE_FLAG_REJECT, 0)) {
+                            return PARSE_ERROR;
+                        }
                     }
                     ctx->header_count++;
                     // Reset value pointer so \n handler can trigger HEADER_KEY transition
                     ctx->current_header_value = NULL;
                     if (*end == '\r') {
                         // CRLF: point to \r; i++ moves to \n which triggers
-                        // HEADER_KEY transition via the NULL value \n handler above
+                        // HEADER_KEY transition via the NULL value \n handler
+                        // above. Mark the line consumed: that handler must not
+                        // mistake the LF for a bare-LF empty value (the key
+                        // pointer still references THIS processed header).
+                        ctx->line_pos |= PARSE_FLAG_LINE_CONSUMED;
                         i = end - buffer;
                     } else {
                         // LF-only: transition directly to HEADER_KEY
@@ -502,7 +669,15 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
 
         i++;
 
-        // Prevent excessive header size (use loop counter directly instead of redundant field)
+        // Per-slice defensive bound only. `i` indexes the current recv slice
+        // and resets on every call, so this does NOT sum header bytes across
+        // recv calls. The real cumulative limit on total header size is
+        // enforced by the caller (esphttpd.c on_http_request rejects with HTTP
+        // 431 once the accumulated recv buffer would exceed 4096 bytes), which
+        // also caps any single slice at 4096. This check therefore only guards
+        // against a pathological oversized slice and is intentionally not a
+        // cumulative counter (that would require a persistent field in the
+        // shared parser context).
         if (__builtin_expect(i > 4096, 0)) {
             ESP_LOGE(TAG, "Headers too large");
             return PARSE_ERROR;
@@ -523,6 +698,11 @@ bool http_parse_url_params(const uint8_t* url, uint16_t len,
             *params = qmark + 1;
             return true;
         }
+        // Trailing '?' with no query text (e.g. "/a?"): keep the output
+        // contract consistent with the no-qmark path, which always writes
+        // *params. Without this, callers that don't pre-init *params would
+        // read an uninitialized pointer.
+        *params = NULL;
         return false;
     }
     *path_len = len;

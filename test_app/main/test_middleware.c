@@ -491,6 +491,40 @@ static void test_radix_route_middleware_collected_during_traversal(void) {
 
 // ==================== Test Runner ====================
 
+// M3: a long middleware chain must still run every middleware in order.
+// Guards against any future flatten/refactor of _middleware_next changing the
+// onion ordering or short-circuit semantics.
+static void test_middleware_long_chain_order(void) {
+    ESP_LOGI(TAG, "Test: Long middleware chain executes fully in order");
+    reset_exec_tracking();
+
+    httpd_req_t req;
+    connection_t conn;
+    setup_mock_req(&req, &conn);
+
+    // Cycle three recordable middlewares into a 12-deep chain (12 + handler = 13
+    // records, within MAX_EXEC_TRACK).
+    httpd_middleware_t cycle[3] = { middleware_1, middleware_2, middleware_3 };
+    httpd_middleware_t chain[12];
+    for (int i = 0; i < 12; i++) chain[i] = cycle[i % 3];
+
+    req._mw.chain = chain;
+    req._mw.chain_len = 12;
+    req._mw.current = 0;
+    req._mw.final_handler = test_handler_record;
+    req._mw.final_user_ctx = NULL;
+    req._mw.router = NULL;
+
+    httpd_err_t err = _middleware_next_test(&req);
+
+    TEST_ASSERT_EQUAL(HTTPD_OK, err);
+    TEST_ASSERT_EQUAL(13, exec_count);  // 12 middleware + handler
+    for (int i = 0; i < 12; i++) {
+        TEST_ASSERT_EQUAL((i % 3) + 1, exec_order[i]);
+    }
+    TEST_ASSERT_EQUAL(999, exec_order[12]);  // final handler runs last
+}
+
 void test_middleware_run(void) {
     ESP_LOGI(TAG, "Running Middleware tests");
 
@@ -501,6 +535,7 @@ void test_middleware_run(void) {
 
     // Multiple middleware tests
     RUN_TEST(test_middleware_chain_order);
+    RUN_TEST(test_middleware_long_chain_order);
     RUN_TEST(test_middleware_chain_stop_middle);
     RUN_TEST(test_middleware_chain_error_propagates);
 

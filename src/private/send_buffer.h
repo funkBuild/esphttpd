@@ -1,6 +1,7 @@
 #ifndef _SEND_BUFFER_H_
 #define _SEND_BUFFER_H_
 
+#include "sdkconfig.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -10,10 +11,33 @@
 extern "C" {
 #endif
 
-// Default buffer size - can be overridden via Kconfig
+// Per-connection send ring size. Taken from Kconfig
+// (CONFIG_HTTPD_SEND_BUFFER_SIZE) with a 4096 fallback for builds without the
+// symbol. Must be a power of two (enforced below).
 #ifndef SEND_BUFFER_SIZE
+#ifdef CONFIG_HTTPD_SEND_BUFFER_SIZE
+#define SEND_BUFFER_SIZE CONFIG_HTTPD_SEND_BUFFER_SIZE
+#else
 #define SEND_BUFFER_SIZE 4096
 #endif
+#endif
+
+// Cap on the total bytes buffered for one connection: ring pending + pending
+// memory-stream bytes + a new append may not exceed this. Without it a client
+// that stops reading (e.g. a WebSocket subscriber continuously fed by
+// httpd_ws_publish — WS connections have no idle timeout) grows the mem_owned
+// overflow stream until OOM. Appends beyond the cap fail; callers propagate
+// the failure as a send error.
+#ifndef SEND_BUFFER_MAX_PENDING
+#ifdef CONFIG_HTTPD_SEND_BUFFER_MAX_PENDING
+#define SEND_BUFFER_MAX_PENDING CONFIG_HTTPD_SEND_BUFFER_MAX_PENDING
+#else
+#define SEND_BUFFER_MAX_PENDING 32768
+#endif
+#endif
+
+_Static_assert(SEND_BUFFER_MAX_PENDING >= SEND_BUFFER_SIZE,
+    "SEND_BUFFER_MAX_PENDING must be at least SEND_BUFFER_SIZE");
 
 _Static_assert(SEND_BUFFER_SIZE <= UINT16_MAX,
     "SEND_BUFFER_SIZE exceeds uint16_t capacity of send_buffer_t fields");
@@ -44,7 +68,8 @@ typedef struct {
     uint8_t chunked : 1;        // Using chunked transfer encoding
     uint8_t headers_done : 1;   // HTTP headers fully sent
     uint8_t mem_streaming : 1;  // Memory streaming active
-    uint8_t _reserved : 3;
+    uint8_t overflow_warned : 1; // Backlog-cap warning already logged (once per response, cleared on reset)
+    uint8_t _reserved : 2;
 } send_buffer_t;
 
 // Initialize a send buffer (does not allocate memory yet)
@@ -126,6 +151,17 @@ static inline size_t send_buffer_file_remaining(send_buffer_t* sb) {
 // Memory streaming (for large in-memory responses)
 // Takes ownership of a heap-allocated copy of the data
 bool send_buffer_start_mem(send_buffer_t* sb, const uint8_t* data, size_t len);
+
+// Two-part memory streaming: appends [d0][d1] (in that order) to the memory
+// stream ATOMICALLY — one pending-cap check for l0+l1 up front, one
+// allocation/grow, then both copies. Either both parts are queued or neither
+// is, so a cap rejection can never leave a torn two-part response (e.g.
+// headers without their body). Either part may be NULL/0; both empty fails.
+// Cap semantics match send_buffer_start_mem exactly: enforced only when a
+// stream is already pending (the first stream allocation is uncapped).
+bool send_buffer_start_mem2(send_buffer_t* sb, const uint8_t* d0, size_t l0,
+                            const uint8_t* d1, size_t l1);
+
 void send_buffer_stop_mem(send_buffer_t* sb);
 
 static inline bool send_buffer_is_mem_streaming(send_buffer_t* sb) {

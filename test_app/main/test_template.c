@@ -404,6 +404,222 @@ static void test_template_flush_after_process(void) {
     TEST_ASSERT_EQUAL_STRING("Start {{name", (char*)output);
 }
 
+// ========== Bug #5: variable value longer than 128 bytes rendered in FULL
+//           under escape_html (previously capped at a 128-byte temp buffer) ==========
+
+// Callback that returns a value longer than the old 128-byte cap, containing
+// HTML-sensitive characters so escaping is also exercised.
+static int large_html_var_callback(const char* var_name,
+                                   uint8_t* output,
+                                   size_t output_size,
+                                   void* user_data) {
+    if (strcmp(var_name, "big") == 0) {
+        // 130 'A' (already > 128) followed by "<x>" so the escapable chars
+        // sit PAST the old 128-byte truncation point.
+        uint8_t val[133];
+        for (int i = 0; i < 130; i++) val[i] = 'A';
+        val[130] = '<';
+        val[131] = 'x';
+        val[132] = '>';
+        size_t len = sizeof(val);
+        if (len > output_size) len = output_size;
+        memcpy(output, val, len);
+        return (int)len;
+    }
+    return -1;
+}
+
+static void test_template_escape_html_large_value(void) {
+    template_context_t ctx;
+    template_init_default(&ctx, large_html_var_callback, NULL);  // escape_html = true
+
+    const char* input = "V:{{big}}";
+    uint8_t output[512] = {0};
+
+    int result = template_process(&ctx, (const uint8_t*)input,
+                                 strlen(input), output, sizeof(output));
+    output[result] = '\0';
+
+    // Build the expected fully-rendered, escaped output.
+    char expected[600];
+    int n = 0;
+    expected[n++] = 'V';
+    expected[n++] = ':';
+    for (int i = 0; i < 130; i++) expected[n++] = 'A';
+    memcpy(expected + n, "&lt;x&gt;", 9);
+    n += 9;
+    expected[n] = '\0';
+
+    // Full value renders (no 128-byte truncation) and the trailing chars past
+    // byte 128 are present and correctly escaped.
+    TEST_ASSERT_EQUAL_STRING(expected, (char*)output);
+    TEST_ASSERT_EQUAL(n, result);
+    TEST_ASSERT_NOT_NULL(strstr((char*)output, "&lt;x&gt;"));
+    TEST_ASSERT_NULL(strstr((char*)output, "<x>"));
+
+    // Terminal call of the run: releases the reusable escape scratch the
+    // large value forced the context to allocate.
+    uint8_t tail[8];
+    template_flush(&ctx, tail, sizeof(tail));
+}
+
+// ========== Escape-scratch reuse: multiple large escaped variables in ONE
+//           template must all render in full. Internally the second and third
+//           variable reuse the per-context scratch allocated for the first
+//           (no per-variable malloc/free); externally we assert full,
+//           correctly escaped rendering of all three. ==========
+
+// Returns ~300 raw bytes for "big1"/"big2"/"big3": 300 fill chars (distinct
+// per variable) followed by "<x>", so escapable chars sit far past both the
+// 128-byte stack fast path and the old truncation point.
+static int three_large_var_callback(const char* var_name,
+                                    uint8_t* output,
+                                    size_t output_size,
+                                    void* user_data) {
+    char fill;
+    if (strcmp(var_name, "big1") == 0)      fill = 'A';
+    else if (strcmp(var_name, "big2") == 0) fill = 'B';
+    else if (strcmp(var_name, "big3") == 0) fill = 'C';
+    else return -1;
+
+    uint8_t val[303];
+    memset(val, fill, 300);
+    val[300] = '<';
+    val[301] = 'x';
+    val[302] = '>';
+    size_t len = sizeof(val);
+    if (len > output_size) len = output_size;
+    memcpy(output, val, len);
+    return (int)len;
+}
+
+static void test_template_escape_scratch_reuse_three_large(void) {
+    template_context_t ctx;
+    template_init_default(&ctx, three_large_var_callback, NULL); // escape_html = true
+
+    const char* input = "{{big1}}|{{big2}}|{{big3}}";
+    // Each variable: 300 fill + "&lt;x&gt;" (9) = 309 escaped bytes.
+    // 3*309 + 2 separators = 929 -> fits in 1024.
+    static uint8_t output[1024];
+    memset(output, 0, sizeof(output));
+
+    int result = template_process(&ctx, (const uint8_t*)input,
+                                  strlen(input), output, sizeof(output));
+    TEST_ASSERT_TRUE(result > 0);
+    output[result] = '\0';
+
+    static char expected[1024];
+    int n = 0;
+    const char fills[3] = { 'A', 'B', 'C' };
+    for (int v = 0; v < 3; v++) {
+        if (v > 0) expected[n++] = '|';
+        memset(expected + n, fills[v], 300);
+        n += 300;
+        memcpy(expected + n, "&lt;x&gt;", 9);
+        n += 9;
+    }
+    expected[n] = '\0';
+
+    TEST_ASSERT_EQUAL(n, result);
+    TEST_ASSERT_EQUAL_STRING(expected, (char*)output);
+
+    uint8_t tail[8];
+    template_flush(&ctx, tail, sizeof(tail));
+}
+
+// ========== Context reuse: a second template_init + process + flush cycle on
+//           the same context (after the first run's flush freed the scratch)
+//           must work correctly - the scratch is re-allocated on demand and
+//           freed again. ==========
+
+static void test_template_ctx_reinit_second_cycle(void) {
+    template_context_t ctx;
+
+    for (int cycle = 0; cycle < 2; cycle++) {
+        template_init_default(&ctx, large_html_var_callback, NULL);
+
+        const char* input = "V:{{big}}";
+        uint8_t output[512] = {0};
+        int result = template_process(&ctx, (const uint8_t*)input,
+                                      strlen(input), output, sizeof(output));
+        TEST_ASSERT_TRUE(result > 0);
+        output[result] = '\0';
+
+        // Same expected output both cycles: full 130-'A' value with the
+        // trailing "<x>" escaped.
+        TEST_ASSERT_NOT_NULL(strstr((char*)output, "&lt;x&gt;"));
+        TEST_ASSERT_NULL(strstr((char*)output, "<x>"));
+        TEST_ASSERT_EQUAL(2 + 130 + 9, result);
+
+        // Flush ends the run and frees the scratch, so the next cycle's
+        // template_init starts from a clean (non-leaking) context.
+        uint8_t tail[8];
+        template_flush(&ctx, tail, sizeof(tail));
+    }
+}
+
+// ========== Bug #4: expansive input (short placeholders -> large escaped
+//           values) round-trips with NO dropped bytes across chunk boundaries.
+//           This is the streaming invariant template_process_file now relies on
+//           (its consume/refill loop). fd-driven testing is not possible here:
+//           ESP-IDF provides no pipe()/tmpfile() and no FS is mounted. ==========
+
+// Each {{esc}} (7 input bytes) expands to "&lt;&amp;&gt;" (13 output bytes).
+static int expansive_var_callback(const char* var_name,
+                                  uint8_t* output,
+                                  size_t output_size,
+                                  void* user_data) {
+    if (strcmp(var_name, "esc") == 0) {
+        const char* value = "<&>";
+        size_t len = strlen(value);
+        if (len > output_size) len = output_size;
+        memcpy(output, value, len);
+        return (int)len;
+    }
+    return -1;
+}
+
+static void test_template_expansive_no_dropped_bytes(void) {
+    template_context_t ctx;
+    template_init_default(&ctx, expansive_var_callback, NULL);  // escape_html = true
+
+    // 20 placeholders: 140 input bytes -> 260 output bytes (1.86x expansion).
+    const int REPEATS = 20;
+    char input[8 * 32];
+    int in_len = 0;
+    for (int i = 0; i < REPEATS; i++) {
+        memcpy(input + in_len, "{{esc}}", 7);
+        in_len += 7;
+    }
+    input[in_len] = '\0';
+
+    // Drive the engine in small slices (like successive file reads) with an
+    // ample accumulating output buffer, so state carries across chunk
+    // boundaries and delimiters may be split. No byte may be dropped.
+    uint8_t output[1024] = {0};
+    int out_pos = 0;
+    const int SLICE = 5;  // deliberately not aligned to the 7-byte placeholder
+    for (int off = 0; off < in_len; off += SLICE) {
+        int chunk = (in_len - off < SLICE) ? (in_len - off) : SLICE;
+        out_pos += template_process(&ctx, (const uint8_t*)input + off, chunk,
+                                    output + out_pos, sizeof(output) - out_pos);
+    }
+    out_pos += template_flush(&ctx, output + out_pos, sizeof(output) - out_pos);
+    output[out_pos] = '\0';
+
+    // Build expected: REPEATS copies of the escaped value.
+    char expected[1024];
+    int n = 0;
+    for (int i = 0; i < REPEATS; i++) {
+        memcpy(expected + n, "&lt;&amp;&gt;", 13);
+        n += 13;
+    }
+    expected[n] = '\0';
+
+    TEST_ASSERT_EQUAL(n, out_pos);
+    TEST_ASSERT_EQUAL_STRING(expected, (char*)output);
+}
+
 // ========== Issue #45: NULL config check in template_init ==========
 
 static void test_template_init_null_config(void) {
@@ -455,6 +671,10 @@ void test_template_run(void) {
     RUN_TEST(test_template_no_escape_html_in_substitution);
     RUN_TEST(test_template_flush_partial_end_delim);
     RUN_TEST(test_template_flush_after_process);
+    RUN_TEST(test_template_escape_html_large_value);
+    RUN_TEST(test_template_escape_scratch_reuse_three_large);
+    RUN_TEST(test_template_ctx_reinit_second_cycle);
+    RUN_TEST(test_template_expansive_no_dropped_bytes);
     RUN_TEST(test_template_init_null_config);
     RUN_TEST(test_template_init_null_ctx);
 

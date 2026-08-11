@@ -328,6 +328,15 @@ int filesystem_serve_file(filesystem_t* fs,
     return filesystem_send_file(fs, conn, actual_path, &metadata);
 }
 
+// Blocking fallback used only when no non-blocking file-stream func is
+// registered (test builds). Kept non-inlined so its 1KB scratch buffer is not
+// part of filesystem_send_file's stack frame on the production serve path.
+__attribute__((noinline))
+static int filesystem_send_file_blocking(int file_fd, int socket_fd, uint32_t file_size) {
+    uint8_t buffer[1024];
+    return filesystem_stream_file(file_fd, socket_fd, file_size, buffer, sizeof(buffer));
+}
+
 int filesystem_send_file(filesystem_t* fs,
                         connection_t* conn,
                         const char* path,
@@ -405,15 +414,18 @@ int filesystem_send_file(filesystem_t* fs,
             if (fs->open_files > 0) fs->open_files--;
             return -1;
         }
-        if (fs->open_files > 0) fs->open_files--;
+        // Keep open_files incremented for the whole streaming lifetime: the fd
+        // is still open and only closed asynchronously when the send buffer
+        // drains it. The server's send_buffer file-close hook decrements the
+        // count then. Decrementing here would let the limit never see in-flight
+        // streams.
         return (metadata->size <= (uint32_t)INT_MAX) ? (int)metadata->size : INT_MAX;
     }
 
-    // Fallback: blocking read/send loop (for tests without server infrastructure)
-    uint8_t buffer[1024];
-    int total_sent = filesystem_stream_file(file_fd, conn->fd,
-                                           metadata->size,
-                                           buffer, sizeof(buffer));
+    // Fallback: blocking read/send loop (for tests without server infrastructure).
+    // The 1KB scratch buffer lives in a separate non-inlined frame so it does
+    // not inflate the stack of the production (non-blocking) serve path above.
+    int total_sent = filesystem_send_file_blocking(file_fd, conn->fd, metadata->size);
 
     close(file_fd);
     if (fs->open_files > 0) fs->open_files--;

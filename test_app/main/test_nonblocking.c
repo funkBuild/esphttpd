@@ -438,12 +438,44 @@ static void test_deferred_continuation_exclusive(void)
 // TEST RUNNER
 // ============================================================================
 
+// M1: httpd_resp_sendfile now streams the body through the send buffer's file
+// path instead of pulling the whole file into heap, so transient RAM stays
+// bounded under a stalled client. End-to-end sendfile needs a mounted FS and a
+// driven event loop (absent in this unit harness), so verify the invariant the
+// fix relies on: a file stream never buffers more than SEND_BUFFER_SIZE of RAM
+// regardless of the logical file size (unlike an in-memory stream, which owns a
+// full-size heap copy).
+static void test_sendfile_streaming_is_bounded(void)
+{
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+    TEST_ASSERT_TRUE(send_buffer_alloc(&sb));
+
+    // Pretend to stream a 1 MB file (mock fd - only bookkeeping is exercised).
+    const size_t big = 1024 * 1024;
+    TEST_ASSERT_TRUE(send_buffer_start_file(&sb, 123 /* mock fd */, big));
+    TEST_ASSERT_TRUE(send_buffer_is_streaming(&sb));
+    TEST_ASSERT_EQUAL(big, send_buffer_file_remaining(&sb));
+
+    // The RAM-resident window is capped by the ring, not the file size.
+    uint8_t* wp = NULL;
+    size_t window = send_buffer_write_ptr(&sb, &wp);
+    TEST_ASSERT_TRUE(window <= SEND_BUFFER_SIZE);
+    TEST_ASSERT_TRUE(send_buffer_pending(&sb) <= SEND_BUFFER_SIZE);
+
+    // Detach the mock fd before cleanup so no real close() is attempted.
+    sb.file_fd = -1;
+    send_buffer_stop_file(&sb);
+    send_buffer_free(&sb);
+}
+
 void test_nonblocking_run(void)
 {
     ESP_LOGI(TAG, "Running Non-blocking I/O tests");
 
     // Chunked transfer encoding tests
     ESP_LOGI(TAG, "Chunked Transfer Encoding tests...");
+    RUN_TEST(test_sendfile_streaming_is_bounded);
     RUN_TEST(test_chunk_frame_atomic_small);
     RUN_TEST(test_chunk_frame_format);
     RUN_TEST(test_final_chunk_format);

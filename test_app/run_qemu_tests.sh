@@ -5,6 +5,10 @@
 
 set -e
 
+# Make all relative paths deterministic regardless of the caller's cwd.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -26,13 +30,14 @@ if ! idf.py --version | grep -q "v5"; then
     echo -e "${YELLOW}Warning: ESP-IDF v5.x recommended for QEMU support${NC}"
 fi
 
+# Clean stale or incompatible build metadata before set-target. idf.py refuses
+# to clean a directory that lacks a valid CMake cache.
+echo -e "${GREEN}Cleaning build directory...${NC}"
+rm -rf build
+
 # Set target to ESP32S3
 echo -e "${GREEN}Setting target to ESP32S3...${NC}"
 idf.py set-target esp32s3
-
-# Clean build directory
-echo -e "${GREEN}Cleaning build directory...${NC}"
-rm -rf build
 
 # Build the test application
 echo -e "${GREEN}Building test application...${NC}"
@@ -49,45 +54,95 @@ fi
 echo -e "${GREEN}Creating QEMU flash image...${NC}"
 cd build
 
-# Merge binaries into single flash image
+# Merge binaries into single flash image.
+# --fill-flash-size pads the image to a QEMU-valid size (2/4/8/16MB);
+# without it QEMU rejects the raw image ("Drive size error"). 2MB matches
+# CONFIG_ESPTOOLPY_FLASHSIZE in sdkconfig.
 esptool.py --chip esp32s3 merge_bin \
     -o qemu_flash.bin \
     --flash_mode dio \
-    --flash_size 4MB \
+    --flash_size 2MB \
+    --fill-flash-size 2MB \
     0x0 bootloader/bootloader.bin \
     0x8000 partition_table/partition-table.bin \
     0x10000 esphttpd_test_app.bin
 
 cd ..
 
+# The ESP32-S3 machine + efuse device are only in the Espressif QEMU build;
+# the distro /usr/bin/qemu-system-xtensa lacks them. Prefer the Espressif one.
+find_qemu() {
+    local QEMU_DIR="$HOME/.espressif/tools/qemu-xtensa"
+    if [ -d "$QEMU_DIR" ]; then
+        local found
+        found=$(find "$QEMU_DIR" -name "qemu-system-xtensa" -type f 2>/dev/null | sort -rV | head -1)
+        if [ -n "$found" ] && [ -x "$found" ]; then
+            echo "$found"; return
+        fi
+    fi
+    which qemu-system-xtensa 2>/dev/null || true
+}
+QEMU_BIN=$(find_qemu)
+
+# The efuse device needs a backing image or the ESP32-S3 machine won't boot.
+if [ ! -f build/qemu_efuse.bin ]; then
+    dd if=/dev/zero of=build/qemu_efuse.bin bs=1K count=4 2>/dev/null
+fi
+
 # Run QEMU with timeout
 echo -e "${GREEN}Starting QEMU ESP32S3...${NC}"
 echo "========================================="
 
-# Create QEMU command
-QEMU_CMD="qemu-system-xtensa \
-    -machine esp32s3 \
-    -drive file=build/qemu_flash.bin,format=raw,if=mtd \
-    -serial stdio \
-    -display none"
-
-# Run QEMU with timeout and capture output
-TIMEOUT=30
+# Run QEMU with a ceiling timeout; kill early when the completion sentinel
+# appears (QEMU does not exit on its own). QEMU serial output contains NUL
+# bytes from early ROM boot, so every grep over the log must use -a (text).
+TIMEOUT=300
 OUTPUT_FILE="qemu_output.txt"
 
 echo -e "${YELLOW}Running tests (timeout: ${TIMEOUT}s)...${NC}"
-timeout $TIMEOUT $QEMU_CMD 2>&1 | tee $OUTPUT_FILE
+
+"$QEMU_BIN" \
+    -M esp32s3 \
+    -drive file=build/qemu_flash.bin,if=mtd,format=raw \
+    -drive file=build/qemu_efuse.bin,if=none,format=raw,id=efuse \
+    -serial mon:stdio \
+    -nographic \
+    -no-reboot \
+    > "$OUTPUT_FILE" 2>&1 &
+QEMU_PID=$!
+
+SECONDS_WAITED=0
+while [ $SECONDS_WAITED -lt $TIMEOUT ]; do
+    if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+        break
+    fi
+    if grep -a -q "QEMU_TEST_COMPLETE:" "$OUTPUT_FILE" 2>/dev/null; then
+        sleep 1  # allow trailing output to flush
+        break
+    fi
+    sleep 2
+    SECONDS_WAITED=$((SECONDS_WAITED + 2))
+done
+
+# Force-kill QEMU (it does not exit on its own)
+if kill -0 "$QEMU_PID" 2>/dev/null; then
+    kill -9 "$QEMU_PID" 2>/dev/null || true
+    wait "$QEMU_PID" 2>/dev/null || true
+fi
+
+# Show the Unity summary line if present
+grep -a -E "Tests [0-9]+ Failures [0-9]+ Ignored" "$OUTPUT_FILE" | tail -1 || true
 
 # Check test results
-if grep -q "QEMU_TEST_COMPLETE: PASS" $OUTPUT_FILE; then
+if grep -a -q "QEMU_TEST_COMPLETE: PASS" "$OUTPUT_FILE"; then
     echo -e "${GREEN}✓ All tests passed!${NC}"
     exit 0
-elif grep -q "QEMU_TEST_COMPLETE: FAIL" $OUTPUT_FILE; then
+elif grep -a -q "QEMU_TEST_COMPLETE: FAIL" "$OUTPUT_FILE"; then
     echo -e "${RED}✗ Some tests failed!${NC}"
 
     # Show failure summary
     echo -e "${RED}Failed tests:${NC}"
-    grep "FAIL" $OUTPUT_FILE | grep -v "QEMU_TEST_COMPLETE"
+    grep -a ":FAIL" "$OUTPUT_FILE" | grep -v "QEMU_TEST_COMPLETE"
     exit 1
 else
     echo -e "${YELLOW}⚠ Tests did not complete within timeout${NC}"

@@ -840,6 +840,42 @@ static void test_free_closes_file(void)
     TEST_ASSERT_FALSE(sb.streaming);
 }
 
+// Fix 6: the send buffer notifies its registered close hook every time it
+// closes a streaming file fd. This is the mechanism by which the filesystem's
+// in-flight open-file count is released when a stream actually ends (not at the
+// handoff moment).
+extern void send_buffer_set_file_close_cb(void (*cb)(void));
+static int s_sb_close_cb_count = 0;
+static void sb_test_close_cb(void) { s_sb_close_cb_count++; }
+
+static void test_file_close_hook_fires_on_close(void)
+{
+    s_sb_close_cb_count = 0;
+    send_buffer_set_file_close_cb(sb_test_close_cb);
+
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+
+    // stop_file on an open (mock) stream: closes fd, fires hook exactly once.
+    sb.file_fd = 77;  // mock fd (close fails harmlessly, hook still fires)
+    sb.streaming = 1;
+    send_buffer_stop_file(&sb);
+    TEST_ASSERT_EQUAL(-1, sb.file_fd);
+    TEST_ASSERT_EQUAL(1, s_sb_close_cb_count);
+
+    // No open fd: stopping again must NOT fire the hook (no double-release).
+    send_buffer_stop_file(&sb);
+    TEST_ASSERT_EQUAL(1, s_sb_close_cb_count);
+
+    // free on an open (mock) stream also fires the hook once.
+    sb.file_fd = 78;
+    send_buffer_free(&sb);
+    TEST_ASSERT_EQUAL(2, s_sb_close_cb_count);
+
+    // Deregister so other tests are unaffected.
+    send_buffer_set_file_close_cb(NULL);
+}
+
 // Test start_file replaces existing file
 static void test_start_file_replaces_existing(void)
 {
@@ -1015,6 +1051,75 @@ static void test_start_mem_append_after_partial_drain(void)
     send_buffer_free(&sb);
 }
 
+// DoS cap: appending to a pending memory stream past SEND_BUFFER_MAX_PENDING
+// must fail (a client that stops reading would otherwise grow the overflow
+// stream until OOM), while appends below the cap keep working, and a failed
+// append must leave the pending stream intact.
+static void test_start_mem_append_capped(void)
+{
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+
+    size_t big = SEND_BUFFER_MAX_PENDING - 100;
+    uint8_t* buf = (uint8_t*)malloc(big);
+    TEST_ASSERT_NOT_NULL(buf);
+    memset(buf, 'A', big);
+
+    // Initial start is not capped (a single response is bounded by its own size)
+    TEST_ASSERT_TRUE(send_buffer_start_mem(&sb, buf, big));
+
+    // Append below the cap succeeds
+    TEST_ASSERT_TRUE(send_buffer_start_mem(&sb, (const uint8_t*)"12345678", 8));
+    TEST_ASSERT_EQUAL(big + 8, send_buffer_mem_remaining(&sb));
+
+    // Append that would push the backlog past the cap fails...
+    TEST_ASSERT_FALSE(send_buffer_start_mem(&sb, buf, 200));
+    // ...and leaves the pending stream untouched
+    TEST_ASSERT_EQUAL(big + 8, send_buffer_mem_remaining(&sb));
+    TEST_ASSERT_TRUE(send_buffer_is_mem_streaming(&sb));
+
+    // Repeated overflow keeps failing (warning is once-per-response, rejection is not)
+    TEST_ASSERT_FALSE(send_buffer_start_mem(&sb, buf, 200));
+    TEST_ASSERT_EQUAL(big + 8, send_buffer_mem_remaining(&sb));
+
+    // Reset clears the once-per-response warning latch with the stream
+    send_buffer_reset(&sb);
+    TEST_ASSERT_FALSE(sb.overflow_warned);
+
+    free(buf);
+    send_buffer_free(&sb);
+}
+
+// Ring-pending bytes are part of the same unsent backlog and must count
+// against the cap.
+static void test_start_mem_cap_counts_ring_pending(void)
+{
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+    TEST_ASSERT_TRUE(send_buffer_alloc(&sb));
+
+    // Stage 100 bytes in the ring
+    uint8_t chunk[100];
+    memset(chunk, 'R', sizeof(chunk));
+    TEST_ASSERT_EQUAL(100, send_buffer_queue(&sb, chunk, sizeof(chunk)));
+
+    // Start a mem stream leaving only 50 bytes of headroom under the cap
+    size_t big = SEND_BUFFER_MAX_PENDING - 150;
+    uint8_t* buf = (uint8_t*)malloc(big);
+    TEST_ASSERT_NOT_NULL(buf);
+    memset(buf, 'A', big);
+    TEST_ASSERT_TRUE(send_buffer_start_mem(&sb, buf, big));
+
+    // 100 (ring) + big + 40 = cap - 10: fits
+    TEST_ASSERT_TRUE(send_buffer_start_mem(&sb, chunk, 40));
+    // 100 (ring) + big + 40 + 100 would exceed the cap: rejected
+    TEST_ASSERT_FALSE(send_buffer_start_mem(&sb, chunk, 100));
+    TEST_ASSERT_EQUAL(big + 40, send_buffer_mem_remaining(&sb));
+
+    free(buf);
+    send_buffer_free(&sb);
+}
+
 static void test_stop_mem_clears_state(void)
 {
     send_buffer_t sb;
@@ -1069,6 +1174,94 @@ static void test_free_releases_mem_stream(void)
     TEST_PASS();
 }
 
+// ===== Two-part memory streaming (scatter-gather send residue path) =====
+
+// send_buffer_start_mem2 must queue both parts in order with one call —
+// this is the [header_block, body] residue of a partial/blocked writev
+static void test_start_mem2_orders_both_parts(void)
+{
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+
+    TEST_ASSERT_TRUE(send_buffer_start_mem2(&sb, (const uint8_t*)"AAA", 3,
+                                            (const uint8_t*)"BB", 2));
+    TEST_ASSERT_TRUE(send_buffer_is_mem_streaming(&sb));
+    TEST_ASSERT_EQUAL(5, send_buffer_mem_remaining(&sb));
+    TEST_ASSERT_EQUAL_MEMORY("AAABB", sb.mem_ptr, 5);
+
+    send_buffer_free(&sb);
+}
+
+// Two-buffer queue-behind-pending: both parts must land BEHIND the bytes of
+// a stream that is already pending, in order (never reorder past queued data)
+static void test_start_mem2_appends_behind_pending(void)
+{
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+
+    TEST_ASSERT_TRUE(send_buffer_start_mem(&sb, (const uint8_t*)"abc", 3));
+    TEST_ASSERT_TRUE(send_buffer_start_mem2(&sb, (const uint8_t*)"DD", 2,
+                                            (const uint8_t*)"E", 1));
+    TEST_ASSERT_EQUAL(6, send_buffer_mem_remaining(&sb));
+    TEST_ASSERT_EQUAL_MEMORY("abcDDE", sb.mem_ptr, 6);
+
+    send_buffer_free(&sb);
+}
+
+// Pending-cap atomicity: the cap must be checked ONCE for len0+len1 BEFORE
+// anything is copied. If part0 alone would fit but part0+part1 would not,
+// the call must fail with the pending stream untouched — appending part0 and
+// then rejecting part1 would put a torn response (headers without body) on
+// the wire.
+static void test_start_mem2_cap_covers_combined_length(void)
+{
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+
+    size_t big = SEND_BUFFER_MAX_PENDING - 100;
+    uint8_t* buf = (uint8_t*)malloc(big);
+    TEST_ASSERT_NOT_NULL(buf);
+    memset(buf, 'A', big);
+
+    // Pending stream near the cap (initial start is uncapped, matching
+    // send_buffer_start_mem semantics)
+    TEST_ASSERT_TRUE(send_buffer_start_mem(&sb, buf, big));
+
+    // 60 + 60 = 120 bytes > the 100 left under the cap, but part0 alone (60)
+    // would fit: the combined check must reject the pair atomically...
+    TEST_ASSERT_FALSE(send_buffer_start_mem2(&sb, buf, 60, buf, 60));
+    // ...leaving the pending stream untouched
+    TEST_ASSERT_EQUAL(big, send_buffer_mem_remaining(&sb));
+    TEST_ASSERT_TRUE(send_buffer_is_mem_streaming(&sb));
+
+    // A pair that fits under the cap still appends, in order
+    TEST_ASSERT_TRUE(send_buffer_start_mem2(&sb, (const uint8_t*)"XY", 2,
+                                            (const uint8_t*)"Z", 1));
+    TEST_ASSERT_EQUAL(big + 3, send_buffer_mem_remaining(&sb));
+    TEST_ASSERT_EQUAL_MEMORY("XYZ", sb.mem_ptr + big, 3);
+
+    free(buf);
+    send_buffer_free(&sb);
+}
+
+// A lone second part (empty first) still queues — send_nonblocking2 reaches
+// this when a partial writev residue ends mid-buf1 — and both-empty fails,
+// matching start_mem's invalid-args contract
+static void test_start_mem2_single_part_normalization(void)
+{
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+
+    TEST_ASSERT_TRUE(send_buffer_start_mem2(&sb, NULL, 0, (const uint8_t*)"tail", 4));
+    TEST_ASSERT_EQUAL(4, send_buffer_mem_remaining(&sb));
+    TEST_ASSERT_EQUAL_MEMORY("tail", sb.mem_ptr, 4);
+
+    TEST_ASSERT_FALSE(send_buffer_start_mem2(&sb, NULL, 0, NULL, 0));
+    TEST_ASSERT_EQUAL(4, send_buffer_mem_remaining(&sb));
+
+    send_buffer_free(&sb);
+}
+
 void test_send_buffer_run(void)
 {
     // Basic functionality tests
@@ -1109,6 +1302,7 @@ void test_send_buffer_run(void)
     RUN_TEST(test_file_remaining_accessor);
     RUN_TEST(test_reset_clears_file_state);
     RUN_TEST(test_free_closes_file);
+    RUN_TEST(test_file_close_hook_fires_on_close);
     RUN_TEST(test_start_file_replaces_existing);
 
     // Bug fix regression tests
@@ -1122,9 +1316,17 @@ void test_send_buffer_run(void)
     RUN_TEST(test_start_mem_invalid_args);
     RUN_TEST(test_start_mem_append_preserves_pending);
     RUN_TEST(test_start_mem_append_after_partial_drain);
+    RUN_TEST(test_start_mem_append_capped);
+    RUN_TEST(test_start_mem_cap_counts_ring_pending);
     RUN_TEST(test_stop_mem_clears_state);
     RUN_TEST(test_reset_clears_mem_state);
     RUN_TEST(test_free_releases_mem_stream);
 
-    ESP_LOGI(TAG, "Send buffer tests completed (43 tests)");
+    // Two-part (scatter-gather residue) memory streaming tests
+    RUN_TEST(test_start_mem2_orders_both_parts);
+    RUN_TEST(test_start_mem2_appends_behind_pending);
+    RUN_TEST(test_start_mem2_cap_covers_combined_length);
+    RUN_TEST(test_start_mem2_single_part_normalization);
+
+    ESP_LOGI(TAG, "Send buffer tests completed (49 tests)");
 }

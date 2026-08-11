@@ -103,7 +103,9 @@ typedef struct {
     uint32_t recv_timeout_ms;        ///< Receive timeout in ms (default: 5000)
     size_t recv_buffer_size;         ///< Receive buffer size (default: 1024)
     size_t send_buffer_size;         ///< Send buffer size (default: 1024)
-    size_t max_uri_len;              ///< Maximum URI length (default: 256)
+    size_t max_uri_len;              ///< Maximum URI length (default: 256). Enforced at
+                                     ///< request dispatch: a longer URI gets 414 and the
+                                     ///< connection is closed. 0 disables the check.
     size_t max_header_len;           ///< Maximum single header length (default: 512)
     uint8_t max_headers;             ///< Maximum number of headers (default: 32)
     uint16_t backlog;                ///< Listen backlog (default: 5)
@@ -236,10 +238,8 @@ struct httpd_request {
     const char* base_url;            ///< Mount prefix (e.g., "/api")
     uint16_t base_url_len;
 
-    // Headers (stored in request-local buffer)
-    char* header_buf;                ///< Header storage buffer
-    size_t header_buf_size;
-    size_t header_buf_used;
+    // Headers (indexed in place inside the connection's recv buffer;
+    // resolved internally via httpd_req_get_header)
     uint8_t header_count;
 
     // Route parameters
@@ -320,6 +320,19 @@ typedef struct {
     httpd_ws_handler_t handler;      ///< WebSocket event handler
     void* user_ctx;                  ///< User context
     uint32_t ping_interval_ms;       ///< Auto-ping interval (0 = disabled)
+    /**
+     * Optional authorization gate, run on the HTTP upgrade request BEFORE the
+     * 101 is sent and before any WS event reaches the handler.
+     *
+     * The upgrade arrives as an ordinary request, so the callback has the full
+     * httpd_req_t: headers, query and the response API all work. Return
+     * HTTPD_OK to accept the upgrade. Any other return rejects it, and the
+     * callback owns sending the response (e.g. a 401 challenge).
+     *
+     * NULL (the default, and what every pre-existing registration gets) keeps
+     * the historical behaviour of accepting every upgrade.
+     */
+    httpd_err_t (*authorize)(httpd_req_t* req, void* user_ctx);
 } httpd_ws_route_t;
 
 // ============================================================================
@@ -647,6 +660,20 @@ httpd_err_t httpd_resp_send_error(httpd_req_t* req, int status, const char* mess
 
 /**
  * @brief Send file from filesystem
+ *
+ * The file body is streamed LAZILY: this call sends the headers, hands the
+ * open file descriptor to the per-connection send buffer and returns before
+ * the body has been transmitted. The event loop then reads and sends the
+ * file incrementally as the TCP window opens.
+ *
+ * @warning The file must remain present and UNMODIFIED until the response
+ * completes (connection re-armed or closed). A serve-then-delete /
+ * serve-then-rewrite pattern is no longer safe with this call: truncating
+ * the file mid-stream aborts the connection, and rewriting it serves
+ * corrupted bytes. If you need to delete or replace the file right after
+ * serving it, either use httpd_resp_sendfile_async() and do it from the
+ * on_done callback, or copy the content and send it with httpd_resp_send().
+ *
  * @param req Request context
  * @param path File path
  * @return HTTPD_OK on success

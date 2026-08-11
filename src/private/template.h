@@ -40,6 +40,20 @@ typedef struct {
     // Owned copies of delimiter strings (config.start_delim/end_delim point here)
     char start_delim_buf[8];
     char end_delim_buf[8];
+
+    // Reusable heap scratch for HTML-escaping variable values larger than the
+    // 128-byte stack fast path. Grown on demand (capped internally), reused
+    // across every variable in a processing run instead of a per-variable
+    // malloc/free. OWNERSHIP: allocated lazily inside template_process*,
+    // freed (and NULLed) by template_flush - the terminal call of a run - and
+    // on every template_process_file exit path. template_init* always resets
+    // these fields to NULL/0 and can NEVER free a previous pointer, because
+    // existing callers pass uninitialized stack contexts to it. RESIDUAL LEAK
+    // RISK: a caller that abandons or re-inits a context after
+    // template_process() on large escaped values WITHOUT calling
+    // template_flush() leaks this buffer (the API has no deinit).
+    uint8_t* escape_scratch;
+    size_t escape_scratch_size;
 } template_context_t;
 
 // Template processing results

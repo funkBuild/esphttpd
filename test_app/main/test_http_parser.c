@@ -156,18 +156,31 @@ static void test_identify_headers(void)
                      http_identify_header((const uint8_t*)"X-Custom", 8));
 }
 
-// Test content length parsing
+// Test content length parsing. Strict per RFC 7230 3.3.2: optional OWS,
+// then digits only. UINT32_MAX is the invalid-value sentinel (valid results
+// are capped at UINT32_MAX/2 by the parser).
 static void test_parse_content_length(void)
 {
     TEST_ASSERT_EQUAL(0, http_parse_content_length((const uint8_t*)"0", 1));
     TEST_ASSERT_EQUAL(123, http_parse_content_length((const uint8_t*)"123", 3));
     TEST_ASSERT_EQUAL(65535, http_parse_content_length((const uint8_t*)"65535", 5));
     TEST_ASSERT_EQUAL(99999, http_parse_content_length((const uint8_t*)"99999", 5)); // No longer clamped
-    TEST_ASSERT_EQUAL(42, http_parse_content_length((const uint8_t*)"42abc", 5)); // Stop at non-digit
+    // Trailing garbage is now REJECTED, not truncated at the first non-digit
+    // ("42abc" used to parse as 42 - a request-smuggling edge)
+    TEST_ASSERT_EQUAL(UINT32_MAX, http_parse_content_length((const uint8_t*)"42abc", 5));
+    // Comma-separated list ("5, 7" used to parse as 5) is rejected
+    TEST_ASSERT_EQUAL(UINT32_MAX, http_parse_content_length((const uint8_t*)"5, 7", 4));
+    // Internal whitespace between digits is rejected
+    TEST_ASSERT_EQUAL(UINT32_MAX, http_parse_content_length((const uint8_t*)"5 7", 3));
     // Test large values (16MB+)
     TEST_ASSERT_EQUAL(16777216, http_parse_content_length((const uint8_t*)"16777216", 8)); // 16MB
     TEST_ASSERT_EQUAL(104857600, http_parse_content_length((const uint8_t*)"104857600", 9)); // 100MB
-    TEST_ASSERT_EQUAL(UINT32_MAX, http_parse_content_length((const uint8_t*)"9999999999999", 13)); // Overflow -> max
+    // Values above the 2 GiB cap (UINT32_MAX/2) are rejected, not clamped
+    TEST_ASSERT_EQUAL(UINT32_MAX, http_parse_content_length((const uint8_t*)"2147483648", 10)); // cap+1
+    TEST_ASSERT_EQUAL(UINT32_MAX, http_parse_content_length((const uint8_t*)"4294967295", 10)); // old clamp value
+    TEST_ASSERT_EQUAL(UINT32_MAX, http_parse_content_length((const uint8_t*)"9999999999999", 13)); // way over
+    // Largest accepted value: exactly the cap
+    TEST_ASSERT_EQUAL(UINT32_MAX / 2, http_parse_content_length((const uint8_t*)"2147483647", 10));
 }
 
 // Test keep-alive parsing
@@ -251,18 +264,20 @@ static void test_identify_header_zero_len(void)
     TEST_ASSERT_EQUAL(HEADER_UNKNOWN, http_identify_header((const uint8_t*)"Host", 0));
 }
 
-// Test content-length with NULL
+// Test content-length with NULL / empty: strict parsing treats "no digits"
+// as invalid (UINT32_MAX sentinel), never a silent 0
 static void test_content_length_null(void)
 {
-    TEST_ASSERT_EQUAL(0, http_parse_content_length(NULL, 0));
-    TEST_ASSERT_EQUAL(0, http_parse_content_length(NULL, 5));
+    TEST_ASSERT_EQUAL(UINT32_MAX, http_parse_content_length(NULL, 0));
+    TEST_ASSERT_EQUAL(UINT32_MAX, http_parse_content_length(NULL, 5));
+    TEST_ASSERT_EQUAL(UINT32_MAX, http_parse_content_length((const uint8_t*)"", 0));
 }
 
-// Test content-length with negative-like strings (should return 0 or error)
+// Test content-length with negative-like strings (rejected, never 0)
 static void test_content_length_negative(void)
 {
-    TEST_ASSERT_EQUAL(0, http_parse_content_length((const uint8_t*)"-1", 2));
-    TEST_ASSERT_EQUAL(0, http_parse_content_length((const uint8_t*)"-100", 4));
+    TEST_ASSERT_EQUAL(UINT32_MAX, http_parse_content_length((const uint8_t*)"-1", 2));
+    TEST_ASSERT_EQUAL(UINT32_MAX, http_parse_content_length((const uint8_t*)"-100", 4));
 }
 
 // Test content-length with leading zeros
@@ -272,12 +287,14 @@ static void test_content_length_leading_zeros(void)
     TEST_ASSERT_EQUAL(0, http_parse_content_length((const uint8_t*)"000", 3));
 }
 
-// Test content-length with whitespace
+// Test content-length with whitespace: optional leading/trailing OWS
+// (SP/HTAB) is allowed per RFC 7230; whitespace-only is invalid
 static void test_content_length_whitespace(void)
 {
-    // Leading whitespace should be handled
-    TEST_ASSERT_EQUAL(0, http_parse_content_length((const uint8_t*)" 100", 4));
+    TEST_ASSERT_EQUAL(100, http_parse_content_length((const uint8_t*)" 100", 4));
     TEST_ASSERT_EQUAL(100, http_parse_content_length((const uint8_t*)"100 ", 4));
+    TEST_ASSERT_EQUAL(5, http_parse_content_length((const uint8_t*)"\t 5 \t", 5));
+    TEST_ASSERT_EQUAL(UINT32_MAX, http_parse_content_length((const uint8_t*)"   ", 3));
 }
 
 // Test request with embedded null byte in URL (should be rejected or handled safely)
@@ -1335,6 +1352,308 @@ static void test_header_value_over_2048_rejected(void) {
     free(request);
 }
 
+// Test that a Transfer-Encoding: chunked request is rejected (not mis-framed).
+// Chunked decoding is out of scope; the parser must fail the request so the
+// caller returns an error rather than parsing chunk data as a next request.
+static void test_parse_transfer_encoding_chunked_rejected(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "POST /upload HTTP/1.1\r\n"
+                          "Host: localhost\r\n"
+                          "Transfer-Encoding: chunked\r\n"
+                          "\r\n"
+                          "5\r\nhello\r\n0\r\n\r\n";
+
+    parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
+                                              strlen(request), &ctx);
+
+    TEST_ASSERT_EQUAL(PARSE_ERROR, result);
+}
+
+// Transfer-Encoding with chunked as a non-first, mixed-case token must also be
+// rejected (case-insensitive token search anywhere in the value).
+static void test_parse_transfer_encoding_chunked_embedded_rejected(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "POST /upload HTTP/1.1\r\n"
+                          "Host: localhost\r\n"
+                          "Transfer-Encoding: gzip, Chunked\r\n"
+                          "\r\n";
+
+    parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
+                                              strlen(request), &ctx);
+
+    TEST_ASSERT_EQUAL(PARSE_ERROR, result);
+}
+
+// A Transfer-Encoding value that does NOT advertise chunked is not rejected on
+// framing grounds (no body is implied without Content-Length here).
+static void test_parse_transfer_encoding_non_chunked_ok(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "GET / HTTP/1.1\r\n"
+                          "Host: localhost\r\n"
+                          "Transfer-Encoding: gzip\r\n"
+                          "\r\n";
+
+    parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
+                                              strlen(request), &ctx);
+
+    TEST_ASSERT_EQUAL(PARSE_COMPLETE, result);
+}
+
+// Duplicate Content-Length with DIFFERENT values must be rejected (RFC 7230
+// 3.3.3 - request smuggling defense).
+static void test_parse_duplicate_content_length_conflict_rejected(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "POST /data HTTP/1.1\r\n"
+                          "Host: localhost\r\n"
+                          "Content-Length: 5\r\n"
+                          "Content-Length: 6\r\n"
+                          "\r\n";
+
+    parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
+                                              strlen(request), &ctx);
+
+    TEST_ASSERT_EQUAL(PARSE_ERROR, result);
+}
+
+// Duplicate Content-Length with IDENTICAL values is accepted.
+static void test_parse_duplicate_content_length_identical_ok(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "POST /data HTTP/1.1\r\n"
+                          "Host: localhost\r\n"
+                          "Content-Length: 5\r\n"
+                          "Content-Length: 5\r\n"
+                          "\r\n";
+
+    parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
+                                              strlen(request), &ctx);
+
+    TEST_ASSERT_EQUAL(PARSE_OK, result);  // headers complete, body expected
+    TEST_ASSERT_EQUAL(5, conn.content_length);
+    TEST_ASSERT_EQUAL(CONN_STATE_HTTP_BODY, conn.state);
+}
+
+// A trailing '?' with no query must write *params = NULL (consistent output
+// contract), even when the caller pre-seeds params with a non-NULL sentinel.
+static void test_parse_url_params_trailing_qmark_sets_null(void) {
+    // Pre-seed with a non-NULL sentinel so we prove the function writes NULL.
+    const uint8_t sentinel = 0;
+    const uint8_t* params = &sentinel;
+    uint16_t path_len = 0;
+
+    const char* url = "/a?";
+    bool has_params = http_parse_url_params((const uint8_t*)url, strlen(url),
+                                            &path_len, &params);
+
+    TEST_ASSERT_FALSE(has_params);
+    TEST_ASSERT_EQUAL(2, path_len);   // "/a"
+    TEST_ASSERT_NULL(params);
+}
+
+// ========== Strict Content-Length value parsing (request level) ==========
+
+// "Content-Length: 5, 7" used to parse as 5 (stop at first non-digit) - a
+// request-smuggling edge. Must reject the whole request.
+static void test_parse_content_length_list_rejected(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "POST /data HTTP/1.1\r\n"
+                          "Host: localhost\r\n"
+                          "Content-Length: 5, 7\r\n"
+                          "\r\n";
+
+    parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
+                                              strlen(request), &ctx);
+
+    TEST_ASSERT_EQUAL(PARSE_ERROR, result);
+}
+
+// Non-numeric Content-Length used to parse as 0 (body silently dropped and
+// re-parsed as a next request). Must reject.
+static void test_parse_content_length_nonnumeric_rejected(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "POST /data HTTP/1.1\r\n"
+                          "Host: localhost\r\n"
+                          "Content-Length: abc\r\n"
+                          "\r\n";
+
+    parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
+                                              strlen(request), &ctx);
+
+    TEST_ASSERT_EQUAL(PARSE_ERROR, result);
+}
+
+// Empty Content-Length value ("Content-Length:") must be rejected; it used to
+// silently frame the request as body-less.
+static void test_parse_content_length_empty_rejected(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "POST /data HTTP/1.1\r\n"
+                          "Host: localhost\r\n"
+                          "Content-Length:\r\n"
+                          "\r\n";
+
+    parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
+                                              strlen(request), &ctx);
+
+    TEST_ASSERT_EQUAL(PARSE_ERROR, result);
+}
+
+// Whitespace-only Content-Length value is also an empty digit string.
+static void test_parse_content_length_ws_only_rejected(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "POST /data HTTP/1.1\r\n"
+                          "Host: localhost\r\n"
+                          "Content-Length:   \r\n"
+                          "\r\n";
+
+    parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
+                                              strlen(request), &ctx);
+
+    TEST_ASSERT_EQUAL(PARSE_ERROR, result);
+}
+
+// Empty Content-Length with bare-LF line endings exercises the LF-only
+// empty-value path (distinct branch from the CRLF one).
+static void test_parse_content_length_empty_lf_only_rejected(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "POST /data HTTP/1.1\n"
+                          "Content-Length:\n"
+                          "\n";
+
+    parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
+                                              strlen(request), &ctx);
+
+    TEST_ASSERT_EQUAL(PARSE_ERROR, result);
+}
+
+// Optional leading/trailing OWS around the digits is legal (RFC 7230) and
+// must still be accepted with the correct value.
+static void test_parse_content_length_ows_accepted(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "POST /data HTTP/1.1\r\n"
+                          "Host: localhost\r\n"
+                          "Content-Length:  5 \r\n"
+                          "\r\n"
+                          "hello";
+
+    parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
+                                              strlen(request), &ctx);
+
+    TEST_ASSERT_EQUAL(PARSE_OK, result);  // headers complete, body expected
+    TEST_ASSERT_EQUAL(5, conn.content_length);
+    TEST_ASSERT_EQUAL(CONN_STATE_HTTP_BODY, conn.state);
+}
+
+// A Content-Length above the 2 GiB cap (UINT32_MAX/2) is rejected outright
+// instead of being clamped to UINT32_MAX (silent mis-framing).
+static void test_parse_content_length_huge_rejected(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "POST /data HTTP/1.1\r\n"
+                          "Host: localhost\r\n"
+                          "Content-Length: 99999999999999999999\r\n"
+                          "\r\n";
+
+    parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
+                                              strlen(request), &ctx);
+
+    TEST_ASSERT_EQUAL(PARSE_ERROR, result);
+}
+
+// ========== Transfer-Encoding + Content-Length (RFC 7230 3.3.3) ==========
+
+// ANY Transfer-Encoding (even non-chunked "gzip") combined with a
+// Content-Length is an unresolvable framing ambiguity - reject. TE first.
+static void test_parse_te_then_content_length_rejected(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "POST /data HTTP/1.1\r\n"
+                          "Host: localhost\r\n"
+                          "Transfer-Encoding: gzip\r\n"
+                          "Content-Length: 5\r\n"
+                          "\r\n";
+
+    parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
+                                              strlen(request), &ctx);
+
+    TEST_ASSERT_EQUAL(PARSE_ERROR, result);
+}
+
+// Same combination with Content-Length arriving BEFORE Transfer-Encoding.
+static void test_parse_content_length_then_te_rejected(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "POST /data HTTP/1.1\r\n"
+                          "Host: localhost\r\n"
+                          "Content-Length: 5\r\n"
+                          "Transfer-Encoding: gzip\r\n"
+                          "\r\n";
+
+    parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
+                                              strlen(request), &ctx);
+
+    TEST_ASSERT_EQUAL(PARSE_ERROR, result);
+}
+
+// Regression: a plain valid POST with Content-Length 5 still parses and
+// frames the body correctly.
+static void test_parse_plain_content_length_regression(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "POST /data HTTP/1.1\r\n"
+                          "Host: localhost\r\n"
+                          "Content-Length: 5\r\n"
+                          "\r\n"
+                          "hello";
+
+    parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
+                                              strlen(request), &ctx);
+
+    TEST_ASSERT_EQUAL(PARSE_OK, result);
+    TEST_ASSERT_EQUAL(5, conn.content_length);
+    TEST_ASSERT_EQUAL(CONN_STATE_HTTP_BODY, conn.state);
+}
+
+// A header name containing an internal space is malformed (RFC 7230 forbids
+// whitespace in a field-name) and must be rejected, not mis-stored.
+static void test_parse_header_name_internal_space_rejected(void) {
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+
+    const char* request = "GET / HTTP/1.1\r\n"
+                          "Content Length: 5\r\n"
+                          "\r\n";
+
+    parse_result_t result = http_parse_request(&conn, (const uint8_t*)request,
+                                              strlen(request), &ctx);
+
+    TEST_ASSERT_EQUAL(PARSE_ERROR, result);
+}
+
 void test_http_parser_run(void)
 {
     // Core functionality tests
@@ -1433,6 +1752,29 @@ void test_http_parser_run(void)
     RUN_TEST(test_parse_bare_cr_in_header_value);
     RUN_TEST(test_header_value_long_accepted);
     RUN_TEST(test_header_value_over_2048_rejected);
+
+    // Framing / smuggling defenses
+    RUN_TEST(test_parse_transfer_encoding_chunked_rejected);
+    RUN_TEST(test_parse_transfer_encoding_chunked_embedded_rejected);
+    RUN_TEST(test_parse_transfer_encoding_non_chunked_ok);
+    RUN_TEST(test_parse_duplicate_content_length_conflict_rejected);
+    RUN_TEST(test_parse_duplicate_content_length_identical_ok);
+    RUN_TEST(test_parse_url_params_trailing_qmark_sets_null);
+    RUN_TEST(test_parse_header_name_internal_space_rejected);
+
+    // Strict Content-Length value parsing
+    RUN_TEST(test_parse_content_length_list_rejected);
+    RUN_TEST(test_parse_content_length_nonnumeric_rejected);
+    RUN_TEST(test_parse_content_length_empty_rejected);
+    RUN_TEST(test_parse_content_length_ws_only_rejected);
+    RUN_TEST(test_parse_content_length_empty_lf_only_rejected);
+    RUN_TEST(test_parse_content_length_ows_accepted);
+    RUN_TEST(test_parse_content_length_huge_rejected);
+
+    // Transfer-Encoding + Content-Length rejection (both orders)
+    RUN_TEST(test_parse_te_then_content_length_rejected);
+    RUN_TEST(test_parse_content_length_then_te_rejected);
+    RUN_TEST(test_parse_plain_content_length_regression);
 
     ESP_LOGI(TAG, "HTTP Parser tests completed");
 }

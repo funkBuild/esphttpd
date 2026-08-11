@@ -18,6 +18,7 @@
 #include "lwip/tcpip.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "private/websocket.h"
 #include <string.h>
 
 #if !defined(CONFIG_LWIP_TCPIP_CORE_LOCKING) && !defined(CONFIG_ESPHTTPD_TEST_MODE)
@@ -350,9 +351,11 @@ static err_t raw_poll_cb(void* arg, struct tcp_pcb* tpcb) {
         timeout_ticks = s_loop->ws_close_timeout_ticks;
     }
 
-    // Skip timeout for active WebSocket connections
-    if (conn->state == CONN_STATE_WEBSOCKET) {
-        return ERR_OK;
+    if (conn->state == CONN_STATE_WEBSOCKET &&
+        conn->ws_ping_interval_ticks > 0 &&
+        s_loop->tick_count - conn->ws_last_ping >= conn->ws_ping_interval_ticks) {
+        if (ws_send_ping(conn, NULL, 0) < 0) return raw_finalize(conn);
+        conn->ws_last_ping = s_loop->tick_count;
     }
 
     if (s_loop->tick_count - conn->last_activity > timeout_ticks) {

@@ -468,6 +468,58 @@ static void test_defer_pause_resume(void) {
     stop_test_server();
 }
 
+// Fix 1: pausing a deferred upload must raise conn->defer_paused (the flag the
+// event loop reads to drop the read fd from its select set and back-pressure
+// the client), and resuming must clear it. Also verify body_received is not
+// advanced by the pause itself (no discard happens while paused).
+static void test_defer_pause_backpressure_flag(void) {
+    start_test_server();
+    reset_test_state();
+
+    TEST_ASSERT_NOT_NULL(g_server);
+    TEST_ASSERT_NOT_NULL(g_test_request_contexts);
+
+    connection_pool_t* pool = &g_server->connection_pool;
+    int idx = 0;
+    connection_t* conn = connection_get(pool, idx);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    conn->fd = 999;
+    conn->state = CONN_STATE_HTTP_BODY;
+    conn->deferred = 1;
+    conn->defer_paused = 0;
+    conn->pool_index = idx;
+    conn->content_length = 1000;
+
+    test_request_context_t* ctx = get_test_ctx(idx);
+    TEST_ASSERT_NOT_NULL(ctx);
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->req._internal = conn;
+    ctx->req.content_length = 1000;
+    ctx->req.body_received = 0;
+    ctx->defer.active = true;
+    ctx->defer.paused = false;
+    ctx->defer.on_body = test_body_callback;
+    ctx->defer.on_done = test_done_callback;
+
+    // Fresh connection: not paused (the event loop would select its read fd).
+    TEST_ASSERT_EQUAL(0, conn->defer_paused);
+
+    // Pause: event loop will now exclude this fd from read_fds.
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_req_defer_pause(&ctx->req));
+    TEST_ASSERT_EQUAL(1, conn->defer_paused);
+    TEST_ASSERT_TRUE(ctx->defer.paused);
+    // Pausing alone must not consume any body bytes.
+    TEST_ASSERT_EQUAL(0, ctx->req.body_received);
+
+    // Resume: delivery re-enabled, flag cleared.
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_req_defer_resume(&ctx->req));
+    TEST_ASSERT_EQUAL(0, conn->defer_paused);
+    TEST_ASSERT_FALSE(ctx->defer.paused);
+
+    stop_test_server();
+}
+
 // Test httpd_req_defer_pause fails when not in deferred mode
 static void test_defer_pause_not_deferred(void) {
     start_test_server();
@@ -825,6 +877,67 @@ static void test_defer_resume_no_connection(void) {
     stop_test_server();
 }
 
+// ==================== IN-PLACE HEADER RETENTION ====================
+
+// Headers live NUL-terminated in place inside recv_buf, which must stay
+// alive for the whole request lifetime: a deferred done-callback runs long
+// after on_http_request returned and must still resolve them.
+static bool defer_hdr_done_called = false;
+static char defer_hdr_value[64];
+
+static void defer_hdr_done_cb(httpd_req_t* req, httpd_err_t err) {
+    (void)err;
+    defer_hdr_done_called = true;
+    const char* v = httpd_req_get_header(req, "X-Defer-Check");
+    snprintf(defer_hdr_value, sizeof(defer_hdr_value), "%s", v ? v : "(null)");
+}
+
+static httpd_err_t defer_hdr_route_handler(httpd_req_t* req) {
+    return httpd_req_defer(req, test_body_callback, defer_hdr_done_cb);
+}
+
+static void test_defer_header_readable_after_dispatch(void) {
+    start_test_server();
+    reset_test_state();
+    defer_hdr_done_called = false;
+    defer_hdr_value[0] = '\0';
+
+    httpd_route_t route = {
+        .method = HTTP_POST, .pattern = "/defhdr", .handler = defer_hdr_route_handler };
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_route(test_handle, &route));
+
+    connection_t* conn = connection_get(&g_server->connection_pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    memset(conn, 0, sizeof(*conn));
+    conn->fd = -1;
+    conn->pool_index = 0;
+    conn->state = CONN_STATE_NEW;
+
+    char req_bytes[] =
+        "POST /defhdr HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "X-Defer-Check: still-here\r\n"
+        "Content-Length: 5\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n";
+    g_server->handlers.on_http_request(conn, (uint8_t*)req_bytes, sizeof(req_bytes) - 1);
+
+    // Handler deferred; body not received yet, done callback still pending
+    TEST_ASSERT_EQUAL(1, conn->deferred);
+    TEST_ASSERT_FALSE(defer_hdr_done_called);
+
+    // Body arrives in a separate event, after on_http_request returned
+    uint8_t body[] = "hello";
+    g_server->handlers.on_http_body(conn, body, 5);
+
+    TEST_ASSERT_TRUE(defer_hdr_done_called);
+    TEST_ASSERT_EQUAL(5, body_bytes_received);
+    // Header resolved from the retained recv_buf inside the done callback
+    TEST_ASSERT_EQUAL_STRING("still-here", defer_hdr_value);
+
+    stop_test_server();
+}
+
 // ==================== TEST RUNNER ====================
 
 void test_defer_run(void) {
@@ -849,6 +962,7 @@ void test_defer_run(void) {
     RUN_TEST(test_defer_pre_received_body);
     RUN_TEST(test_defer_body_already_complete);
     RUN_TEST(test_defer_pause_resume);
+    RUN_TEST(test_defer_pause_backpressure_flag);
     RUN_TEST(test_defer_pause_not_deferred);
     RUN_TEST(test_defer_resume_not_deferred);
     RUN_TEST(test_is_deferred_with_context);
@@ -856,6 +970,7 @@ void test_defer_run(void) {
     RUN_TEST(test_defer_null_body_callback);
     RUN_TEST(test_defer_zero_content_length);
     RUN_TEST(test_defer_disconnect_calls_on_done);
+    RUN_TEST(test_defer_header_readable_after_dispatch);
     RUN_TEST(test_defer_no_connection);
     RUN_TEST(test_defer_pause_no_connection);
     RUN_TEST(test_defer_resume_no_connection);

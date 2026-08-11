@@ -92,10 +92,23 @@ menu "ESPHTTPD Configuration"
 
         config HTTPD_SEND_BUFFER_SIZE
             int "Send buffer size"
-            default 1024
+            default 4096
             range 512 4096
             help
-                Size of send buffer for outgoing data.
+                Size of the per-connection send ring buffer for outgoing data.
+                Must be a power of two (enforced at compile time).
+                Default 4096 matches the previously hardcoded value.
+
+        config HTTPD_SEND_BUFFER_MAX_PENDING
+            int "Maximum buffered send backlog per connection (bytes)"
+            default 32768
+            range 4096 262144
+            help
+                Upper bound on unsent bytes buffered for a single connection
+                (send ring + memory overflow stream). Sends that would exceed
+                this cap fail instead of growing the heap without bound when
+                a client stops reading (e.g. a stalled WebSocket subscriber).
+                Must be >= HTTPD_SEND_BUFFER_SIZE.
 
         config HTTPD_MAX_REQ_HEADERS
             int "Maximum request headers"

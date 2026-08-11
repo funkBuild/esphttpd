@@ -13,8 +13,18 @@
 #include <stdlib.h>
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "private/websocket.h"
 
 static const char TAG[] __attribute__((unused)) = "EVENT_LOOP";
+
+// RX I/O buffer size from Kconfig (CONFIG_HTTPD_RECV_BUFFER_SIZE) with a
+// 1024 fallback for builds without the symbol.
+#ifdef CONFIG_HTTPD_RECV_BUFFER_SIZE
+#define EVENT_LOOP_IO_BUFFER_SIZE CONFIG_HTTPD_RECV_BUFFER_SIZE
+#else
+#define EVENT_LOOP_IO_BUFFER_SIZE 1024
+#endif
 
 // Default configuration
 static const event_loop_config_t default_config = {
@@ -23,7 +33,7 @@ static const event_loop_config_t default_config = {
     .timeout_ms = 30000,        // 30 second timeout
 #ifndef CONFIG_HTTPD_USE_RAW_API
     .select_timeout_ms = 1000,   // 1 second select timeout
-    .io_buffer_size = 1024,      // 1KB I/O buffer
+    .io_buffer_size = EVENT_LOOP_IO_BUFFER_SIZE,  // RX I/O buffer
 #endif
     .ws_close_timeout_ms = 5000, // 5 second WS close handshake timeout
     .nodelay = true,             // Disable Nagle's algorithm
@@ -54,6 +64,7 @@ void event_loop_init(event_loop_t* loop, connection_pool_t* pool, const event_lo
 #else
     loop->listen_fd = -1;
     if (loop->config.select_timeout_ms == 0) loop->config.select_timeout_ms = 1000;
+    if (loop->config.io_buffer_size == 0) loop->config.io_buffer_size = EVENT_LOOP_IO_BUFFER_SIZE;
     // Precompute timeout in ticks (avoid division in hot path); floor of 1
     // tick so a coarse select interval cannot zero out a timeout entirely
     loop->timeout_ticks = loop->config.timeout_ms / loop->config.select_timeout_ms;
@@ -274,16 +285,33 @@ void event_loop_check_timeouts(event_loop_t* loop) {
     // Use precomputed timeout_ticks (avoid division in hot path)
     uint32_t timeout_ticks = loop->timeout_ticks;
 
-    // Only check non-WebSocket connections (bitmask arithmetic to skip WS)
-    // This eliminates per-iteration branch for WebSocket check
-    // Note: CONN_STATE_WS_CLOSING connections are removed from ws_active_mask
-    // so they are included here and get a shorter timeout below.
-    uint32_t mask = loop->pool->active_mask & ~loop->pool->ws_active_mask;
+    uint32_t mask = loop->pool->active_mask;
     while (mask) {
         int i = __builtin_ctz(mask);
         mask &= mask - 1;  // Clear lowest set bit
 
         connection_t* conn = &loop->pool->connections[i];
+
+        if (conn->state == CONN_STATE_WEBSOCKET &&
+            conn->ws_ping_interval_ticks > 0 &&
+            loop->tick_count - conn->ws_last_ping >= conn->ws_ping_interval_ticks) {
+            if (ws_send_ping(conn, NULL, 0) < 0) {
+                conn->state = CONN_STATE_CLOSED;
+                continue;
+            }
+            conn->ws_last_ping = loop->tick_count;
+        }
+
+        // A paused deferred upload is in an app-controlled state: its read fd
+        // is deliberately excluded from the select set (back-pressure), so
+        // last_activity — refreshed only on recv — inevitably goes stale.
+        // Refresh it here so the pause cannot idle the connection out; the
+        // app is responsible for resuming or closing. Tradeoff: a client that
+        // dies while paused is only reaped after resume + a full idle timeout.
+        if (conn->defer_paused) {
+            conn->last_activity = loop->tick_count;
+            continue;
+        }
 
         // Use shorter timeout for WebSocket close handshake (RFC 6455)
         uint32_t effective_timeout = (conn->state == CONN_STATE_WS_CLOSING)
@@ -335,7 +363,19 @@ int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, u
             continue;
         }
 
-        FD_SET(conn->fd, &read_fds);
+        // Back-pressure a paused deferred upload: omit its read fd from the
+        // select set so we stop draining the socket. lwIP's receive window
+        // then closes and the client is throttled instead of us pulling body
+        // bytes off the socket and discarding them. The connection stays in
+        // active_mask, so its writes and timeouts are still serviced below.
+        // Note: httpd_req_defer_resume() from another task only clears
+        // defer_paused; the fd set is rebuilt here each iteration, so the
+        // resume takes effect at the next select wakeup (up to one select
+        // timeout of latency). While paused, the timeout scan refreshes
+        // last_activity so the connection cannot idle out.
+        if (!conn->defer_paused) {
+            FD_SET(conn->fd, &read_fds);
+        }
 
         // Monitor for write readiness if data pending
         if (has_write_pending && connection_has_write_pending(loop->pool, i)) {
@@ -424,9 +464,17 @@ int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, u
 }
 
 void event_loop_run(event_loop_t* loop, const event_handlers_t* handlers) {
-    // Allocate I/O buffer on heap (saves 1KB stack space for 4KB task compatibility)
+    // Allocate I/O buffer on heap (saves 1KB stack space for 4KB task compatibility).
+    // Deliberate exception to the malloc-goes-to-SPIRAM default: this is the
+    // hottest RX buffer (every inbound byte crosses it), so prefer internal
+    // DRAM. Fall back to plain malloc if internal DRAM is unavailable — under
+    // QEMU there is no SPIRAM, so both paths land in the same heap anyway.
     if (!loop->io_buffer) {
-        loop->io_buffer = (uint8_t*)malloc(loop->config.io_buffer_size);
+        loop->io_buffer = (uint8_t*)heap_caps_malloc(loop->config.io_buffer_size,
+                                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!loop->io_buffer) {
+            loop->io_buffer = (uint8_t*)malloc(loop->config.io_buffer_size);
+        }
         if (!loop->io_buffer) {
             ESP_LOGE(TAG, "Failed to allocate I/O buffer");
             return;

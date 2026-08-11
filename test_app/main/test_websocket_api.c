@@ -8,7 +8,9 @@
 #include "connection.h"
 #include "test_exports.h"
 #include "websocket.h"
+#include "send_buffer.h"
 #include "esp_log.h"
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -341,7 +343,242 @@ static void test_ws_frame_types(void) {
     TEST_ASSERT_EQUAL(0xA, WS_TYPE_PONG);
 }
 
+// ==================== WS Lifecycle Tests (frame error / stop) ====================
+
+// Mock send buffer at pool slot 0 (same pattern as test_http_api.c): seeded
+// with one byte so send paths queue into the ring instead of calling send()
+// on the mock fd=-1.
+static send_buffer_t ws_mock_send_buf;
+static bool ws_mock_send_buf_installed = false;
+
+static void ws_install_mock_send_buffer(void) {
+    if (!g_test_send_buffers) return;
+    send_buffer_t** bufs = (send_buffer_t**)g_test_send_buffers;
+    send_buffer_init(&ws_mock_send_buf);
+    send_buffer_alloc(&ws_mock_send_buf);
+    uint8_t dummy = 0;
+    send_buffer_queue(&ws_mock_send_buf, &dummy, 1);
+    bufs[0] = &ws_mock_send_buf;
+    ws_mock_send_buf_installed = true;
+}
+
+static void ws_remove_mock_send_buffer(void) {
+    if (!ws_mock_send_buf_installed) return;
+    if (g_test_send_buffers) {
+        send_buffer_t** bufs = (send_buffer_t**)g_test_send_buffers;
+        bufs[0] = NULL;
+    }
+    // Safe even if httpd_stop already freed it via the slot-0 pointer:
+    // send_buffer_free re-inits the struct, so a second free is a no-op.
+    send_buffer_free(&ws_mock_send_buf);
+    ws_mock_send_buf_installed = false;
+}
+
+static int ws_lifecycle_connect_count = 0;
+static int ws_lifecycle_disconnect_count = 0;
+
+static httpd_err_t ws_lifecycle_handler(httpd_ws_t* ws, httpd_ws_event_t* event) {
+    (void)ws;
+    if (event->type == WS_EVENT_CONNECT) ws_lifecycle_connect_count++;
+    if (event->type == WS_EVENT_DISCONNECT) ws_lifecycle_disconnect_count++;
+    return HTTPD_OK;
+}
+
+// Run a real WebSocket upgrade on pool slot 0 through on_http_request so the
+// server sets up ws_contexts[0] (route, frame context, active mask) exactly
+// as production does. Requires the mock send buffer (handshake bytes queue
+// into it).
+static connection_t* ws_upgrade_slot0(const char* pattern) {
+    httpd_ws_route_t route = {
+        .pattern = pattern,
+        .handler = ws_lifecycle_handler,
+        .ping_interval_ms = 0
+    };
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_ws_route(test_server, &route));
+
+    connection_t* conn = connection_get(&g_server->connection_pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    memset(conn, 0, sizeof(*conn));
+    conn->fd = -1;
+    conn->pool_index = 0;
+    conn->state = CONN_STATE_NEW;
+
+    char req[256];
+    int n = snprintf(req, sizeof(req),
+                     "GET %s HTTP/1.1\r\n"
+                     "Host: localhost\r\n"
+                     "Upgrade: websocket\r\n"
+                     "Connection: Upgrade\r\n"
+                     "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                     "Sec-WebSocket-Version: 13\r\n"
+                     "\r\n", pattern);
+    TEST_ASSERT_TRUE(n > 0 && n < (int)sizeof(req));
+    g_server->handlers.on_http_request(conn, (uint8_t*)req, (size_t)n);
+    return conn;
+}
+
+// Fix 1: a protocol-invalid frame (here: unmasked - RFC 6455 requires client
+// frames to be masked) must close the connection instead of leaving it
+// wedged. Before the fix, WS_FRAME_ERROR fell through to the "need more
+// data" path, the parser stayed desynced, and - because WS connections are
+// exempt from the idle timeout - the slot was leaked forever (16 bad frames
+// exhausted the pool).
+static void test_ws_invalid_frame_closes_connection(void) {
+    start_test_server();
+    ws_install_mock_send_buffer();
+    ws_lifecycle_connect_count = 0;
+    ws_lifecycle_disconnect_count = 0;
+
+    connection_t* conn = ws_upgrade_slot0("/ws-err");
+    TEST_ASSERT_EQUAL(CONN_STATE_WEBSOCKET, conn->state);
+    TEST_ASSERT_EQUAL(1, ws_lifecycle_connect_count);
+    TEST_ASSERT_EQUAL(1u, g_server->connection_pool.ws_active_mask & 1u);
+
+    // Unmasked text frame "Hello"
+    uint8_t bad_frame[] = { 0x81, 0x05, 'H', 'e', 'l', 'l', 'o' };
+    g_server->handlers.on_ws_frame(conn, bad_frame, sizeof(bad_frame));
+
+    // Connection handed to the reaper, not wedged in CONN_STATE_WEBSOCKET
+    TEST_ASSERT_EQUAL(CONN_STATE_CLOSED, conn->state);
+    // WS disconnect event delivered exactly once
+    TEST_ASSERT_EQUAL(1, ws_lifecycle_disconnect_count);
+    // Removed from the active-WS mask
+    TEST_ASSERT_EQUAL(0u, g_server->connection_pool.ws_active_mask & 1u);
+
+    ws_remove_mock_send_buffer();
+    stop_test_server();
+    // Stop must not double-fire the disconnect (connection already closed)
+    TEST_ASSERT_EQUAL(1, ws_lifecycle_disconnect_count);
+}
+
+// Fix 3a: httpd_stop with a live WebSocket connection must fire
+// WS_EVENT_DISCONNECT to the route handler before teardown - app per-socket
+// state (allocated on WS_EVENT_CONNECT) leaked on every stop otherwise.
+static void test_ws_stop_fires_disconnect_event(void) {
+    start_test_server();
+    ws_install_mock_send_buffer();
+    ws_lifecycle_connect_count = 0;
+    ws_lifecycle_disconnect_count = 0;
+
+    connection_t* conn = ws_upgrade_slot0("/ws-stop");
+    TEST_ASSERT_EQUAL(CONN_STATE_WEBSOCKET, conn->state);
+    TEST_ASSERT_EQUAL(1, ws_lifecycle_connect_count);
+    TEST_ASSERT_EQUAL(1u, g_server->connection_pool.ws_active_mask & 1u);
+
+    // Stop with the WS connection still active
+    stop_test_server();
+    TEST_ASSERT_EQUAL(1, ws_lifecycle_disconnect_count);
+
+    // httpd_stop already ran send_buffer_free on the installed mock (it was
+    // wired in as slot 0's buffer); this just clears the bookkeeping.
+    ws_remove_mock_send_buffer();
+}
+
+// In-place header retention across a WebSocket upgrade: the upgrade request's
+// headers live NUL-terminated inside recv_buf, which is retained for the
+// WHOLE WebSocket connection lifetime (freed at disconnect, not at upgrade),
+// so WS handlers can read upgrade-request headers on any later event.
+static bool ws_hdr_msg_seen = false;
+static char ws_hdr_version[16];
+static char ws_hdr_host[32];
+
+static httpd_err_t ws_hdr_handler(httpd_ws_t* ws, httpd_ws_event_t* event) {
+    (void)ws;
+    if (event->type == WS_EVENT_MESSAGE) {
+        ws_hdr_msg_seen = true;
+        // The upgrade request context persists at the connection's pool slot
+        test_request_context_t** ctxs = (test_request_context_t**)g_test_request_contexts;
+        const char* v = ctxs && ctxs[0] ?
+            httpd_req_get_header(&ctxs[0]->req, "Sec-WebSocket-Version") : NULL;
+        snprintf(ws_hdr_version, sizeof(ws_hdr_version), "%s", v ? v : "(null)");
+        const char* h = ctxs && ctxs[0] ?
+            httpd_req_get_header(&ctxs[0]->req, "Host") : NULL;
+        snprintf(ws_hdr_host, sizeof(ws_hdr_host), "%s", h ? h : "(null)");
+    }
+    return HTTPD_OK;
+}
+
+static void test_ws_headers_readable_after_upgrade(void) {
+    start_test_server();
+    ws_install_mock_send_buffer();
+    ws_hdr_msg_seen = false;
+    ws_hdr_version[0] = '\0';
+    ws_hdr_host[0] = '\0';
+
+    httpd_ws_route_t route = {
+        .pattern = "/ws-hdr",
+        .handler = ws_hdr_handler,
+        .ping_interval_ms = 0
+    };
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_ws_route(test_server, &route));
+
+    connection_t* conn = connection_get(&g_server->connection_pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    memset(conn, 0, sizeof(*conn));
+    conn->fd = -1;
+    conn->pool_index = 0;
+    conn->state = CONN_STATE_NEW;
+
+    char req[] = "GET /ws-hdr HTTP/1.1\r\n"
+                 "Host: localhost\r\n"
+                 "Upgrade: websocket\r\n"
+                 "Connection: Upgrade\r\n"
+                 "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                 "Sec-WebSocket-Version: 13\r\n"
+                 "\r\n";
+    g_server->handlers.on_http_request(conn, (uint8_t*)req, sizeof(req) - 1);
+    TEST_ASSERT_EQUAL(CONN_STATE_WEBSOCKET, conn->state);
+
+    // Upgrade headers readable AFTER on_http_request returned (recv_buf was
+    // NOT freed at upgrade)
+    test_request_context_t** ctxs = (test_request_context_t**)g_test_request_contexts;
+    TEST_ASSERT_NOT_NULL(ctxs);
+    TEST_ASSERT_NOT_NULL(ctxs[0]);
+    const char* v = httpd_req_get_header(&ctxs[0]->req, "Sec-WebSocket-Version");
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_EQUAL_STRING("13", v);
+
+    // ...and from within the WS handler on a later frame event.
+    // Masked text frame "hi" (all-zero mask key leaves the payload as-is).
+    uint8_t frame[] = { 0x81, 0x82, 0x00, 0x00, 0x00, 0x00, 'h', 'i' };
+    g_server->handlers.on_ws_frame(conn, frame, sizeof(frame));
+    TEST_ASSERT_TRUE(ws_hdr_msg_seen);
+    TEST_ASSERT_EQUAL_STRING("13", ws_hdr_version);
+    TEST_ASSERT_EQUAL_STRING("localhost", ws_hdr_host);
+
+    ws_remove_mock_send_buffer();
+    stop_test_server();
+}
+
 // ==================== Test Runner ====================
+
+// Fix 3: in socket mode the WS send entry points (send/broadcast/publish/close)
+// take the recursive send mutex, which httpd_start() creates. Verify the mutex
+// is present (the APIs run their now-lock-guarded bodies to completion without
+// deadlock or crash) and that httpd_ws_close clamps an oversized reason (RFC
+// 6455: reason text <= 123 bytes) rather than overflowing.
+static void test_ws_send_apis_lock_guarded_after_init(void) {
+    start_test_server();
+    TEST_ASSERT_NOT_NULL(test_server);
+
+    // Broadcast/publish with no active WS connections: their SEND_LOCK-wrapped
+    // bodies execute and return 0.
+    TEST_ASSERT_EQUAL(0, httpd_ws_broadcast(test_server, "*", "hi", 2, WS_TYPE_TEXT));
+    TEST_ASSERT_EQUAL(0, httpd_ws_publish(test_server, "no-such-channel", "hi", 2, WS_TYPE_TEXT));
+
+    // httpd_ws_close with a 200-byte reason must clamp to <=123 and complete
+    // under the send lock without overrunning its 128-byte frame buffer.
+    httpd_ws_t ws;
+    connection_t conn;
+    setup_mock_ws(&ws, &conn);
+    conn.pool_index = 0;
+    char big_reason[200];
+    memset(big_reason, 'A', sizeof(big_reason) - 1);
+    big_reason[sizeof(big_reason) - 1] = '\0';
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_ws_close(&ws, 1000, big_reason));
+
+    stop_test_server();
+}
 
 void test_websocket_api_run(void) {
     ESP_LOGI(TAG, "Running WebSocket API tests");
@@ -352,8 +589,16 @@ void test_websocket_api_run(void) {
     RUN_TEST(test_ws_send_text_null_ws);
     RUN_TEST(test_ws_send_text_null_text);
 
+    // Send-path locking / reason clamp
+    RUN_TEST(test_ws_send_apis_lock_guarded_after_init);
+
     // Close tests
     RUN_TEST(test_ws_close_null_ws);
+
+    // Lifecycle tests (frame error handling / stop-time disconnect events)
+    RUN_TEST(test_ws_invalid_frame_closes_connection);
+    RUN_TEST(test_ws_stop_fires_disconnect_event);
+    RUN_TEST(test_ws_headers_readable_after_upgrade);
 
     // Broadcast tests
     RUN_TEST(test_ws_broadcast_null_server);

@@ -6,15 +6,39 @@
 
 static const char* TAG = "TEST_WS_FRAME";
 
-// Test parsing unmasked text frame
-static void test_parse_unmasked_text_frame(void)
+// Test that an unmasked client data frame is rejected (RFC 6455 5.1).
+// A server MUST fail the connection on any unmasked frame from a client.
+static void test_parse_unmasked_frame_rejected(void)
 {
     connection_t conn = {0};
     ws_frame_context_t ctx = {0};
     size_t consumed;
 
-    // Create simple text frame: FIN=1, opcode=TEXT, mask=0, length=5, payload="Hello"
+    // Simple text frame: FIN=1, opcode=TEXT, mask=0, length=5, payload="Hello"
+    // Unmasked (mask bit clear) => must be rejected.
     uint8_t frame[] = {0x81, 0x05, 'H', 'e', 'l', 'l', 'o'};
+
+    ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
+                                               &ctx, &consumed);
+
+    TEST_ASSERT_EQUAL(WS_FRAME_ERROR, result);
+
+    if (ctx.payload_buffer) free(ctx.payload_buffer);
+}
+
+// Test parsing a normal masked data frame (mask key 0 leaves payload intact)
+static void test_parse_masked_data_frame_ok(void)
+{
+    connection_t conn = {0};
+    ws_frame_context_t ctx = {0};
+    size_t consumed;
+
+    // Masked text frame with an all-zero mask key: masked bytes == plaintext.
+    uint8_t frame[] = {
+        0x81, 0x85,             // FIN=1, TEXT, MASK=1, len=5
+        0x00, 0x00, 0x00, 0x00, // Mask key (0 => payload unchanged)
+        'H', 'e', 'l', 'l', 'o'
+    };
 
     ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
                                                &ctx, &consumed);
@@ -22,12 +46,12 @@ static void test_parse_unmasked_text_frame(void)
     TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
     TEST_ASSERT_TRUE(conn.ws_fin);
     TEST_ASSERT_EQUAL(WS_OPCODE_TEXT, conn.ws_opcode);
-    TEST_ASSERT_FALSE(conn.ws_masked);
+    TEST_ASSERT_TRUE(conn.ws_masked);
     TEST_ASSERT_EQUAL(5, conn.ws_payload_len);
     TEST_ASSERT_EQUAL(sizeof(frame), consumed);
+    TEST_ASSERT_EQUAL_MEMORY("Hello", &frame[6], 5);
 
-    // Verify payload is unchanged (unmasked)
-    TEST_ASSERT_EQUAL_MEMORY("Hello", &frame[2], 5);
+    if (ctx.payload_buffer) free(ctx.payload_buffer);
 }
 
 // Test parsing masked text frame
@@ -69,16 +93,21 @@ static void test_parse_extended_length_16(void)
     ws_frame_context_t ctx = {0};
     size_t consumed;
 
-    // Frame with 126 byte payload (16-bit length)
-    uint8_t frame[132];
-    frame[0] = 0x82; // FIN=1, BINARY
-    frame[1] = 126;  // Extended 16-bit length follows
-    frame[2] = 0x00; // High byte
-    frame[3] = 0x7E; // Low byte = 126
+    // Masked frame with 126 byte payload (16-bit length).
+    // Mask key is all-zero, so masked payload == plaintext.
+    uint8_t frame[136];
+    frame[0] = 0x82;        // FIN=1, BINARY
+    frame[1] = 0x80 | 126;  // MASK=1, extended 16-bit length follows
+    frame[2] = 0x00;        // High byte
+    frame[3] = 0x7E;        // Low byte = 126
+    frame[4] = 0x00;        // Mask key
+    frame[5] = 0x00;
+    frame[6] = 0x00;
+    frame[7] = 0x00;
 
     // Fill with test pattern
     for (int i = 0; i < 126; i++) {
-        frame[4 + i] = i & 0xFF;
+        frame[8 + i] = i & 0xFF;
     }
 
     ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
@@ -87,7 +116,9 @@ static void test_parse_extended_length_16(void)
     TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
     TEST_ASSERT_EQUAL(WS_OPCODE_BINARY, conn.ws_opcode);
     TEST_ASSERT_EQUAL(126, conn.ws_payload_len);
-    TEST_ASSERT_EQUAL(130, consumed); // 1 + 1 + 2 + 126
+    TEST_ASSERT_EQUAL(134, consumed); // 1 + 1 + 2 + 4 (mask) + 126
+
+    if (ctx.payload_buffer) free(ctx.payload_buffer);
 }
 
 // Test parsing 64-bit extended length (len byte 127 + 8 length bytes)
@@ -97,16 +128,18 @@ static void test_parse_extended_length_64(void)
     ws_frame_context_t ctx = {0};
     size_t consumed;
 
-    // Frame with 300-byte payload declared via the 64-bit length field
+    // Masked frame with 300-byte payload declared via the 64-bit length field.
+    // Mask key is all-zero, so masked payload == plaintext.
     enum { WS64_PAYLOAD = 300 };
-    static uint8_t frame[10 + WS64_PAYLOAD];
-    frame[0] = 0x82;  // FIN=1, BINARY
-    frame[1] = 127;   // 64-bit extended length follows
+    static uint8_t frame[14 + WS64_PAYLOAD];
+    frame[0] = 0x82;        // FIN=1, BINARY
+    frame[1] = 0x80 | 127;  // MASK=1, 64-bit extended length follows
     memset(&frame[2], 0, 8);
     frame[8] = (WS64_PAYLOAD >> 8) & 0xFF;
     frame[9] = WS64_PAYLOAD & 0xFF;
+    memset(&frame[10], 0, 4);  // Mask key (0 => payload unchanged)
     for (int i = 0; i < WS64_PAYLOAD; i++) {
-        frame[10 + i] = i & 0xFF;
+        frame[14 + i] = i & 0xFF;
     }
 
     ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
@@ -117,9 +150,12 @@ static void test_parse_extended_length_64(void)
     TEST_ASSERT_EQUAL(WS64_PAYLOAD, conn.ws_payload_len);
     TEST_ASSERT_EQUAL(sizeof(frame), consumed);
     TEST_ASSERT_EQUAL(WS64_PAYLOAD, ctx.payload_received);
-    TEST_ASSERT_EQUAL(42, ctx.payload_buffer[42]);
+    // Whole payload arrived in one slice: zero-copy contract means
+    // payload_ptr points into the input buffer (no accumulation copy).
+    TEST_ASSERT_EQUAL_PTR(&frame[14], ctx.payload_ptr);
+    TEST_ASSERT_EQUAL(42, ctx.payload_ptr[42]);
 
-    free(ctx.payload_buffer);
+    if (ctx.payload_buffer) free(ctx.payload_buffer);
 }
 
 // 64-bit length above the 64KB cap must be rejected, not truncated
@@ -131,7 +167,7 @@ static void test_parse_extended_length_64_too_large(void)
 
     uint8_t frame[10];
     frame[0] = 0x82;
-    frame[1] = 127;
+    frame[1] = 0x80 | 127;  // MASK=1 so the too-large check (not the mask rule) fires
     memset(&frame[2], 0, 8);
     frame[6] = 0x00;
     frame[7] = 0x01;  // 0x10000 = 65536 (> 65535 cap)
@@ -153,7 +189,7 @@ static void test_parse_extended_length_64_upper_bits(void)
 
     uint8_t frame[10];
     frame[0] = 0x82;
-    frame[1] = 127;
+    frame[1] = 0x80 | 127;  // MASK=1 so the upper-bits check (not the mask rule) fires
     memset(&frame[2], 0, 8);
     frame[2] = 0x01;  // bit in the upper 32 bits of the 64-bit length
 
@@ -171,20 +207,23 @@ static void test_parse_extended_length_64_split(void)
     ws_frame_context_t ctx = {0};
     size_t consumed;
 
+    // Masked frame (14-byte header: opcode + len + 8 length + 4 mask).
+    // Mask key is all-zero, so masked payload == plaintext.
     enum { WS64S_PAYLOAD = 200 };
-    static uint8_t frame[10 + WS64S_PAYLOAD];
+    static uint8_t frame[14 + WS64S_PAYLOAD];
     frame[0] = 0x82;
-    frame[1] = 127;
+    frame[1] = 0x80 | 127;  // MASK=1
     memset(&frame[2], 0, 8);
     frame[9] = WS64S_PAYLOAD;  // 200 fits in the low byte
+    memset(&frame[10], 0, 4);  // Mask key
     for (int i = 0; i < WS64S_PAYLOAD; i++) {
-        frame[10 + i] = i & 0xFF;
+        frame[14 + i] = i & 0xFF;
     }
 
-    // Feed the 10-byte header one byte at a time
+    // Feed the 14-byte header one byte at a time
     size_t offset = 0;
     ws_frame_result_t result = WS_FRAME_NEED_MORE;
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 14; i++) {
         result = ws_process_frame(&conn, frame + offset, 1, &ctx, &consumed);
         TEST_ASSERT_EQUAL(WS_FRAME_NEED_MORE, result);
         offset += consumed;
@@ -195,8 +234,11 @@ static void test_parse_extended_length_64_split(void)
     TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
     TEST_ASSERT_EQUAL(WS64S_PAYLOAD, conn.ws_payload_len);
     TEST_ASSERT_EQUAL(WS64S_PAYLOAD, ctx.payload_received);
+    // Only the header was split - the whole payload arrived in the final
+    // slice, so the zero-copy contract applies (payload_ptr -> input).
+    TEST_ASSERT_EQUAL_PTR(frame + offset, ctx.payload_ptr);
 
-    free(ctx.payload_buffer);
+    if (ctx.payload_buffer) free(ctx.payload_buffer);
 }
 
 // Test parsing fragmented frame
@@ -206,8 +248,8 @@ static void test_parse_fragmented_frame(void)
     ws_frame_context_t ctx = {0};
     size_t consumed;
 
-    // First fragment: FIN=0, TEXT
-    uint8_t frame1[] = {0x01, 0x03, 'H', 'e', 'l'};
+    // First fragment: FIN=0, TEXT (masked, mask key 0 => payload unchanged)
+    uint8_t frame1[] = {0x01, 0x83, 0x00, 0x00, 0x00, 0x00, 'H', 'e', 'l'};
     ws_frame_result_t result = ws_process_frame(&conn, frame1, sizeof(frame1),
                                                &ctx, &consumed);
 
@@ -215,14 +257,16 @@ static void test_parse_fragmented_frame(void)
     TEST_ASSERT_FALSE(conn.ws_fin);
     TEST_ASSERT_EQUAL(WS_OPCODE_TEXT, conn.ws_opcode);
 
-    // Continuation fragment: FIN=1, CONTINUATION
+    // Continuation fragment: FIN=1, CONTINUATION (masked)
     ctx.state = WS_STATE_OPCODE; // Reset for next frame
-    uint8_t frame2[] = {0x80, 0x02, 'l', 'o'};
+    uint8_t frame2[] = {0x80, 0x82, 0x00, 0x00, 0x00, 0x00, 'l', 'o'};
     result = ws_process_frame(&conn, frame2, sizeof(frame2), &ctx, &consumed);
 
     TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
     TEST_ASSERT_TRUE(conn.ws_fin);
     TEST_ASSERT_EQUAL(WS_OPCODE_CONTINUATION, conn.ws_opcode);
+
+    if (ctx.payload_buffer) free(ctx.payload_buffer);
 }
 
 // Test parsing control frames
@@ -232,28 +276,30 @@ static void test_parse_control_frames(void)
     ws_frame_context_t ctx = {0};
     size_t consumed;
 
-    // Close frame
-    uint8_t close_frame[] = {0x88, 0x02, 0x03, 0xE8}; // Code 1000
+    // Close frame (masked, mask key 0 => payload unchanged). Code 1000.
+    uint8_t close_frame[] = {0x88, 0x82, 0x00, 0x00, 0x00, 0x00, 0x03, 0xE8};
     ws_frame_result_t result = ws_process_frame(&conn, close_frame,
                                                sizeof(close_frame), &ctx, &consumed);
     TEST_ASSERT_EQUAL(WS_FRAME_CLOSE, result);
     TEST_ASSERT_EQUAL(WS_OPCODE_CLOSE, conn.ws_opcode);
 
-    // Ping frame
+    // Ping frame (masked)
     ctx.state = WS_STATE_OPCODE;
-    uint8_t ping_frame[] = {0x89, 0x04, 'p', 'i', 'n', 'g'};
+    uint8_t ping_frame[] = {0x89, 0x84, 0x00, 0x00, 0x00, 0x00, 'p', 'i', 'n', 'g'};
     result = ws_process_frame(&conn, ping_frame, sizeof(ping_frame),
                              &ctx, &consumed);
     TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
     TEST_ASSERT_EQUAL(WS_OPCODE_PING, conn.ws_opcode);
 
-    // Pong frame
+    // Pong frame (masked)
     ctx.state = WS_STATE_OPCODE;
-    uint8_t pong_frame[] = {0x8A, 0x04, 'p', 'o', 'n', 'g'};
+    uint8_t pong_frame[] = {0x8A, 0x84, 0x00, 0x00, 0x00, 0x00, 'p', 'o', 'n', 'g'};
     result = ws_process_frame(&conn, pong_frame, sizeof(pong_frame),
                              &ctx, &consumed);
     TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
     TEST_ASSERT_EQUAL(WS_OPCODE_PONG, conn.ws_opcode);
+
+    if (ctx.payload_buffer) free(ctx.payload_buffer);
 }
 
 // Test parsing frame received in chunks
@@ -263,8 +309,9 @@ static void test_parse_frame_in_chunks(void)
     ws_frame_context_t ctx = {0};
     size_t consumed;
 
-    // Frame to be received in chunks
-    uint8_t full_frame[] = {0x81, 0x05, 'H', 'e', 'l', 'l', 'o'};
+    // Masked frame to be received in chunks (mask key 0 => payload unchanged)
+    uint8_t full_frame[] = {0x81, 0x85, 0x00, 0x00, 0x00, 0x00,
+                            'H', 'e', 'l', 'l', 'o'};
 
     // First chunk - just opcode byte
     ws_frame_result_t result = ws_process_frame(&conn, full_frame, 1,
@@ -276,14 +323,20 @@ static void test_parse_frame_in_chunks(void)
     result = ws_process_frame(&conn, &full_frame[1], 1, &ctx, &consumed);
     TEST_ASSERT_EQUAL(WS_FRAME_NEED_MORE, result);
 
-    // Third chunk - partial payload
-    result = ws_process_frame(&conn, &full_frame[2], 3, &ctx, &consumed);
+    // Third chunk - mask key (4 bytes)
+    result = ws_process_frame(&conn, &full_frame[2], 4, &ctx, &consumed);
     TEST_ASSERT_EQUAL(WS_FRAME_NEED_MORE, result);
 
-    // Fourth chunk - remaining payload
-    result = ws_process_frame(&conn, &full_frame[5], 2, &ctx, &consumed);
+    // Fourth chunk - partial payload
+    result = ws_process_frame(&conn, &full_frame[6], 3, &ctx, &consumed);
+    TEST_ASSERT_EQUAL(WS_FRAME_NEED_MORE, result);
+
+    // Fifth chunk - remaining payload
+    result = ws_process_frame(&conn, &full_frame[9], 2, &ctx, &consumed);
     TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
     TEST_ASSERT_EQUAL(5, conn.ws_payload_len);
+
+    if (ctx.payload_buffer) free(ctx.payload_buffer);
 }
 
 // Test invalid frames
@@ -306,9 +359,11 @@ static void test_parse_invalid_frames(void)
                              sizeof(fragmented_control), &ctx, &consumed);
     TEST_ASSERT_EQUAL(WS_FRAME_ERROR, result);
 
-    // Control frame with > 125 byte payload (invalid)
+    // Control frame using the 126 extended-length form (invalid: control
+    // frames must be <=125 and must not use the extended length forms).
+    // Masked so the extended-length rule fires, not the unmasked-frame rule.
     ctx.state = WS_STATE_OPCODE;
-    uint8_t large_control[] = {0x89, 0x7E, 0x00, 0x7E}; // PING with 126 bytes
+    uint8_t large_control[] = {0x89, 0xFE, 0x00, 0x7E}; // PING, MASK=1, len form 126
     result = ws_process_frame(&conn, large_control, sizeof(large_control),
                              &ctx, &consumed);
     TEST_ASSERT_EQUAL(WS_FRAME_ERROR, result);
@@ -609,7 +664,8 @@ static void test_frame_zero_payload(void)
     ws_frame_context_t ctx = {0};
     size_t consumed;
 
-    uint8_t frame[] = {0x81, 0x00}; // FIN=1, TEXT, len=0
+    // FIN=1, TEXT, MASK=1, len=0 (mask key 0)
+    uint8_t frame[] = {0x81, 0x80, 0x00, 0x00, 0x00, 0x00};
     ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
                                                 &ctx, &consumed);
 
@@ -624,10 +680,13 @@ static void test_close_frame_empty(void)
     ws_frame_context_t ctx = {0};
     size_t consumed;
 
-    uint8_t frame[] = {0x88, 0x00}; // Close with no payload
+    // Close with no payload (masked, mask key 0)
+    uint8_t frame[] = {0x88, 0x80, 0x00, 0x00, 0x00, 0x00};
     ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
                                                 &ctx, &consumed);
     TEST_ASSERT_EQUAL(WS_FRAME_CLOSE, result);
+
+    if (ctx.payload_buffer) free(ctx.payload_buffer);
 }
 
 // Test close frame with 1-byte payload (invalid - should have 0 or 2+ bytes)
@@ -637,11 +696,14 @@ static void test_close_frame_one_byte(void)
     ws_frame_context_t ctx = {0};
     size_t consumed;
 
-    uint8_t frame[] = {0x88, 0x01, 0x00}; // Close with 1 byte payload
+    // Close with 1 byte payload (masked, mask key 0)
+    uint8_t frame[] = {0x88, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00};
     ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
                                                 &ctx, &consumed);
     // 1-byte close payload is technically invalid, but implementations may vary
     TEST_ASSERT_TRUE(result == WS_FRAME_CLOSE || result == WS_FRAME_ERROR);
+
+    if (ctx.payload_buffer) free(ctx.payload_buffer);
 }
 
 // Test frame_ctx_init with NULL
@@ -871,6 +933,9 @@ static void test_fast_path_partial_payload(void) {
     TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
     TEST_ASSERT_EQUAL(15, consumed);
     TEST_ASSERT_EQUAL(20, conn.ws_payload_len);
+    // Payload spanned two calls: accumulation path, payload_ptr must
+    // reference the internal payload buffer.
+    TEST_ASSERT_EQUAL_PTR(ctx.payload_buffer, ctx.payload_ptr);
 
     // Clean up
     if (ctx.payload_buffer) free(ctx.payload_buffer);
@@ -903,9 +968,9 @@ static void test_split_ping_payload(void)
     ws_frame_context_t ctx = {0};
     size_t consumed;
 
-    // PING frame with 4-byte payload, split across two calls
-    // First part: header (opcode + length) but only 2 bytes of payload
-    uint8_t part1[] = {0x89, 0x04, 'P', 'I'};  // PING, len=4, partial payload
+    // PING frame with 4-byte payload, split across two calls (masked, mask key 0)
+    // First part: header (opcode + length + mask) but only 2 bytes of payload
+    uint8_t part1[] = {0x89, 0x84, 0x00, 0x00, 0x00, 0x00, 'P', 'I'};
 
     ws_frame_result_t result = ws_process_frame(&conn, part1, sizeof(part1),
                                                 &ctx, &consumed);
@@ -944,8 +1009,8 @@ static void test_close_frame_invalid_status_codes(void)
         connection_t conn = {0};
         ws_frame_context_t ctx = {0};
         size_t consumed;
-        // Close frame with status code 999 (0x03E7)
-        uint8_t frame[] = {0x88, 0x02, 0x03, 0xE7};
+        // Close frame with status code 999 (0x03E7), masked (mask key 0)
+        uint8_t frame[] = {0x88, 0x82, 0x00, 0x00, 0x00, 0x00, 0x03, 0xE7};
         ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
                                                     &ctx, &consumed);
         TEST_ASSERT_EQUAL_MESSAGE(WS_FRAME_ERROR, result,
@@ -958,7 +1023,7 @@ static void test_close_frame_invalid_status_codes(void)
         connection_t conn = {0};
         ws_frame_context_t ctx = {0};
         size_t consumed;
-        uint8_t frame[] = {0x88, 0x02, 0x03, 0xEC};  // 1004
+        uint8_t frame[] = {0x88, 0x82, 0x00, 0x00, 0x00, 0x00, 0x03, 0xEC};  // 1004, masked
         ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
                                                     &ctx, &consumed);
         TEST_ASSERT_EQUAL_MESSAGE(WS_FRAME_ERROR, result,
@@ -971,7 +1036,7 @@ static void test_close_frame_invalid_status_codes(void)
         connection_t conn = {0};
         ws_frame_context_t ctx = {0};
         size_t consumed;
-        uint8_t frame[] = {0x88, 0x02, 0x13, 0x88};  // 5000
+        uint8_t frame[] = {0x88, 0x82, 0x00, 0x00, 0x00, 0x00, 0x13, 0x88};  // 5000, masked
         ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
                                                     &ctx, &consumed);
         TEST_ASSERT_EQUAL_MESSAGE(WS_FRAME_ERROR, result,
@@ -987,7 +1052,7 @@ static void test_close_frame_valid_status_codes(void)
         connection_t conn = {0};
         ws_frame_context_t ctx = {0};
         size_t consumed;
-        uint8_t frame[] = {0x88, 0x02, 0x03, 0xE8};  // 1000
+        uint8_t frame[] = {0x88, 0x82, 0x00, 0x00, 0x00, 0x00, 0x03, 0xE8};  // 1000, masked
         ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
                                                     &ctx, &consumed);
         TEST_ASSERT_EQUAL_MESSAGE(WS_FRAME_CLOSE, result,
@@ -1000,7 +1065,7 @@ static void test_close_frame_valid_status_codes(void)
         connection_t conn = {0};
         ws_frame_context_t ctx = {0};
         size_t consumed;
-        uint8_t frame[] = {0x88, 0x02, 0x13, 0x87};  // 4999
+        uint8_t frame[] = {0x88, 0x82, 0x00, 0x00, 0x00, 0x00, 0x13, 0x87};  // 4999, masked
         ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
                                                     &ctx, &consumed);
         TEST_ASSERT_EQUAL_MESSAGE(WS_FRAME_CLOSE, result,
@@ -1009,10 +1074,367 @@ static void test_close_frame_valid_status_codes(void)
     }
 }
 
+// ========== RFC 6455 5.5: control frames must not use extended length ==========
+
+// A control frame that declares its length via the 126 (16-bit) or 127 (64-bit)
+// extended forms must be rejected, even before the extended length is read.
+static void test_control_frame_extended_length_rejected(void)
+{
+    // CLOSE using the 126 (16-bit) length form => reject
+    {
+        connection_t conn = {0};
+        ws_frame_context_t ctx = {0};
+        size_t consumed;
+        // 0x88 CLOSE, MASK=1, len form 126; 16-bit length says 130
+        uint8_t frame[] = {0x88, 0xFE, 0x00, 0x82};
+        ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
+                                                    &ctx, &consumed);
+        TEST_ASSERT_EQUAL_MESSAGE(WS_FRAME_ERROR, result,
+            "CLOSE with 16-bit extended length must be rejected");
+        if (ctx.payload_buffer) free(ctx.payload_buffer);
+    }
+
+    // PING using the 127 (64-bit) length form => reject
+    {
+        connection_t conn = {0};
+        ws_frame_context_t ctx = {0};
+        size_t consumed;
+        // 0x89 PING, MASK=1, len form 127; 64-bit length says 200
+        uint8_t frame[] = {0x89, 0xFF, 0x00, 0x00, 0x00, 0x00,
+                           0x00, 0x00, 0x00, 0xC8};
+        ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
+                                                    &ctx, &consumed);
+        TEST_ASSERT_EQUAL_MESSAGE(WS_FRAME_ERROR, result,
+            "PING with 64-bit extended length must be rejected");
+        if (ctx.payload_buffer) free(ctx.payload_buffer);
+    }
+}
+
+// A valid masked control frame (payload <= 125) must still parse correctly.
+static void test_masked_control_frame_ok(void)
+{
+    connection_t conn = {0};
+    conn.fd = -1;  // Prevent actual send attempts on PING->PONG
+    ws_frame_context_t ctx = {0};
+    size_t consumed;
+
+    // PING, MASK=1, len=4 (mask key 0 => payload unchanged)
+    uint8_t frame[] = {0x89, 0x84, 0x00, 0x00, 0x00, 0x00, 'p', 'i', 'n', 'g'};
+    ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
+                                                &ctx, &consumed);
+
+    TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
+    TEST_ASSERT_EQUAL(WS_OPCODE_PING, conn.ws_opcode);
+    TEST_ASSERT_TRUE(conn.ws_masked);
+    TEST_ASSERT_EQUAL(4, conn.ws_payload_len);
+
+    if (ctx.payload_buffer) free(ctx.payload_buffer);
+}
+
+// ============================================================================
+// payload_ptr zero-copy contract + payload buffer shrink tests
+// ============================================================================
+
+// Single-slice masked data frame: payload_ptr must point INTO the input
+// buffer (zero-copy) and reference the unmasked payload. No accumulation
+// buffer may be allocated for this path.
+static void test_payload_ptr_zero_copy_single_slice(void)
+{
+    connection_t conn = {0};
+    ws_frame_context_t ctx = {0};
+    size_t consumed;
+
+    // Masked text frame, real (non-zero) mask key: "Hello"
+    uint8_t frame[] = {
+        0x81, 0x85,             // FIN=1, TEXT, MASK=1, len=5
+        0x37, 0xfa, 0x21, 0x3d, // Mask key
+        0x7f, 0x9f, 0x4d, 0x51, 0x58  // Masked "Hello"
+    };
+
+    ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
+                                                &ctx, &consumed);
+
+    TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
+    TEST_ASSERT_EQUAL(sizeof(frame), consumed);
+    TEST_ASSERT_EQUAL(5, ctx.payload_received);
+    // Zero-copy: payload_ptr points into the INPUT buffer, at the
+    // (in-place unmasked) payload start.
+    TEST_ASSERT_EQUAL_PTR(&frame[6], ctx.payload_ptr);
+    TEST_ASSERT_EQUAL_MEMORY("Hello", ctx.payload_ptr, 5);
+    // Proof no copy happened: the accumulation buffer was never allocated.
+    TEST_ASSERT_NULL(ctx.payload_buffer);
+}
+
+// Frame whose payload spans two ws_process_frame calls: must take the
+// accumulation path, with payload_ptr == payload_buffer and correct
+// (unmask-offset-aware) content.
+static void test_payload_ptr_split_frame_accumulates(void)
+{
+    connection_t conn = {0};
+    ws_frame_context_t ctx = {0};
+    size_t consumed;
+
+    static const char plain[] = "ABCDEFGH";  // 8 bytes
+    uint8_t frame[14];
+    frame[0] = 0x81;        // FIN=1, TEXT
+    frame[1] = 0x80 | 8;    // MASK=1, len=8
+    frame[2] = 0x11;        // Mask key
+    frame[3] = 0x22;
+    frame[4] = 0x33;
+    frame[5] = 0x44;
+    for (int i = 0; i < 8; i++) {
+        frame[6 + i] = (uint8_t)plain[i] ^ frame[2 + (i % 4)];
+    }
+
+    // First call: header + 3 of 8 payload bytes
+    ws_frame_result_t result = ws_process_frame(&conn, frame, 9, &ctx, &consumed);
+    TEST_ASSERT_EQUAL(WS_FRAME_NEED_MORE, result);
+    TEST_ASSERT_EQUAL(9, consumed);
+
+    // Second call: remaining 5 payload bytes
+    result = ws_process_frame(&conn, &frame[9], 5, &ctx, &consumed);
+    TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
+    TEST_ASSERT_EQUAL(5, consumed);
+    TEST_ASSERT_EQUAL(8, ctx.payload_received);
+
+    // Accumulation path: payload_ptr must reference the internal buffer
+    TEST_ASSERT_NOT_NULL(ctx.payload_buffer);
+    TEST_ASSERT_EQUAL_PTR(ctx.payload_buffer, ctx.payload_ptr);
+    TEST_ASSERT_EQUAL_MEMORY(plain, ctx.payload_ptr, 8);
+
+    free(ctx.payload_buffer);
+}
+
+// Zero-length data frame: payload_ptr must be NULL (the only case where
+// NULL is allowed by the contract).
+static void test_payload_ptr_zero_length_frame(void)
+{
+    connection_t conn = {0};
+    ws_frame_context_t ctx = {0};
+    size_t consumed;
+
+    // Poison payload_ptr to prove it is (re)set on this completion
+    ctx.payload_ptr = (const uint8_t*)(uintptr_t)0xDEADBEEF;
+
+    // FIN=1, TEXT, MASK=1, len=0
+    uint8_t frame[] = {0x81, 0x80, 0x00, 0x00, 0x00, 0x00};
+    ws_frame_result_t result = ws_process_frame(&conn, frame, sizeof(frame),
+                                                &ctx, &consumed);
+
+    TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
+    TEST_ASSERT_EQUAL(0, ctx.payload_received);
+    TEST_ASSERT_NULL(ctx.payload_ptr);
+
+    if (ctx.payload_buffer) free(ctx.payload_buffer);
+}
+
+// After a large (>WS_PAYLOAD_SHRINK_THRESHOLD) frame grows the payload
+// buffer, starting the next frame must shrink it back to
+// WS_DEFAULT_BUFFER_SIZE.
+static void test_payload_buffer_shrinks_after_large_frame(void)
+{
+    connection_t conn = {0};
+    ws_frame_context_t ctx = {0};
+    size_t consumed;
+
+    // 2000-byte masked binary frame (16-bit extended length, mask key 0).
+    // Delivered in two slices so it takes the accumulation path and
+    // actually grows payload_buffer (a single slice would be zero-copy).
+    enum { BIG_PAYLOAD = 2000, BIG_HDR = 8, SPLIT_AT = BIG_HDR + 1200 };
+    static uint8_t frame[BIG_HDR + BIG_PAYLOAD];
+    frame[0] = 0x82;                     // FIN=1, BINARY
+    frame[1] = 0x80 | 126;               // MASK=1, 16-bit length
+    frame[2] = (BIG_PAYLOAD >> 8) & 0xFF;
+    frame[3] = BIG_PAYLOAD & 0xFF;
+    memset(&frame[4], 0, 4);             // Mask key (0 => payload unchanged)
+    for (int i = 0; i < BIG_PAYLOAD; i++) {
+        frame[BIG_HDR + i] = i & 0xFF;
+    }
+
+    // Slice 1: header + 1200 payload bytes
+    ws_frame_result_t result = ws_process_frame(&conn, frame, SPLIT_AT,
+                                                &ctx, &consumed);
+    TEST_ASSERT_EQUAL(WS_FRAME_NEED_MORE, result);
+    TEST_ASSERT_EQUAL(SPLIT_AT, consumed);
+    TEST_ASSERT_TRUE(ctx.payload_buffer_size > WS_PAYLOAD_SHRINK_THRESHOLD);
+
+    // Slice 2: remaining payload
+    result = ws_process_frame(&conn, frame + SPLIT_AT,
+                              sizeof(frame) - SPLIT_AT, &ctx, &consumed);
+    TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
+    TEST_ASSERT_EQUAL(BIG_PAYLOAD, ctx.payload_received);
+    TEST_ASSERT_EQUAL_PTR(ctx.payload_buffer, ctx.payload_ptr);
+    TEST_ASSERT_EQUAL(1500 & 0xFF, ctx.payload_ptr[1500]);
+
+    // Mimic the production caller's per-frame reset, then start a new
+    // small frame: the ratcheted buffer must shrink back to default.
+    ctx.state = WS_STATE_OPCODE;
+    ctx.payload_received = 0;
+
+    uint8_t small[] = {0x81, 0x85, 0x00, 0x00, 0x00, 0x00,
+                       'W', 'o', 'r', 'l', 'd'};
+    result = ws_process_frame(&conn, small, sizeof(small), &ctx, &consumed);
+    TEST_ASSERT_EQUAL(WS_FRAME_COMPLETE, result);
+    TEST_ASSERT_EQUAL(WS_DEFAULT_BUFFER_SIZE, ctx.payload_buffer_size);
+    // Small frame delivered zero-copy from the new input slice
+    TEST_ASSERT_EQUAL_PTR(&small[6], ctx.payload_ptr);
+    TEST_ASSERT_EQUAL_MEMORY("World", ctx.payload_ptr, 5);
+
+    if (ctx.payload_buffer) free(ctx.payload_buffer);
+}
+
+// ==================== Frame send: scatter-gather vs fallback ====================
+
+// Capture mocks for ws_send_frame's send-function contract. The single-buffer
+// mock records each call's length; the two-buffer mock records both parts of
+// one scatter-gather call. Both append into one contiguous capture so byte
+// order across calls/parts can be asserted.
+#define SEND_CAP_MAX 1024
+static uint8_t s_send_cap[SEND_CAP_MAX];
+static size_t s_send_cap_len;
+static int s_send1_calls;
+static size_t s_send1_first_len;
+static int s_send2_calls;
+static size_t s_send2_len0;
+static size_t s_send2_len1;
+
+static void reset_send_capture(void)
+{
+    s_send_cap_len = 0;
+    s_send1_calls = 0;
+    s_send1_first_len = 0;
+    s_send2_calls = 0;
+    s_send2_len0 = 0;
+    s_send2_len1 = 0;
+}
+
+static void capture_bytes(const void* data, size_t len)
+{
+    if (data && len > 0 && s_send_cap_len + len <= SEND_CAP_MAX) {
+        memcpy(s_send_cap + s_send_cap_len, data, len);
+        s_send_cap_len += len;
+    }
+}
+
+static ssize_t mock_send1(connection_t* conn, const void* data, size_t len, int flags)
+{
+    (void)conn; (void)flags;
+    if (s_send1_calls == 0) {
+        s_send1_first_len = len;
+    }
+    s_send1_calls++;
+    capture_bytes(data, len);
+    return (ssize_t)len;
+}
+
+static ssize_t mock_send2(connection_t* conn, const void* buf0, size_t len0,
+                          const void* buf1, size_t len1)
+{
+    (void)conn;
+    s_send2_calls++;
+    s_send2_len0 = len0;
+    s_send2_len1 = len1;
+    capture_bytes(buf0, len0);
+    capture_bytes(buf1, len1);
+    return (ssize_t)(len0 + len1);
+}
+
+// >256B frame with a two-buffer send func registered: ONE scatter-gather call
+// carrying [frame_header, payload], arriving contiguous and in order
+static void test_send_frame_large_uses_two_buffer_func(void)
+{
+    connection_t conn = {0};
+    reset_send_capture();
+    ws_set_send_func(mock_send1);
+    ws_set_send2_func(mock_send2);
+
+    static uint8_t payload[300];
+    for (size_t i = 0; i < sizeof(payload); i++) {
+        payload[i] = (uint8_t)(i & 0xFF);
+    }
+
+    int ret = ws_send_frame(&conn, WS_OPCODE_BINARY, payload, sizeof(payload), false);
+
+    ws_set_send_func(NULL);
+    ws_set_send2_func(NULL);
+
+    // 4-byte header (16-bit extended length) + 300-byte payload
+    TEST_ASSERT_EQUAL(304, ret);
+    TEST_ASSERT_EQUAL(1, s_send2_calls);           // Exactly one 2-buffer call
+    TEST_ASSERT_EQUAL(0, s_send1_calls);           // Single-buffer func unused
+    TEST_ASSERT_EQUAL(4, s_send2_len0);            // buf0 = frame header
+    TEST_ASSERT_EQUAL(sizeof(payload), s_send2_len1);  // buf1 = payload
+
+    // Contiguous [header|payload]: FIN+BINARY, 126, len hi/lo, then payload
+    TEST_ASSERT_EQUAL(304, s_send_cap_len);
+    TEST_ASSERT_EQUAL_UINT8(0x82, s_send_cap[0]);
+    TEST_ASSERT_EQUAL_UINT8(126, s_send_cap[1]);
+    TEST_ASSERT_EQUAL_UINT8((300 >> 8) & 0xFF, s_send_cap[2]);
+    TEST_ASSERT_EQUAL_UINT8(300 & 0xFF, s_send_cap[3]);
+    TEST_ASSERT_EQUAL_MEMORY(payload, &s_send_cap[4], sizeof(payload));
+}
+
+// Same frame with NO two-buffer func (test-mode/mock configuration): the
+// two-call fallback must still produce correct, ordered two-part output
+static void test_send_frame_large_fallback_two_calls(void)
+{
+    connection_t conn = {0};
+    reset_send_capture();
+    ws_set_send_func(mock_send1);
+    ws_set_send2_func(NULL);
+
+    static uint8_t payload[300];
+    for (size_t i = 0; i < sizeof(payload); i++) {
+        payload[i] = (uint8_t)((i * 7) & 0xFF);
+    }
+
+    int ret = ws_send_frame(&conn, WS_OPCODE_BINARY, payload, sizeof(payload), false);
+
+    ws_set_send_func(NULL);
+
+    TEST_ASSERT_EQUAL(304, ret);
+    TEST_ASSERT_EQUAL(0, s_send2_calls);
+    TEST_ASSERT_EQUAL(2, s_send1_calls);           // Header call + payload call
+    TEST_ASSERT_EQUAL(4, s_send1_first_len);       // First call = 4-byte header
+
+    TEST_ASSERT_EQUAL(304, s_send_cap_len);
+    TEST_ASSERT_EQUAL_UINT8(0x82, s_send_cap[0]);
+    TEST_ASSERT_EQUAL_UINT8(126, s_send_cap[1]);
+    TEST_ASSERT_EQUAL_UINT8((300 >> 8) & 0xFF, s_send_cap[2]);
+    TEST_ASSERT_EQUAL_UINT8(300 & 0xFF, s_send_cap[3]);
+    TEST_ASSERT_EQUAL_MEMORY(payload, &s_send_cap[4], sizeof(payload));
+}
+
+// <=256B combined frames keep the single stack-coalesced send even when the
+// two-buffer func is registered (one small buffer beats building an iovec)
+static void test_send_frame_small_stays_single_call(void)
+{
+    connection_t conn = {0};
+    reset_send_capture();
+    ws_set_send_func(mock_send1);
+    ws_set_send2_func(mock_send2);
+
+    static const uint8_t payload[100] = { [0] = 0xAB, [99] = 0xCD };
+
+    int ret = ws_send_frame(&conn, WS_OPCODE_BINARY, payload, sizeof(payload), false);
+
+    ws_set_send_func(NULL);
+    ws_set_send2_func(NULL);
+
+    TEST_ASSERT_EQUAL(102, ret);                   // 2-byte header + 100 payload
+    TEST_ASSERT_EQUAL(1, s_send1_calls);           // One combined send
+    TEST_ASSERT_EQUAL(0, s_send2_calls);           // 2-buffer func not used
+    TEST_ASSERT_EQUAL(102, s_send_cap_len);
+    TEST_ASSERT_EQUAL_UINT8(0x82, s_send_cap[0]);
+    TEST_ASSERT_EQUAL_UINT8(100, s_send_cap[1]);
+    TEST_ASSERT_EQUAL_MEMORY(payload, &s_send_cap[2], sizeof(payload));
+}
+
 void test_websocket_frame_run(void)
 {
     // Core functionality tests
-    RUN_TEST(test_parse_unmasked_text_frame);
+    RUN_TEST(test_parse_unmasked_frame_rejected);
+    RUN_TEST(test_parse_masked_data_frame_ok);
     RUN_TEST(test_parse_masked_text_frame);
     RUN_TEST(test_parse_extended_length_16);
     RUN_TEST(test_parse_extended_length_64);
@@ -1070,6 +1492,21 @@ void test_websocket_frame_run(void)
     RUN_TEST(test_compute_accept_key_null);
     RUN_TEST(test_close_frame_invalid_status_codes);
     RUN_TEST(test_close_frame_valid_status_codes);
+
+    // RFC 6455 spec-compliance tests (masking + control-frame length)
+    RUN_TEST(test_control_frame_extended_length_rejected);
+    RUN_TEST(test_masked_control_frame_ok);
+
+    // payload_ptr zero-copy contract + payload buffer shrink tests
+    RUN_TEST(test_payload_ptr_zero_copy_single_slice);
+    RUN_TEST(test_payload_ptr_split_frame_accumulates);
+    RUN_TEST(test_payload_ptr_zero_length_frame);
+    RUN_TEST(test_payload_buffer_shrinks_after_large_frame);
+
+    // Frame send: scatter-gather (2-buffer func) vs two-call fallback
+    RUN_TEST(test_send_frame_large_uses_two_buffer_func);
+    RUN_TEST(test_send_frame_large_fallback_two_calls);
+    RUN_TEST(test_send_frame_small_stays_single_call);
 
     ESP_LOGI(TAG, "WebSocket frame tests completed");
 }

@@ -7,6 +7,31 @@
 
 static const char TAG[] = "SEND_BUF";
 
+// Optional hook: invoked whenever the buffer closes a streaming file fd, so the
+// owner (the filesystem module) can release its in-flight open-file count. The
+// server registers it via send_buffer_set_file_close_cb(); it stays NULL (and
+// thus a no-op) in standalone/test builds. Kept out of send_buffer.h so the
+// shared private header does not have to change.
+static void (*s_file_close_cb)(void) = NULL;
+
+void send_buffer_set_file_close_cb(void (*cb)(void)) {
+    s_file_close_cb = cb;
+}
+
+// Close the streaming file fd (if one is open) exactly once and notify the
+// owner so its open-file accounting stays balanced. Every fd that reaches this
+// buffer came through send_buffer_start_file after the owner incremented its
+// count, so one close == one decrement.
+static void sb_close_stream_fd(send_buffer_t* sb) {
+    if (sb->file_fd >= 0) {
+        close(sb->file_fd);
+        sb->file_fd = -1;
+        if (s_file_close_cb) {
+            s_file_close_cb();
+        }
+    }
+}
+
 void send_buffer_init(send_buffer_t* sb) {
     memset(sb, 0, sizeof(send_buffer_t));
     sb->file_fd = -1;
@@ -34,10 +59,8 @@ bool send_buffer_alloc(send_buffer_t* sb) {
 }
 
 void send_buffer_free(send_buffer_t* sb) {
-    // Close any open file
-    if (sb->file_fd >= 0) {
-        close(sb->file_fd);
-    }
+    // Close any open streaming file (releases the owner's open-file count)
+    sb_close_stream_fd(sb);
 
     // Free owned memory buffer
     if (sb->mem_owned) {
@@ -57,10 +80,7 @@ void send_buffer_reset(send_buffer_t* sb) {
     sb->head = 0;
     sb->tail = 0;
 
-    if (sb->file_fd >= 0) {
-        close(sb->file_fd);
-        sb->file_fd = -1;
-    }
+    sb_close_stream_fd(sb);
     sb->file_remaining = 0;
     sb->streaming = 0;
     sb->chunked = 0;
@@ -74,6 +94,7 @@ void send_buffer_reset(send_buffer_t* sb) {
     sb->mem_ptr = NULL;
     sb->mem_remaining = 0;
     sb->mem_streaming = 0;
+    sb->overflow_warned = 0;  // New response gets a fresh backlog-cap warning
 }
 
 ssize_t send_buffer_queue(send_buffer_t* __restrict sb, const void* __restrict data, size_t len) {
@@ -153,10 +174,8 @@ bool send_buffer_start_file(send_buffer_t* sb, int file_fd, size_t file_size) {
         file_size = UINT32_MAX;
     }
 
-    // Close any existing file
-    if (sb->file_fd >= 0) {
-        close(sb->file_fd);
-    }
+    // Close any existing stream first (releases the replaced stream's count)
+    sb_close_stream_fd(sb);
 
     sb->file_fd = file_fd;
     sb->file_remaining = (uint32_t)file_size;
@@ -167,55 +186,94 @@ bool send_buffer_start_file(send_buffer_t* sb, int file_fd, size_t file_size) {
 }
 
 void send_buffer_stop_file(send_buffer_t* sb) {
-    if (sb->file_fd >= 0) {
-        close(sb->file_fd);
-        sb->file_fd = -1;
-    }
+    sb_close_stream_fd(sb);
     sb->file_remaining = 0;
     sb->streaming = 0;
 }
 
 bool send_buffer_start_mem(send_buffer_t* sb, const uint8_t* data, size_t len) {
-    if (!data || len == 0) {
-        return false;
+    return send_buffer_start_mem2(sb, data, len, NULL, 0);
+}
+
+// Two-part variant: appends [d0][d1] atomically. ONE cap check up front for
+// the combined length, ONE allocation/grow, then both copies — so a two-part
+// caller (scatter-gather send residue: header block + body) can never end up
+// with d0 queued and d1 rejected, which would put a torn response on the wire.
+bool send_buffer_start_mem2(send_buffer_t* sb, const uint8_t* d0, size_t l0,
+                            const uint8_t* d1, size_t l1) {
+    // Normalize empty parts; shift a lone second part into the first slot
+    if (!d0 || l0 == 0) {
+        d0 = d1;
+        l0 = l1;
+        d1 = NULL;
+        l1 = 0;
     }
+    if (!d1 || l1 == 0) {
+        d1 = NULL;
+        l1 = 0;
+    }
+    if (!d0 || l0 == 0) {
+        return false;  // Both parts empty/NULL (matches start_mem's contract)
+    }
+    size_t total = l0 + l1;
 
     // If a stream is already pending, append behind its unsent bytes —
     // replacing the buffer here would silently drop response data.
     if (sb->mem_owned) {
         size_t unsent = sb->mem_remaining;
+        // Cap the per-connection send backlog. A peer that stops reading
+        // (e.g. a WebSocket subscriber continuously fed by httpd_ws_publish)
+        // would otherwise grow this overflow stream without bound until OOM.
+        // Ring-pending bytes count against the cap too: they are the same
+        // unacknowledged backlog, just staged one hop closer to the socket.
+        // Checked ONCE for the combined length BEFORE anything is copied.
+        size_t backlog = send_buffer_pending(sb) + unsent + total;
+        if (backlog > SEND_BUFFER_MAX_PENDING) {
+            if (!sb->overflow_warned) {
+                sb->overflow_warned = 1;  // Warn once per response, not per call
+                ESP_LOGW(TAG, "Send backlog cap exceeded (%zu pending + %zu new > %d), dropping",
+                         send_buffer_pending(sb) + unsent, total, SEND_BUFFER_MAX_PENDING);
+            }
+            return false;
+        }
         // Compact unsent bytes to the start of the allocation, then grow.
         memmove(sb->mem_owned, sb->mem_ptr, unsent);
         sb->mem_ptr = sb->mem_owned;
-        uint8_t* grown = (uint8_t*)realloc(sb->mem_owned, unsent + len);
+        uint8_t* grown = (uint8_t*)realloc(sb->mem_owned, unsent + total);
         if (!grown) {
-            ESP_LOGW(TAG, "Failed to grow memory stream buffer (%zu bytes)", unsent + len);
+            ESP_LOGW(TAG, "Failed to grow memory stream buffer (%zu bytes)", unsent + total);
             return false;
         }
-        memcpy(grown + unsent, data, len);
+        memcpy(grown + unsent, d0, l0);
+        if (l1 > 0) {
+            memcpy(grown + unsent + l0, d1, l1);
+        }
         sb->mem_owned = grown;
         sb->mem_ptr = grown;
-        sb->mem_remaining = (uint32_t)(unsent + len);
+        sb->mem_remaining = (uint32_t)(unsent + total);
         sb->mem_streaming = 1;
         ESP_LOGD(TAG, "Appended %zu bytes to memory stream (%" PRIu32 " pending)",
-                 len, sb->mem_remaining);
+                 total, sb->mem_remaining);
         return true;
     }
 
-    // Allocate a copy so the caller's buffer can go out of scope
-    uint8_t* copy = (uint8_t*)malloc(len);
+    // Allocate a copy so the caller's buffers can go out of scope
+    uint8_t* copy = (uint8_t*)malloc(total);
     if (!copy) {
-        ESP_LOGW(TAG, "Failed to allocate memory stream buffer (%zu bytes)", len);
+        ESP_LOGW(TAG, "Failed to allocate memory stream buffer (%zu bytes)", total);
         return false;
     }
-    memcpy(copy, data, len);
+    memcpy(copy, d0, l0);
+    if (l1 > 0) {
+        memcpy(copy + l0, d1, l1);
+    }
 
     sb->mem_owned = copy;
     sb->mem_ptr = copy;
-    sb->mem_remaining = (uint32_t)len;
+    sb->mem_remaining = (uint32_t)total;
     sb->mem_streaming = 1;
 
-    ESP_LOGD(TAG, "Started memory stream: %zu bytes", len);
+    ESP_LOGD(TAG, "Started memory stream: %zu bytes", total);
     return true;
 }
 

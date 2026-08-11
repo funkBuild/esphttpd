@@ -3,6 +3,7 @@
  * @brief HTTP/WebSocket server implementation
  */
 
+#include "esp_attr.h"
 #include "esphttpd.h"
 #include "private/connection.h"
 #include "private/event_loop.h"
@@ -31,10 +32,14 @@
 #include <strings.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include "esp_timer.h"
 #ifndef CONFIG_HTTPD_USE_RAW_API
 #include <sys/socket.h>
+// struct iovec + writev()/lwip_writev() for the scatter-gather send path
+// (send_nonblocking2): one syscall carries [header_block, body] with zero copy.
+#include "lwip/sockets.h"
 #else
 // Define socket flags used as send_nonblocking parameters
 // Under raw API these are translated to raw_tcp_write flags
@@ -79,11 +84,12 @@ static const char TAG[] = "ESPHTTPD";
 
 #define MAX_MIDDLEWARES CONFIG_HTTPD_MAX_SERVER_MIDDLEWARES
 #define MAX_WS_ROUTES CONFIG_HTTPD_MAX_WS_ROUTES
-#define REQ_HEADER_BUF_SIZE 2048
 #define MAX_REQ_HEADERS CONFIG_HTTPD_MAX_REQ_HEADERS
 #define MAX_QUERY_PARAMS CONFIG_HTTPD_MAX_QUERY_PARAMS
 
-// Header entry for per-request storage
+// Header index entry: offsets into the request's recv buffer (recv_buf),
+// where keys/values are NUL-terminated in place once parsing completes.
+// recv_buf is capped at 4096 bytes, so uint16_t offsets always suffice.
 typedef struct {
     uint16_t key_offset;
     uint16_t value_offset;
@@ -106,6 +112,7 @@ typedef struct {
     httpd_ws_handler_t handler;
     void* user_ctx;
     uint32_t ping_interval_ms;
+    httpd_err_t (*authorize)(httpd_req_t* req, void* user_ctx);
 } httpd_ws_route_entry_t;
 
 // Mounted router entry
@@ -162,7 +169,9 @@ struct httpd_server {
     connection_pool_t connection_pool;
     event_handlers_t handlers;
 
-    // Filesystem (optional)
+    // Filesystem (optional). NOTE: the filesystem module currently has no
+    // production enable path — nothing in the shipping firmware sets these
+    // (test-only; see filesystem.c).
     filesystem_t* filesystem;
     bool filesystem_enabled;
 
@@ -250,18 +259,24 @@ typedef struct {
 typedef struct {
     // === Fields that NEED zeroing per request (memset target) ===
     httpd_req_t req;                      // Public request struct
-    char* header_buf;                     // Header storage (dynamically allocated)
     char* uri_buf;                        // URI storage (dynamically allocated)
     struct httpd_server* server;          // Back pointer to server
-    httpd_route_entry_t* matched_route;   // Matched route
     // Pre-received body data (received with headers) - dynamically allocated
     uint8_t* body_buf;                    // Buffer for body data (NULL if not allocated)
     size_t body_buf_len;                  // Amount of data in body_buf
     size_t body_buf_pos;                  // Current read position in body_buf
-    // HTTP header accumulation buffer (for multi-recv parsing)
-    uint8_t* recv_buf;                    // Accumulated recv data (NULL if not parsing)
+    // HTTP recv accumulation buffer. Also the backing store for the header
+    // index: keys/values are NUL-terminated IN PLACE here at parse-complete,
+    // so the buffer is retained for the whole request lifetime (and for the
+    // whole connection lifetime after a WebSocket upgrade). Freed by
+    // init_request_context (next keep-alive request), on_disconnect and
+    // httpd_stop.
+    uint8_t* recv_buf;                    // Accumulated recv data (NULL if no request yet)
     size_t recv_buf_len;                  // Amount of data accumulated
     size_t recv_buf_capacity;             // Allocated capacity
+    uint8_t* pipeline_buf;                // Bytes belonging to the next request
+    size_t pipeline_buf_len;
+    size_t pipeline_buf_capacity;
     http_parser_context_t parser_ctx;     // Persistent parser context across recv calls
     bool parsing_in_progress;             // True while headers are being accumulated
     bool recv_buf_is_heap;                // true if recv_buf was malloc'd (needs free)
@@ -330,7 +345,7 @@ static ws_context_t* preallocated_ws_contexts;
 static send_buffer_t* preallocated_send_buffers;
 
 // Global server instance (for now - could be made multi-instance later)
-static struct httpd_server server_instance;
+static EXT_RAM_BSS_ATTR struct httpd_server server_instance;
 #ifdef CONFIG_ESPHTTPD_TEST_MODE
 struct httpd_server* volatile g_server = NULL;  // Non-static for test access
 void* g_test_request_contexts = NULL;  // Non-static for test access
@@ -720,15 +735,233 @@ static ssize_t send_nonblocking(connection_t* __restrict conn, const void* __res
     return result;
 }
 
-// WebSocket send callback - wraps send_nonblocking for use by websocket.c
-// Drops the flags parameter (WebSocket frames are complete messages, no MSG_MORE needed)
-static ssize_t ws_send_callback(connection_t* conn, const void* data, size_t len) {
-    return send_nonblocking(conn, data, len, 0);
+// Two-buffer scatter-gather variant of send_nonblocking_impl: transmits
+// [buf0][buf1] (in that order) as ONE writev when the path to the socket is
+// clear — zero copy, one lwIP syscall round, any body size — and otherwise
+// queues both buffers in order behind whatever is already pending.
+//
+// No flags parameter: writev(2) takes none. The old MSG_MORE on the first
+// part was only a coalescing hint for the two-send sequence; a single writev
+// hands both parts to TCP at once, which supersedes it. Blocking is prevented
+// by O_NONBLOCK on the fd (set at accept in event_loop.c), not MSG_DONTWAIT.
+//
+// Raw-API mode keeps compiling as two sequential tcp_write-backed sends
+// (function calls, not syscalls — nothing to gain from scatter-gather there).
+static ssize_t send_nonblocking2_impl(connection_t* conn,
+                                      const void* buf0, size_t len0,
+                                      const void* buf1, size_t len1) {
+    // Degenerate cases collapse to the single-buffer path (which also handles
+    // the both-empty case by returning 0)
+    if (!buf0 || len0 == 0) {
+        return send_nonblocking_impl(conn, buf1, len1, 0);
+    }
+    if (!buf1 || len1 == 0) {
+        return send_nonblocking_impl(conn, buf0, len0, 0);
+    }
+    if (!conn) {
+        return 0;
+    }
+
+#ifdef CONFIG_HTTPD_USE_RAW_API
+    // Raw mode: two sequential existing-path writes under the caller's
+    // LOCK_TCPIP_CORE. MSG_MORE on the first part preserves the previous
+    // segment-coalescing behavior; ordering is guaranteed because
+    // send_nonblocking_impl queues behind any bytes it could not write.
+    if (send_nonblocking_impl(conn, buf0, len0, MSG_MORE) < 0) {
+        return -1;
+    }
+    if (send_nonblocking_impl(conn, buf1, len1, 0) < 0) {
+        return -1;
+    }
+    return (ssize_t)(len0 + len1);
+#else
+    send_buffer_t* sb = get_send_buffer(conn);
+    if (!sb) {
+        ESP_LOGE(TAG, "No send buffer for connection");
+        return -1;
+    }
+
+    const uint8_t* p0 = (const uint8_t*)buf0;
+    size_t r0 = len0;
+    const uint8_t* p1 = (const uint8_t*)buf1;
+    size_t r1 = len1;
+
+    // ORDERING: if ANY bytes are pending (ring or mem-stream), the new bytes
+    // must queue behind them — never writev ahead of the ring. Mirrors the
+    // single-buffer path, including the >64B opportunistic drain.
+    if (send_buffer_has_data(sb) || send_buffer_is_mem_streaming(sb)) {
+        if (len0 + len1 > 64) {
+            drain_send_buffer(conn);
+        }
+        if (send_buffer_has_data(sb) || send_buffer_is_mem_streaming(sb)) {
+            goto queue_data;
+        }
+    }
+
+    // Clear path: one writev carrying both buffers. Loop mirrors the
+    // single-buffer send() retry loop; a short write advances the residue
+    // (possibly ending mid-buf0 or mid-buf1) and retries until done or the
+    // socket signals EWOULDBLOCK, at which point the residue is queued.
+    while (r0 > 0 || r1 > 0) {
+        struct iovec iov[2];
+        int iovcnt = 0;
+        if (r0 > 0) {
+            iov[iovcnt].iov_base = (void*)(uintptr_t)p0;
+            iov[iovcnt].iov_len = r0;
+            iovcnt++;
+        }
+        if (r1 > 0) {
+            iov[iovcnt].iov_base = (void*)(uintptr_t)p1;
+            iov[iovcnt].iov_len = r1;
+            iovcnt++;
+        }
+        // lwip_writev directly: the POSIX writev alias is behind
+        // LWIP_POSIX_SOCKETS_IO_NAMES (off under ESP-IDF, where VFS provides
+        // POSIX names but registers no writev). Same fd family as the lwip
+        // compat calls (send/recv) used throughout this file.
+        ssize_t sent = lwip_writev(conn->fd, iov, iovcnt);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                goto queue_data;  // Socket buffer full, queue the residue
+            }
+            ESP_LOGE(TAG, "send_nonblocking2 failed: %s", strerror(errno));
+            return -1;
+        }
+        // Partial-write residue: writev consumes iovecs in order, so the
+        // accepted bytes cover a prefix of buf0 then a prefix of buf1.
+        size_t n = (size_t)sent;
+        if (n >= r0) {
+            n -= r0;
+            r0 = 0;
+            p1 += n;      // n <= r1 since sent <= r0 + r1
+            r1 -= n;
+        } else {
+            p0 += n;
+            r0 -= n;
+        }
+    }
+
+    // All data sent directly
+    return (ssize_t)(len0 + len1);
+
+queue_data:
+    // Ensure we have a buffer allocated
+    if (!sb->allocated) {
+        if (!send_buffer_alloc(sb)) {
+            ESP_LOGE(TAG, "Failed to allocate send buffer");
+            return -1;
+        }
+    }
+
+    // A pending memory stream means BOTH residues must append behind it, in
+    // order, via ONE atomic call: send_buffer_start_mem2 checks the pending
+    // cap once for len0+len1 BEFORE copying anything, so a cap rejection can
+    // never leave buf0 queued without buf1 (a torn response).
+    if (send_buffer_is_mem_streaming(sb)) {
+        if (!send_buffer_start_mem2(sb, p0, r0, p1, r1)) {
+            ESP_LOGE(TAG, "Failed to append %zu+%zu bytes to memory stream", r0, r1);
+            return -1;
+        }
+        connection_mark_write_pending(&g_server->connection_pool, conn->pool_index, true);
+        return (ssize_t)(len0 + len1);
+    }
+
+    // Queue buf0 then buf1 through the ring in chunks, draining between
+    // fills. When socket and ring are both full, the ordered remainder of
+    // both buffers moves to the memory stream in ONE atomic call. In this
+    // branch no stream exists yet, so send_buffer_start_mem2's fresh-stream
+    // allocation is uncapped — identical semantics to the single-buffer path.
+    {
+        const uint8_t* part[2] = { p0, p1 };
+        size_t part_len[2] = { r0, r1 };
+        for (int i = 0; i < 2; i++) {
+            while (part_len[i] > 0) {
+                size_t space = send_buffer_space(sb);
+                if (space == 0) {
+                    // Buffer full - drain to socket to make room
+                    drain_send_buffer(conn);
+                    space = send_buffer_space(sb);
+                    if (space == 0) {
+                        // Socket also full - defer the ordered remainder
+                        // (tail of buf0 + all of buf1, or tail of buf1)
+                        // to the memory stream atomically.
+                        if (!send_buffer_start_mem2(sb, part[i], part_len[i],
+                                                    (i == 0) ? part[1] : NULL,
+                                                    (i == 0) ? part_len[1] : 0)) {
+                            ESP_LOGE(TAG, "Send buffer full and mem stream alloc failed (%zu bytes)",
+                                     part_len[i] + ((i == 0) ? part_len[1] : 0));
+                            return -1;
+                        }
+                        ESP_LOGD(TAG, "Deferred %zu bytes to memory stream for conn [%d]",
+                                 part_len[i] + ((i == 0) ? part_len[1] : 0), conn->pool_index);
+                        goto queued;
+                    }
+                }
+                size_t to_queue = (part_len[i] <= space) ? part_len[i] : space;
+                if (send_buffer_queue(sb, part[i], to_queue) < 0) {
+                    return -1;
+                }
+                part[i] += to_queue;
+                part_len[i] -= to_queue;
+            }
+        }
+    }
+
+queued:
+    // Mark connection as having pending writes (same bookkeeping as the
+    // single-buffer path — there are no other counters on this path)
+    connection_mark_write_pending(&g_server->connection_pool, conn->pool_index, true);
+
+    return (ssize_t)(len0 + len1);
+#endif // CONFIG_HTTPD_USE_RAW_API
+}
+
+// Serialized two-buffer entry point: same recursive SEND_LOCK as
+// send_nonblocking, so it is safe both standalone and from callers that
+// already hold the lock (httpd_ws_send/broadcast around ws_send_frame).
+static ssize_t send_nonblocking2(connection_t* conn,
+                                 const void* buf0, size_t len0,
+                                 const void* buf1, size_t len1) {
+    SEND_LOCK();
+    ssize_t result = send_nonblocking2_impl(conn, buf0, len0, buf1, len1);
+    SEND_UNLOCK();
+    return result;
+}
+
+// WebSocket send callback - wraps send_nonblocking for use by websocket.c.
+// flags is forwarded: websocket.c passes MSG_MORE for the header part of a
+// two-part frame send so header+payload coalesce into one TCP segment.
+static ssize_t ws_send_callback(connection_t* conn, const void* data, size_t len, int flags) {
+    return send_nonblocking(conn, data, len, flags);
+}
+
+// WebSocket two-buffer send callback - routes a [frame_header, payload] pair
+// through send_nonblocking2 so large frames go out in one writev instead of
+// the header-with-MSG_MORE + payload two-send sequence.
+static ssize_t ws_send2_callback(connection_t* conn,
+                                 const void* buf0, size_t len0,
+                                 const void* buf1, size_t len1) {
+    return send_nonblocking2(conn, buf0, len0, buf1, len1);
 }
 
 // Filesystem send callback - wraps send_nonblocking for use by filesystem.c
 static ssize_t fs_send_callback(connection_t* conn, const void* data, size_t len) {
     return send_nonblocking(conn, data, len, MSG_MORE);
+}
+
+// Defined in send_buffer.c. Registered by the server so the filesystem's
+// in-flight open-file count is released when a streamed fd is ACTUALLY closed
+// (stream completion / reset / free), not at the handoff moment. Declared
+// extern here to avoid modifying the shared private/send_buffer.h header.
+extern void send_buffer_set_file_close_cb(void (*cb)(void));
+
+// Invoked by send_buffer whenever it closes a streaming file descriptor. Each
+// streamed fd corresponds to exactly one open_files increment (in
+// filesystem_send_file or httpd_resp_sendfile), so decrement once here.
+static void fs_stream_closed_cb(void) {
+    if (g_server && g_server->filesystem && g_server->filesystem->open_files > 0) {
+        g_server->filesystem->open_files--;
+    }
 }
 
 // Filesystem file stream callback - starts non-blocking file streaming via send_buffer
@@ -1089,16 +1322,24 @@ static void init_request_context(request_context_t* ctx, connection_t* conn) {
     // On the first request of a connection, _internal is NULL (from calloc
     // or on_disconnect memset), so all buffer pointers are guaranteed NULL.
     // Skip the free() calls to avoid function call overhead.
+    //
+    // The PREVIOUS request's recv_buf is freed HERE, not at parse-complete:
+    // header keys/values live NUL-terminated in place inside it, so it must
+    // stay resolvable for the whole request lifetime (during dispatch and
+    // from deferred/provider/continuation handlers after on_http_request
+    // returns). on_disconnect and httpd_stop free the last request's buffer.
     if (ctx->req._internal) {
         if (ctx->uri_buf_is_heap) free(ctx->uri_buf);
-        if (ctx->header_buf) free(ctx->header_buf);
         if (ctx->body_buf) free(ctx->body_buf);
         if (ctx->recv_buf_is_heap) free(ctx->recv_buf);
+        free(ctx->pipeline_buf);
     }
 
     // Zero only the fields that need zeroing (up to _zero_end marker).
     // Skips ~768 bytes of scratch buffers (inline_recv_buf, inline_uri_buf,
     // headers array, query_params, mw_chain) that are written before read.
+    // This also resets recv_buf/header_count, so request N+1 can never
+    // resolve request N's header index.
     memset(ctx, 0, offsetof(request_context_t, _zero_end));
 
     // Set the few non-zero fields
@@ -1122,60 +1363,63 @@ void esphttpd_store_header(connection_t* conn,
     store_header_in_req(ctx, key, key_len, value, value_len);
 }
 
-// New header storage that works with request context
-// Dynamically allocates and grows header buffer as needed
+// Zero-copy header indexing: key/value point INTO ctx->recv_buf (the parser
+// only ever hands out pointers into the recv slice, and the caller rebases
+// them whenever recv_buf reallocs - by the time this runs for a header line,
+// its pointers refer to the CURRENT buffer). Only offsets are recorded here;
+// they stay valid across any later inline->heap migration or realloc because
+// the contents are copied/preserved as a block. The separating ':' and the
+// value-terminating CR (or LF) are overwritten with NULs AFTER parsing
+// completes (terminate_headers_in_place) - the parser re-reads the value
+// terminator byte right after emitting a header (CRLF detection in the bulk
+// scan), so writing the NUL here would corrupt the parse.
+//
+// Trimming semantics are unchanged from the copying implementation: the
+// parser excludes leading OWS from the value pointer and includes trailing
+// OWS in value_len, and the old path copied exactly key_len/value_len bytes.
 static void store_header_in_req(request_context_t* ctx, const uint8_t* key, uint16_t key_len,
                                 const uint8_t* value, uint16_t value_len) {
     if (ctx->req.header_count >= MAX_REQ_HEADERS) return;
+    if (!ctx->recv_buf) return;  // Not parsing from the recv buffer (e.g. bare parser tests)
 
-    size_t needed = (size_t)key_len + 1 + (size_t)value_len + 1;
-    size_t required = ctx->req.header_buf_used + needed;
-    if (required < needed) return;  // Overflow check
-
-    // Allocate or grow header buffer if needed
-    if (required > ctx->req.header_buf_size) {
-        // Calculate new capacity - start with 256, grow to fit with margin
-        size_t new_capacity = ctx->req.header_buf_size ? ctx->req.header_buf_size : 256;
-        while (new_capacity < required) {
-            new_capacity = (new_capacity < 1024) ? new_capacity * 2 : new_capacity + 512;
-        }
-        // Cap at max size
-        if (new_capacity > REQ_HEADER_BUF_SIZE) {
-            new_capacity = REQ_HEADER_BUF_SIZE;
-        }
-        if (required > new_capacity) {
-            ESP_LOGW(TAG, "Header buffer full, dropping header");
-            return;
-        }
-
-        char* new_buf = (char*)realloc(ctx->header_buf, new_capacity);
-        if (!new_buf) {
-            ESP_LOGE(TAG, "Failed to allocate header buffer");
-            return;
-        }
-        ctx->header_buf = new_buf;
-        ctx->req.header_buf = new_buf;
-        ctx->req.header_buf_size = new_capacity;
+    const uint8_t* base = ctx->recv_buf;
+    ptrdiff_t key_off = key - base;
+    ptrdiff_t value_off = value - base;
+    // Both spans, INCLUDING the terminator byte that becomes the NUL
+    // (key[key_len] is the ':', value[value_len] is the CR/LF), must lie
+    // within the accumulated data. recv_buf caps at 4096, so any in-range
+    // offset fits uint16_t.
+    if (key_off < 0 || value_off < 0 ||
+        (size_t)key_off + key_len >= ctx->recv_buf_len ||
+        (size_t)value_off + value_len >= ctx->recv_buf_len) {
+        ESP_LOGE(TAG, "Header pointers outside recv buffer, dropping header");
+        return;
     }
 
     req_header_entry_t* entry = &ctx->headers[ctx->req.header_count];
-    char* dst = &ctx->header_buf[ctx->req.header_buf_used];
-
-    // Store key
-    entry->key_offset = ctx->req.header_buf_used;
+    entry->key_offset = (uint16_t)key_off;
     entry->key_len = key_len;
-    memcpy(dst, key, key_len);
-    dst[key_len] = '\0';
-    dst += key_len + 1;
-
-    // Store value
-    entry->value_offset = ctx->req.header_buf_used + key_len + 1;
+    entry->value_offset = (uint16_t)value_off;
     entry->value_len = value_len;
-    memcpy(dst, value, value_len);
-    dst[value_len] = '\0';
-
-    ctx->req.header_buf_used += needed;
     ctx->req.header_count++;
+}
+
+// NUL-terminate the indexed headers in place inside recv_buf: the ':' that
+// ended each key and the CR (or LF, for a bare-LF line) that ended each
+// value become '\0'. Must only run once parsing is FINISHED for the request
+// (success or terminal error) - never between parser invocations, since the
+// parser re-reads terminator bytes. All positions were bounds-checked at
+// store time. The overwritten bytes are pure protocol framing within the
+// header region (< conn->header_bytes), so the body bytes that may follow in
+// the same buffer are untouched.
+static void terminate_headers_in_place(request_context_t* ctx) {
+    uint8_t* base = ctx->recv_buf;
+    if (!base) return;
+    for (uint8_t i = 0; i < ctx->req.header_count; i++) {
+        const req_header_entry_t* e = &ctx->headers[i];
+        base[(size_t)e->key_offset + e->key_len] = '\0';
+        base[(size_t)e->value_offset + e->value_len] = '\0';
+    }
 }
 
 // ============================================================================
@@ -1265,12 +1509,18 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
         return HTTPD_ERR_NO_MEM;
     }
 
-    // Register WebSocket send callback so frames route through send_nonblocking
+    // Register WebSocket send callbacks so frames route through
+    // send_nonblocking / send_nonblocking2 (two-buffer scatter-gather)
     ws_set_send_func(ws_send_callback);
+    ws_set_send2_func(ws_send2_callback);
 
     // Register filesystem send callbacks so file serving routes through send_nonblocking
     fs_set_send_func(fs_send_callback);
     fs_set_file_stream_func(fs_file_stream_callback);
+
+    // Release the filesystem's in-flight open-file count when the send buffer
+    // actually closes a streamed fd (streaming outlives the handoff call).
+    send_buffer_set_file_close_cb(fs_stream_closed_cb);
 
     // Setup event handlers
     server->handlers.on_http_request = on_http_request;
@@ -1385,8 +1635,66 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
     while (!server->task_exited) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+#endif
+#endif
 
-    // Close all active connections
+    // Fire WS_EVENT_DISCONNECT to the route handler for every live WebSocket
+    // connection BEFORE any teardown: app code allocates per-socket state on
+    // WS_EVENT_CONNECT and releases it on WS_EVENT_DISCONNECT, so skipping
+    // this leaked that state on every stop. The event loop / server task has
+    // already exited above, so handlers run here on the stopping task.
+    // (In raw API mode raw_tcp_stop has already closed the PCBs - the events
+    // still fire so app state is released; handlers must tolerate failed
+    // sends during shutdown.)
+    {
+        uint32_t ws_mask = server->connection_pool.ws_active_mask;
+        while (ws_mask) {
+            int i = __builtin_ctz(ws_mask);
+            ws_mask &= ws_mask - 1;
+            ws_context_t* ws_ctx = ws_contexts[i];
+            if (ws_ctx && ws_ctx->ws.connected) {
+                if (ws_ctx->route && ws_ctx->route->handler) {
+                    httpd_ws_event_t event = {
+                        .type = WS_EVENT_DISCONNECT,
+                        .data = NULL,
+                        .len = 0
+                    };
+                    ws_ctx->route->handler(&ws_ctx->ws, &event);
+                }
+                ws_ctx->ws.connected = false;
+                httpd_ws_leave_all(&ws_ctx->ws);
+            }
+            connection_mark_ws_inactive(&server->connection_pool, i);
+        }
+    }
+
+    // Flush in-flight defer/async/provider completion callbacks BEFORE the
+    // fds are closed below (mirrors on_disconnect): without this, defer file
+    // handles stay open and user completion callbacks never run when the
+    // server stops mid-request. Ordering matters: an on_done that attempts a
+    // final write must hit a still-open (at worst failing) fd, never a
+    // closed-and-reused one.
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (!request_contexts[i]) continue;
+        request_context_t* c = request_contexts[i];
+
+        if (c->defer.active && c->defer.on_done) {
+            c->defer.on_done(&c->req, HTTPD_ERR_CONN_CLOSED);
+        }
+        c->defer.active = false;
+        if (c->async_send.active && c->async_send.on_done) {
+            c->async_send.on_done(&c->req, HTTPD_ERR_CONN_CLOSED);
+        }
+        c->async_send.active = false;
+        if (c->data_provider.active && c->data_provider.on_complete) {
+            c->data_provider.on_complete(&c->req, HTTPD_ERR_CONN_CLOSED);
+        }
+        c->data_provider.active = false;
+    }
+
+#if !defined(CONFIG_HTTPD_USE_RAW_API) && !defined(CONFIG_ESPHTTPD_TEST_MODE)
+    // Close all active connections (after the WS disconnect events and the
+    // callback flush above, so app callbacks never see a closed/reused fd)
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         if (connection_is_active(&server->connection_pool, i)) {
             connection_t* conn = &server->connection_pool.connections[i];
@@ -1394,40 +1702,28 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
         }
     }
 #endif
-#endif
 
-    // Free per-connection dynamic sub-buffers
+    // Free per-connection dynamic sub-buffers. Serialized against app-task
+    // WebSocket sends (httpd_ws_send/broadcast/publish take the same lock):
+    // without it a concurrent send could queue into a ring buffer while it
+    // is being freed here.
+    SEND_LOCK();
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
 
         // Free dynamically-allocated sub-buffers within pre-allocated contexts
         if (request_contexts[i]) {
             request_context_t* c = request_contexts[i];
 
-            // Notify in-flight async work before tearing down (mirrors
-            // on_disconnect): without this, defer file handles stay open and
-            // user completion callbacks never run when the server stops
-            // mid-request
-            if (c->defer.active && c->defer.on_done) {
-                c->defer.on_done(&c->req, HTTPD_ERR_CONN_CLOSED);
-            }
-            c->defer.active = false;
-            if (c->async_send.active && c->async_send.on_done) {
-                c->async_send.on_done(&c->req, HTTPD_ERR_CONN_CLOSED);
-            }
-            c->async_send.active = false;
-            if (c->data_provider.active && c->data_provider.on_complete) {
-                c->data_provider.on_complete(&c->req, HTTPD_ERR_CONN_CLOSED);
-            }
-            c->data_provider.active = false;
-
             if (c->uri_buf_is_heap) {
                 free(c->uri_buf);
             }
-            free(c->header_buf);
             free(c->body_buf);
+            // Also releases the in-place header storage of the connection's
+            // last request (headers are indexed inside recv_buf)
             if (c->recv_buf_is_heap) {
                 free(c->recv_buf);
             }
+            free(c->pipeline_buf);
             request_contexts[i] = NULL;
         }
 
@@ -1438,11 +1734,15 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
 
         if (connection_send_buffers[i]) {
             // Unconditional: also releases a pending memory stream or an open
-            // streaming file fd, not just the ring allocation
+            // streaming file fd, not just the ring allocation. Note the
+            // buffers are freed while the send-buffer file-close callback is
+            // still registered (cleared further below) so streamed fds still
+            // release the filesystem's open-file count - preserve this order.
             send_buffer_free(connection_send_buffers[i]);
             connection_send_buffers[i] = NULL;
         }
     }
+    SEND_UNLOCK();
 
     // Free pre-allocated backing arrays
     free(preallocated_request_contexts);
@@ -1477,8 +1777,9 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
     // Reset channel hash table
     init_channel_hash(server);
 
-    // Clear WebSocket send callback
+    // Clear WebSocket send callbacks
     ws_set_send_func(NULL);
+    ws_set_send2_func(NULL);
 
     // Unmount filesystem if enabled
     if (server->filesystem_enabled && server->filesystem) {
@@ -1489,6 +1790,7 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
     // Clear filesystem send callbacks
     fs_set_send_func(NULL);
     fs_set_file_stream_func(NULL);
+    send_buffer_set_file_close_cb(NULL);
 
     if (g_server == server) {
         g_server = NULL;
@@ -1568,6 +1870,7 @@ httpd_err_t httpd_register_ws_route(httpd_handle_t handle, const httpd_ws_route_
     entry->handler = route->handler;
     entry->user_ctx = route->user_ctx;
     entry->ping_interval_ms = route->ping_interval_ms;
+    entry->authorize = route->authorize;
 
     ESP_LOGD(TAG, "Registered WebSocket route: %s", route->pattern);
 
@@ -1666,7 +1969,25 @@ static httpd_err_t send_cors_preflight(httpd_req_t* req, connection_t* conn, con
     resp_buf[pos++] = '\r';
     resp_buf[pos++] = '\n';
 
-    // Append the static CORS headers
+    // Include any headers a prior middleware staged before this OPTIONS
+    // short-circuit (e.g. custom security/CORS headers) — otherwise they are
+    // silently dropped. Only include them if they fit alongside the static
+    // block (resp_buf is small); skip and log otherwise, since preflight
+    // correctness does not depend on them. Consume them either way so they are
+    // not re-emitted on a later response for this request.
+    if (req->_resp_hdr_buf && req->_resp_hdr_len > 0) {
+        size_t staged = req->_resp_hdr_len;
+        size_t avail = sizeof(resp_buf) - pos - (sizeof(cors_headers) - 1);
+        if (staged <= avail) {
+            memcpy(resp_buf + pos, req->_resp_hdr_buf, staged);
+            pos += staged;
+        } else {
+            ESP_LOGW(TAG, "Dropped %zu staged bytes from CORS preflight (no room)", staged);
+        }
+        req->_resp_hdr_len = 0;
+    }
+
+    // Append the static CORS headers (terminating blank line included)
     memcpy(resp_buf + pos, cors_headers, sizeof(cors_headers) - 1);
     pos += sizeof(cors_headers) - 1;
 
@@ -1733,8 +2054,20 @@ const char* httpd_req_get_base_url(httpd_req_t* req) {
 
 const char* httpd_req_get_header(httpd_req_t* req, const char* key) {
     if (!req || !key) return NULL;
+    // Bail before touching the context: bare httpd_req_t structs (tests,
+    // legacy paths) are not embedded in a request_context_t, and with no
+    // indexed headers there is nothing to resolve anyway.
+    if (req->header_count == 0) return NULL;
 
     request_context_t* ctx = (request_context_t*)((char*)req - offsetof(request_context_t, req));
+
+    // Headers live NUL-terminated in place inside the ACTIVE recv buffer
+    // (ctx->recv_buf points at either the inline buffer or the heap
+    // allocation). Offsets remain valid across the inline->heap migration
+    // and the shrink-at-dispatch realloc because contents move as a block.
+    const char* base = (const char*)ctx->recv_buf;
+    if (!base) return NULL;
+
     size_t key_len = strlen(key);
 
     // Pre-compute first char lowercase for fast filtering
@@ -1744,9 +2077,9 @@ const char* httpd_req_get_header(httpd_req_t* req, const char* key) {
         req_header_entry_t* entry = &ctx->headers[i];
         // Filter by length and first char before expensive header_casecmp
         if (entry->key_len == key_len &&
-            (ctx->header_buf[entry->key_offset] | 0x20) == first_lower &&
-            header_casecmp(&ctx->header_buf[entry->key_offset], key, key_len)) {
-            return &ctx->header_buf[entry->value_offset];
+            (base[entry->key_offset] | 0x20) == first_lower &&
+            header_casecmp(&base[entry->key_offset], key, key_len)) {
+            return &base[entry->value_offset];
         }
     }
 
@@ -1928,15 +2261,6 @@ httpd_err_t httpd_resp_set_header(httpd_req_t* req, const char* key, const char*
 
     // Legacy path (bare request structs without a staging buffer): transmit
     // immediately, emitting the status line first if needed
-    if (!req->headers_sent) {
-        char fallback_buf[64];
-        int slen;
-        const char* sl = get_status_line(req->status_code, fallback_buf, sizeof(fallback_buf), &slen);
-        if (send_nonblocking(conn, sl, slen, MSG_MORE) < 0) {
-            return HTTPD_ERR_IO;
-        }
-        req->headers_sent = true;
-    }
     char header[256];
     if (total > sizeof(header)) return HTTPD_ERR_INVALID_ARG;
     memcpy(header, key, key_len);
@@ -1945,6 +2269,20 @@ httpd_err_t httpd_resp_set_header(httpd_req_t* req, const char* key, const char*
     memcpy(header + key_len + 2, value, val_len);
     header[key_len + 2 + val_len] = '\r';
     header[key_len + 2 + val_len + 1] = '\n';
+    if (!req->headers_sent) {
+        // Status line + first header as one scatter-gather send instead of
+        // two MSG_MORE-hinted sends
+        char fallback_buf[64];
+        int slen;
+        const char* sl = get_status_line(req->status_code, fallback_buf, sizeof(fallback_buf), &slen);
+        if (send_nonblocking2(conn, sl, slen, header, total) < 0) {
+            return HTTPD_ERR_IO;
+        }
+        req->headers_sent = true;
+        return HTTPD_OK;
+    }
+    // Subsequent headers: single send; MSG_MORE hints that more header lines
+    // (or the body) follow in later calls on this legacy path
     if (send_nonblocking(conn, header, total, MSG_MORE) < 0) {
         return HTTPD_ERR_IO;
     }
@@ -1989,69 +2327,13 @@ httpd_err_t httpd_resp_send(httpd_req_t* req, const char* body, ssize_t len) {
 
     size_t body_len = (len >= 0) ? (size_t)len : (body ? strlen(body) : 0);
 
-    // Fast path: coalesce small responses into a single send
-    // Only when no headers have been sent yet and Content-Length wasn't manually set
-    if (!req->headers_sent && !req->content_length_set && body_len <= 256 &&
-        req->_resp_hdr_len <= 384) {
-        char resp_buf[768];  // status (~64) + staged headers (<=384) + CL + body (<=256)
-        size_t pos = 0;
-
-        // Status line
-        char fallback_buf[64];
-        int slen;
-        const char* sl = get_status_line(req->status_code, fallback_buf, sizeof(fallback_buf), &slen);
-        memcpy(resp_buf, sl, slen);
-        pos += slen;
-
-        // Headers staged via httpd_resp_set_header
-        if (req->_resp_hdr_buf && req->_resp_hdr_len > 0) {
-            memcpy(resp_buf + pos, req->_resp_hdr_buf, req->_resp_hdr_len);
-            pos += req->_resp_hdr_len;
-            req->_resp_hdr_len = 0;
-        }
-
-        // Content-Length header via memcpy (avoid snprintf)
-        static const char cl_prefix[] = "Content-Length: ";
-        memcpy(resp_buf + pos, cl_prefix, sizeof(cl_prefix) - 1);
-        pos += sizeof(cl_prefix) - 1;
-        // Convert body_len to digits
-        char digits[16];
-        int ndigits = 0;
-        {
-            size_t val = body_len;
-            do {
-                digits[ndigits++] = '0' + (val % 10);
-                val /= 10;
-            } while (val > 0);
-            // Reverse digits into resp_buf
-            for (int i = ndigits - 1; i >= 0; i--) {
-                resp_buf[pos++] = digits[i];
-            }
-        }
-        resp_buf[pos++] = '\r';
-        resp_buf[pos++] = '\n';
-
-        // End headers
-        resp_buf[pos++] = '\r';
-        resp_buf[pos++] = '\n';
-
-        // Body
-        if (body && body_len > 0) {
-            memcpy(resp_buf + pos, body, body_len);
-            pos += body_len;
-        }
-
-        if (send_nonblocking(conn, resp_buf, pos, 0) < 0) {
-            return HTTPD_ERR_IO;
-        }
-        req->headers_sent = true;
-        req->body_started = true;
-        return HTTPD_OK;
-    }
-
-    // Standard path (large bodies / staged headers): build the entire header
-    // block — status line + staged headers + Content-Length + blank line —
-    // and hand it to the socket in ONE send instead of up to four
+    // Single path for every body size: build the header block — status line +
+    // staged headers + Content-Length + blank line — on the stack, then hand
+    // [header_block, body] to the socket as ONE scatter-gather send
+    // (send_nonblocking2 issues a single writev). Zero body copy, one lwIP
+    // syscall round. This retires both the old <=256B stack-coalesce fast
+    // path (writev makes the body memcpy pointless — same syscall count
+    // without it) and the former internal-DRAM scratch mid-size coalesce.
     {
         char block[RESP_HDR_BLOCK_BUF];
         int pos = 0;
@@ -2070,19 +2352,14 @@ httpd_err_t httpd_resp_send(httpd_req_t* req, const char* body, ssize_t len) {
         // End headers
         block[pos++] = '\r';
         block[pos++] = '\n';
-        if (send_nonblocking(conn, block, pos, (body && body_len > 0) ? MSG_MORE : 0) < 0) {
+
+        // send_nonblocking2 collapses to the single-buffer path when the body
+        // is empty, and preserves header->body ordering when queueing.
+        if (send_nonblocking2(conn, block, (size_t)pos, body, body_len) < 0) {
             return HTTPD_ERR_IO;
         }
     }
     req->body_started = true;
-
-    // Send body via non-blocking send. Data is sent directly if the socket accepts it,
-    // otherwise queued to the send buffer for draining by on_write_ready in the event loop.
-    if (body && body_len > 0) {
-        if (send_nonblocking(conn, body, body_len, 0) < 0) {
-            return HTTPD_ERR_IO;
-        }
-    }
 
     return HTTPD_OK;
 }
@@ -2161,16 +2438,11 @@ httpd_err_t httpd_resp_send_chunk(httpd_req_t* req, const char* chunk, ssize_t l
             // Check if we have enough contiguous space for header + data + trailer
             size_t space = send_buffer_space(sb);
             if (space < frame_size) {
-                // Not enough space - try to send header+data in parts
-                // but each syscall must be complete before proceeding
+                // Not enough space - send in parts, ordering preserved by the
+                // send infrastructure: chunk header + data as ONE
+                // scatter-gather send, then the terminator
 
-                // Send header first
-                if (send_nonblocking(conn, size_header, header_len, MSG_MORE) < 0) {
-                    return HTTPD_ERR_IO;
-                }
-
-                // Send data
-                if (send_nonblocking(conn, chunk, chunk_len, MSG_MORE) < 0) {
+                if (send_nonblocking2(conn, size_header, header_len, chunk, chunk_len) < 0) {
                     return HTTPD_ERR_IO;
                 }
 
@@ -2309,9 +2581,9 @@ httpd_err_t httpd_resp_sendfile(httpd_req_t* req, const char* path) {
         return httpd_resp_send_error(req, 404, "File not found");
     }
 
-    // Open file
-    FILE* f = fopen(path, "rb");
-    if (!f) {
+    // Open file (fd, not FILE*, so ownership can transfer to the send buffer)
+    int file_fd = open(path, O_RDONLY);
+    if (file_fd < 0) {
         return httpd_resp_send_error(req, 404, "File not found");
     }
 
@@ -2330,7 +2602,7 @@ httpd_err_t httpd_resp_sendfile(httpd_req_t* req, const char* path) {
     // Finalize headers and stream file body with Content-Length encoding
     connection_t* conn = (connection_t*)req->_internal;
     if (!conn) {
-        fclose(f);
+        close(file_fd);
         return HTTPD_ERR_CONN_CLOSED;
     }
 
@@ -2342,30 +2614,45 @@ httpd_err_t httpd_resp_sendfile(httpd_req_t* req, const char* path) {
         if (!req->headers_sent) {
             pos = build_status_and_staged_headers(req, block, sizeof(block));
             if (pos < 0) {
-                fclose(f);
+                close(file_fd);
                 return HTTPD_ERR_NO_MEM;
             }
         }
         block[pos++] = '\r';
         block[pos++] = '\n';
         if (send_nonblocking(conn, block, pos, st.st_size > 0 ? MSG_MORE : 0) < 0) {
-            fclose(f);
+            close(file_fd);
             return HTTPD_ERR_IO;
         }
     }
     req->body_started = true;
 
-    // Stream file data directly (no chunked framing)
-    char buf[512];
-    size_t bytes_read;
-    while ((bytes_read = fread(buf, 1, sizeof(buf), f)) > 0) {
-        if (send_nonblocking(conn, buf, bytes_read, 0) < 0) {
-            fclose(f);
-            return HTTPD_ERR_IO;
-        }
+    // Zero-length file: the headers (Content-Length: 0) complete the response.
+    if (st.st_size == 0) {
+        close(file_fd);
+        return HTTPD_OK;
     }
 
-    fclose(f);
+    // Stream the body incrementally through the send buffer rather than pulling
+    // the whole file into heap. The previous fread()+send loop, under a stalled
+    // client, grew an unbounded memory-stream copy of the unsent remainder (a
+    // 1MB file ≈ 1MB transient heap, starving other connections). File
+    // streaming caps buffering at the ring size and drains from on_write_ready
+    // as the TCP window reopens. Count the in-flight fd against the filesystem's
+    // open-file budget (matching filesystem_send_file) so the send-buffer
+    // close hook releases it symmetrically when streaming ends.
+    if (g_server && g_server->filesystem && g_server->filesystem->open_files < 255) {
+        g_server->filesystem->open_files++;
+    }
+    if (fs_file_stream_callback(conn, file_fd, (size_t)st.st_size) < 0) {
+        // Handoff failed: the send buffer did not take the fd, so release our
+        // own reference and count immediately.
+        if (g_server && g_server->filesystem && g_server->filesystem->open_files > 0) {
+            g_server->filesystem->open_files--;
+        }
+        close(file_fd);
+        return HTTPD_ERR_IO;
+    }
     return HTTPD_OK;
 }
 
@@ -2467,7 +2754,12 @@ httpd_err_t httpd_resp_send_async(httpd_req_t* req, const char* body, ssize_t le
         int pos = 0;
         if (!req->headers_sent) {
             pos = build_status_and_staged_headers(req, block, sizeof(block));
-            if (pos < 0) return HTTPD_ERR_NO_MEM;
+            if (pos < 0) {
+                // Nothing committed yet; notify the caller so its completion
+                // callback still fires (mirrors httpd_resp_sendfile_async).
+                if (on_done) on_done(req, HTTPD_ERR_NO_MEM);
+                return HTTPD_ERR_NO_MEM;
+            }
         }
         if (!req->content_length_set) {
             static const char cl_pfx[] = "Content-Length: ";
@@ -2479,14 +2771,13 @@ httpd_err_t httpd_resp_send_async(httpd_req_t* req, const char* body, ssize_t le
         }
         block[pos++] = '\r';
         block[pos++] = '\n';
-        if (send_nonblocking(conn, block, pos, body_len > 0 ? MSG_MORE : 0) < 0) {
-            return HTTPD_ERR_IO;
-        }
-    }
-
-    // Queue body
-    if (body && body_len > 0) {
-        if (send_nonblocking(conn, body, body_len, 0) < 0) {
+        // Header block + body as ONE scatter-gather send/queue (replaces the
+        // MSG_MORE header send followed by a separate body send)
+        if (send_nonblocking2(conn, block, (size_t)pos, body, body_len) < 0) {
+            // Framing may be partly committed: fire on_done and abort the
+            // connection.
+            if (on_done) on_done(req, HTTPD_ERR_IO);
+            conn->state = CONN_STATE_CLOSED;
             return HTTPD_ERR_IO;
         }
     }
@@ -2569,7 +2860,12 @@ httpd_err_t httpd_resp_send_provider(httpd_req_t* req, ssize_t content_length,
         int pos = 0;
         if (!req->headers_sent) {
             pos = build_status_and_staged_headers(req, block, sizeof(block));
-            if (pos < 0) return HTTPD_ERR_NO_MEM;
+            if (pos < 0) {
+                // Nothing committed yet; still notify the provider so its
+                // completion callback runs and its context isn't leaked.
+                if (on_complete) on_complete(req, HTTPD_ERR_NO_MEM);
+                return HTTPD_ERR_NO_MEM;
+            }
         }
         if (use_chunked) {
             static const char te_chunked[] = "Transfer-Encoding: chunked\r\n";
@@ -2586,14 +2882,25 @@ httpd_err_t httpd_resp_send_provider(httpd_req_t* req, ssize_t content_length,
         block[pos++] = '\r';
         block[pos++] = '\n';
         if (send_nonblocking(conn, block, pos, 0) < 0) {
+            // Same leak class as the alloc failure below: notify the provider so
+            // its context isn't stranded, then abort the connection.
+            if (on_complete) on_complete(req, HTTPD_ERR_IO);
+            conn->state = CONN_STATE_CLOSED;
             return HTTPD_ERR_IO;
         }
     }
 
     // Allocate send buffer for the data provider
     send_buffer_t* sb = get_send_buffer(conn);
-    if (!send_buffer_alloc(sb)) {
+    if (!sb || !send_buffer_alloc(sb)) {
+        // The framing header block was already committed to the wire but we
+        // cannot stream the body. data_provider.active was never set, so
+        // neither on_disconnect nor on_write_ready will run on_complete —
+        // invoke it here so the provider's context is not leaked, then abort
+        // the connection (a second status line can't recover the stream).
         ESP_LOGE(TAG, "Failed to allocate send buffer for provider");
+        if (on_complete) on_complete(req, HTTPD_ERR_NO_MEM);
+        conn->state = CONN_STATE_CLOSED;
         return HTTPD_ERR_NO_MEM;
     }
 
@@ -2620,7 +2927,7 @@ httpd_err_t httpd_resp_send_provider(httpd_req_t* req, ssize_t content_length,
 
 ssize_t httpd_req_pipe_to_file(httpd_req_t* req, const char* path) {
     // Error codes are already negative, so return them directly
-    if (!req || !path) return HTTPD_ERR_INVALID_ARG;
+    if (!req || !path || strstr(path, "..") != NULL) return HTTPD_ERR_INVALID_ARG;
 
     connection_t* conn = (connection_t*)req->_internal;
     if (!conn) return HTTPD_ERR_CONN_CLOSED;
@@ -2830,7 +3137,7 @@ bool httpd_req_is_deferred(httpd_req_t* req) {
 }
 
 httpd_err_t httpd_req_defer_to_file(httpd_req_t* req, const char* path, httpd_done_cb_t on_done) {
-    if (!req || !path || !on_done) {
+    if (!req || !path || !on_done || strstr(path, "..") != NULL) {
         return HTTPD_ERR_INVALID_ARG;
     }
 
@@ -2955,11 +3262,12 @@ bool httpd_req_is_continuation(httpd_req_t* req) {
  * Always compares the full length regardless of where differences occur.
  */
 static bool constant_time_compare_n(const char* a, size_t len_a, const char* b, size_t len_b) {
-    // Use len_b to avoid leaking length of 'a' (the secret)
     volatile uint8_t result = len_a ^ len_b;
-    size_t len = len_a < len_b ? len_a : len_b;
-    for (size_t i = 0; i < len; i++) {
-        result |= (uint8_t)(a[i] ^ b[i]);
+    // Always walk the full secret length. Missing attacker bytes compare as
+    // zero without reading beyond the supplied buffer.
+    for (size_t i = 0; i < len_a; i++) {
+        uint8_t bv = i < len_b ? (uint8_t)b[i] : 0;
+        result |= (uint8_t)((uint8_t)a[i] ^ bv);
     }
     return result == 0;
 }
@@ -3081,6 +3389,9 @@ httpd_err_t httpd_ws_send(httpd_ws_t* ws, const void* data, size_t len, ws_type_
     connection_t* conn = (connection_t*)ws->_internal;
     if (!conn) return HTTPD_ERR_CONN_CLOSED;
 
+    // Serialize against the server task's on_write_ready (socket mode). Raw mode
+    // relies on LOCK_TCPIP_CORE instead; SEND_LOCK is a no-op there.
+    SEND_LOCK();
 #ifdef CONFIG_HTTPD_USE_RAW_API
     HTTPD_LOCK_TCPIP();
 #endif
@@ -3088,6 +3399,7 @@ httpd_err_t httpd_ws_send(httpd_ws_t* ws, const void* data, size_t len, ws_type_
 #ifdef CONFIG_HTTPD_USE_RAW_API
     HTTPD_UNLOCK_TCPIP();
 #endif
+    SEND_UNLOCK();
 
     if (ret < 0) {
         return HTTPD_ERR_IO;
@@ -3122,6 +3434,9 @@ int httpd_ws_broadcast(httpd_handle_t handle, const char* pattern,
         if (target_index == UINT8_MAX) return 0;  // No matching route
     }
 
+    // Serialize the whole broadcast against the server task's writer (socket
+    // mode); raw mode uses LOCK_TCPIP_CORE and SEND_LOCK is a no-op there.
+    SEND_LOCK();
 #ifdef CONFIG_HTTPD_USE_RAW_API
     HTTPD_LOCK_TCPIP();
 #endif
@@ -3145,6 +3460,7 @@ int httpd_ws_broadcast(httpd_handle_t handle, const char* pattern,
 #ifdef CONFIG_HTTPD_USE_RAW_API
     HTTPD_UNLOCK_TCPIP();
 #endif
+    SEND_UNLOCK();
 
     return sent;
 }
@@ -3159,8 +3475,10 @@ httpd_err_t httpd_ws_close(httpd_ws_t* ws, uint16_t code, const char* reason) {
 
     if (reason) {
         size_t reason_len = strlen(reason);
-        if (reason_len > sizeof(close_data) - 2) {
-            reason_len = sizeof(close_data) - 2;
+        // RFC 6455 §5.5 caps a control-frame payload at 125 bytes; with the
+        // 2-byte close code that leaves at most 123 bytes of reason text.
+        if (reason_len > 123) {
+            reason_len = 123;
         }
         memcpy(&close_data[2], reason, reason_len);
         close_len += reason_len;
@@ -3168,6 +3486,9 @@ httpd_err_t httpd_ws_close(httpd_ws_t* ws, uint16_t code, const char* reason) {
 
     connection_t* conn = (connection_t*)ws->_internal;
 
+    // Serialize against the server task's writer (socket mode); raw mode uses
+    // LOCK_TCPIP_CORE and SEND_LOCK is a no-op there.
+    SEND_LOCK();
 #ifdef CONFIG_HTTPD_USE_RAW_API
     HTTPD_LOCK_TCPIP();
 #endif
@@ -3189,6 +3510,7 @@ httpd_err_t httpd_ws_close(httpd_ws_t* ws, uint16_t code, const char* reason) {
 #ifdef CONFIG_HTTPD_USE_RAW_API
     HTTPD_UNLOCK_TCPIP();
 #endif
+    SEND_UNLOCK();
 
     return HTTPD_OK;
 }
@@ -3375,6 +3697,9 @@ int httpd_ws_publish(httpd_handle_t handle, const char* channel,
         default: return 0;
     }
 
+    // Serialize the whole publish against the server task's writer (socket
+    // mode); raw mode uses LOCK_TCPIP_CORE and SEND_LOCK is a no-op there.
+    SEND_LOCK();
 #ifdef CONFIG_HTTPD_USE_RAW_API
     HTTPD_LOCK_TCPIP();
 #endif
@@ -3397,6 +3722,7 @@ int httpd_ws_publish(httpd_handle_t handle, const char* channel,
 #ifdef CONFIG_HTTPD_USE_RAW_API
     HTTPD_UNLOCK_TCPIP();
 #endif
+    SEND_UNLOCK();
 
     return sent;
 }
@@ -3584,6 +3910,9 @@ static void reset_request_recv_state(connection_t* conn) {
     conn->upgrade_ws = 0;
     conn->is_websocket = 0;
     conn->keep_alive = 0;
+    // Clear the deferred flow-control flag so a paused upload cannot leak into
+    // the next keep-alive request and wrongly back-pressure its body.
+    conn->defer_paused = 0;
 }
 
 // Bytes of the current request's body that have arrived on the wire, whether
@@ -3593,6 +3922,21 @@ static size_t request_body_wire_received(request_context_t* ctx) {
     size_t unconsumed = (ctx->body_buf && ctx->body_buf_len > ctx->body_buf_pos)
                       ? ctx->body_buf_len - ctx->body_buf_pos : 0;
     return ctx->req.body_received + unconsumed;
+}
+
+static bool append_pipeline_bytes(request_context_t* ctx, const uint8_t* data, size_t len) {
+    if (len == 0) return true;
+    if (len > 4096 || ctx->pipeline_buf_len > 4096 - len) return false;
+    size_t needed = ctx->pipeline_buf_len + len;
+    if (needed > ctx->pipeline_buf_capacity) {
+        uint8_t* grown = realloc(ctx->pipeline_buf, needed);
+        if (!grown) return false;
+        ctx->pipeline_buf = grown;
+        ctx->pipeline_buf_capacity = needed;
+    }
+    memcpy(ctx->pipeline_buf + ctx->pipeline_buf_len, data, len);
+    ctx->pipeline_buf_len = needed;
+    return true;
 }
 
 // Honor "Connection: close" once the response has been fully handed to the
@@ -3615,6 +3959,14 @@ static void maybe_close_for_connection_close(connection_t* conn, request_context
 // in CONN_STATE_HTTP_BODY so on_http_body can drain the rest before re-arming.
 static void finish_sync_request(connection_t* conn, request_context_t* ctx) {
     if (conn->deferred || conn->continuation) return;  // async paths re-arm on completion
+    // An async response is still in flight (data provider / async send): do
+    // NOT re-arm yet. Re-arming here let a pipelined request N+1 reach
+    // init_request_context, which memset the live provider/async state
+    // without ever firing on_complete/on_done (context leak + truncated or
+    // interleaved responses). The completion path in on_write_ready_impl
+    // clears the active flags and calls back into finish_sync_request to
+    // re-arm once the response has fully drained.
+    if (ctx->data_provider.active || ctx->async_send.active) return;
     if (conn->state == CONN_STATE_WEBSOCKET || conn->state == CONN_STATE_WS_CLOSING ||
         conn->state == CONN_STATE_CLOSED) {
         return;
@@ -3624,13 +3976,66 @@ static void finish_sync_request(connection_t* conn, request_context_t* ctx) {
         return;  // body still in flight; on_http_body drains it and re-arms
     }
     bool close_requested = !conn->keep_alive;
+    uint8_t* pipeline = NULL;
+    size_t pipeline_len = 0;
+    if (!close_requested && !conn->pipeline_dispatch_active &&
+        ctx->pipeline_buf_len > 0) {
+        pipeline = ctx->pipeline_buf;
+        pipeline_len = ctx->pipeline_buf_len;
+        ctx->pipeline_buf = NULL;
+        ctx->pipeline_buf_len = 0;
+        ctx->pipeline_buf_capacity = 0;
+    }
     reset_request_recv_state(conn);
-    maybe_close_for_connection_close(conn, ctx, close_requested);
+    if (pipeline) {
+        // Drain iteratively. Calling on_http_request recursively for every
+        // complete pipelined request made stack use attacker-controlled.
+        conn->pipeline_dispatch_active = 1;
+        while (pipeline) {
+            on_http_request(conn, pipeline, pipeline_len);
+            free(pipeline);
+            pipeline = NULL;
+            pipeline_len = 0;
+
+            // A synchronous nested request was re-armed by its own
+            // finish_sync_request. Async, partial, upgraded and closed requests
+            // leave a different state and resume through their normal path.
+            if (conn->state != CONN_STATE_NEW || ctx->parsing_in_progress ||
+                conn->deferred || conn->continuation ||
+                ctx->data_provider.active || ctx->async_send.active ||
+                ctx->pipeline_buf_len == 0) {
+                break;
+            }
+
+            pipeline = ctx->pipeline_buf;
+            pipeline_len = ctx->pipeline_buf_len;
+            ctx->pipeline_buf = NULL;
+            ctx->pipeline_buf_len = 0;
+            ctx->pipeline_buf_capacity = 0;
+        }
+        conn->pipeline_dispatch_active = 0;
+    } else {
+        maybe_close_for_connection_close(conn, ctx, close_requested);
+    }
 }
 
 static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
     request_context_t* ctx = get_request_context(conn);
     if (!ctx) return;
+
+    // Bytes of a pipelined request N+1 arriving while the PREVIOUS response
+    // is still streaming asynchronously (data provider / async send):
+    // init_request_context below would memset the live async state without
+    // firing its completion callback (context leak + interleaved responses).
+    if (!ctx->parsing_in_progress &&
+        (ctx->data_provider.active || ctx->async_send.active)) {
+        if (!append_pipeline_bytes(ctx, buffer, len)) {
+            ESP_LOGW(TAG, "Failed to buffer %zu pipelined bytes (conn %" PRIu8 ")",
+                     len, conn->pool_index);
+            conn->keep_alive = 0;
+        }
+        return;
+    }
 
     // Only initialize on the first call for this request (not on continuation)
     if (!ctx->parsing_in_progress) {
@@ -3647,6 +4052,9 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
         // Header data too large
         ESP_LOGE(TAG, "Request headers too large (%zu bytes)", new_total);
         ctx->parsing_in_progress = false;
+        // Parsing is terminally over (connection closes below): terminate
+        // any headers indexed on earlier recv calls.
+        terminate_headers_in_place(ctx);
         // Advertise the close: keep-alive clients (Node 19+ pools by default)
         // would otherwise reuse the dying socket and hit a reset
         httpd_resp_set_header(&ctx->req, "Connection", "close");
@@ -3731,6 +4139,10 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
 
     if (result == PARSE_ERROR) {
         ctx->parsing_in_progress = false;
+        // Parsing is terminally over (connection closes below): make any
+        // headers indexed so far readable as proper C strings in case an
+        // error path consults them.
+        terminate_headers_in_place(ctx);
         // Advertise the close: keep-alive clients (Node 19+ pools by default)
         // would otherwise reuse the dying socket and hit a reset
         httpd_resp_set_header(&ctx->req, "Connection", "close");
@@ -3757,8 +4169,27 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
     // absolute position within the full recv_buf.
     conn->header_bytes += parse_offset;
 
+    // The parser will not touch the header region again: NUL-terminate the
+    // indexed keys/values in place (':' and value-terminating CR/LF become
+    // '\0'). All overwritten bytes lie within the header region
+    // (< conn->header_bytes), so the request line consumed below via
+    // parser_ctx.url and any body bytes at recv_buf + header_bytes are
+    // unaffected.
+    terminate_headers_in_place(ctx);
+
     // Copy URL to request context (inline buffer or heap-allocated)
     if (ctx->parser_ctx.url && ctx->parser_ctx.url_len > 0) {
+        // Enforce config.max_uri_len (previously documented but never
+        // checked). 0 disables the limit.
+        if (g_server->config.max_uri_len > 0 &&
+            (size_t)ctx->parser_ctx.url_len > g_server->config.max_uri_len) {
+            ESP_LOGW(TAG, "URI too long (%u > %zu)",
+                     (unsigned)ctx->parser_ctx.url_len, g_server->config.max_uri_len);
+            httpd_resp_set_header(&ctx->req, "Connection", "close");
+            httpd_resp_send_error(&ctx->req, 414, "URI Too Long");
+            conn->state = CONN_STATE_CLOSED;
+            return;
+        }
         size_t url_buf_needed = ctx->parser_ctx.url_len + 1;
         if (url_buf_needed <= sizeof(ctx->inline_uri_buf)) {
             ctx->uri_buf = ctx->inline_uri_buf;
@@ -3808,6 +4239,21 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
     // Store content length
     ctx->req.content_length = conn->content_length;
 
+    size_t request_end = conn->header_bytes;
+    if (conn->content_length <= SIZE_MAX - request_end) {
+        request_end += conn->content_length;
+    } else {
+        conn->state = CONN_STATE_CLOSED;
+        return;
+    }
+    if (ctx->recv_buf_len > request_end) {
+        size_t surplus = ctx->recv_buf_len - request_end;
+        if (!append_pipeline_bytes(ctx, ctx->recv_buf + request_end, surplus)) {
+            ESP_LOGW(TAG, "Failed to buffer %zu pipelined bytes", surplus);
+            conn->keep_alive = 0;
+        }
+    }
+
     // Save any body data that was received along with headers
     // conn->header_bytes contains the number of header bytes (including final CRLF)
     if (conn->content_length > 0 && ctx->recv_buf_len > conn->header_bytes) {
@@ -3815,8 +4261,6 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
         // Clamp to the declared Content-Length: bytes beyond it belong to the
         // next pipelined request and must not be delivered as body data.
         if (body_in_buffer > conn->content_length) {
-            ESP_LOGW(TAG, "Dropping %zu pipelined bytes beyond request body",
-                     body_in_buffer - conn->content_length);
             body_in_buffer = conn->content_length;
         }
         // Dynamically allocate body buffer for pre-received data
@@ -3833,13 +4277,26 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
         }
     }
 
-    // Free the recv accumulation buffer now that parsing is complete
-    if (ctx->recv_buf) {
-        if (ctx->recv_buf_is_heap) free(ctx->recv_buf);
-        ctx->recv_buf = NULL;
-        ctx->recv_buf_len = 0;
-        ctx->recv_buf_capacity = 0;
-        ctx->recv_buf_is_heap = false;
+    // recv_buf is NOT freed here: header keys/values live NUL-terminated in
+    // place inside it and must stay resolvable for the whole request
+    // lifetime - during dispatch, from deferred/provider/continuation
+    // handlers after on_http_request returns, and (after a WebSocket
+    // upgrade) for WS handlers reading upgrade-request headers over the
+    // whole connection lifetime. It is freed by init_request_context on the
+    // next keep-alive request, by on_disconnect, and by httpd_stop.
+    //
+    // Shrink an oversized heap buffer down to the bytes actually used - it
+    // may now be retained for a long time (deferred upload, WS connection)
+    // and multi-packet parsing grows it straight to 4096. Safe: no absolute
+    // pointers into recv_buf survive past this point (URL and pre-received
+    // body were copied out above; the header index stores offsets, which
+    // realloc preserves by keeping contents in place relative to the base).
+    if (ctx->recv_buf_is_heap && ctx->recv_buf_capacity > ctx->recv_buf_len) {
+        uint8_t* shrunk = (uint8_t*)realloc(ctx->recv_buf, ctx->recv_buf_len);
+        if (shrunk) {  // realloc failure keeps the original block valid
+            ctx->recv_buf = shrunk;
+            ctx->recv_buf_capacity = ctx->recv_buf_len;
+        }
     }
 
     // Save original URL
@@ -3871,6 +4328,26 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
     if (ctx->req.is_websocket) {
         for (int i = 0; i < g_server->ws_route_count; i++) {
             if (strcmp(g_server->ws_routes[i].pattern, ctx->req.path) == 0) {
+                // Authorize BEFORE the 101. The upgrade is still an ordinary
+                // request here — headers and the response API both work — which
+                // is the only point at which a WebSocket endpoint can be gated
+                // at all: once the handshake is sent the handler sees frames,
+                // not headers.
+                if (g_server->ws_routes[i].authorize != NULL &&
+                    g_server->ws_routes[i].authorize(&ctx->req, g_server->ws_routes[i].user_ctx) != HTTPD_OK) {
+                    // The callback sent its own response. The parser had already
+                    // moved the connection to CONN_STATE_WEBSOCKET on seeing the
+                    // Upgrade header; put it back so the rejection is delivered
+                    // as HTTP and subsequent bytes are not fed to on_ws_frame.
+                    if (conn->state == CONN_STATE_WEBSOCKET) {
+                        conn->state = CONN_STATE_HTTP_HEADERS;
+                    }
+                    ESP_LOGW(TAG, "<< GET %s ws-upgrade rejected (unauthorized)", ctx->req.path);
+                    HTTPD_LOG_REQUEST_END(ctx, conn, req_start_us, " ws-unauthorized");
+                    finish_sync_request(conn, ctx);
+                    return;
+                }
+
                 // WebSocket route found - set up context
                 ws_context_t* ws_ctx = get_ws_context(conn);
                 ws_ctx->route = &g_server->ws_routes[i];
@@ -3893,6 +4370,37 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
                 }
                 conn->state = CONN_STATE_WEBSOCKET;
                 ws_ctx->ws.connected = true;
+
+#ifdef CONFIG_HTTPD_USE_RAW_API
+                uint32_t ws_tick_ms = CONFIG_HTTPD_RAW_POLL_INTERVAL * 500U;
+#else
+                uint32_t ws_tick_ms = g_server->event_loop.config.select_timeout_ms;
+#endif
+                if (ws_tick_ms == 0) ws_tick_ms = 1000;
+                /* A route that does not configure an interval still gets a
+                 * keepalive ping.
+                 *
+                 * WebSocket connections used to be EXEMPT from the idle
+                 * timeout (event_loop_check_timeouts masked out
+                 * ws_active_mask). That exemption was removed so a dead peer
+                 * gets reaped, and the auto-ping is what makes that safe — but
+                 * gating the ping on ping_interval_ms left every route that
+                 * omits it (which is every route in this firmware) with no
+                 * keepalive AND no exemption. last_activity is refreshed only
+                 * on RECV, so an idle-but-healthy browser socket was force
+                 * closed after timeout_ms and reconnected in a loop, dropping
+                 * pushed logs/state in every gap. A browser answers PING with
+                 * an automatic PONG, and that PONG is a recv. */
+                uint32_t ping_ms = ws_ctx->route->ping_interval_ms;
+                if (ping_ms == 0) {
+                    /* Comfortably inside the idle timeout so several pings are
+                     * attempted before it could ever expire. */
+                    const uint32_t idle_ms = g_server->event_loop.config.timeout_ms;
+                    ping_ms = (idle_ms > 3000) ? idle_ms / 3 : 1000;
+                }
+                conn->ws_ping_interval_ticks = (ping_ms + ws_tick_ms - 1) / ws_tick_ms;
+                if (conn->ws_ping_interval_ticks == 0) conn->ws_ping_interval_ticks = 1;
+                conn->ws_last_ping = g_server->event_loop.tick_count;
 
                 // Mark as active WebSocket - O(1) using pool_index
                 connection_mark_ws_active(&g_server->connection_pool, conn->pool_index);
@@ -4186,7 +4694,11 @@ static void on_http_body(connection_t* conn, uint8_t* buffer, size_t len) {
     // Handle deferred body reception
     if (!ctx->defer.active) return;
 
-    // Skip if paused (flow control) - still track bytes to avoid hanging on content-length
+    // Defensive fallback only: while a deferred request is paused, the event
+    // loop drops the connection's read fd from its select set, so the socket is
+    // never recv()'d and this handler should not run for a paused connection.
+    // If it ever does (e.g. buffered bytes already read before the pause), fall
+    // back to discarding rather than delivering out of flow-control order.
     if (ctx->defer.paused) {
         ESP_LOGW(TAG, "Deferred body paused, discarding %zu bytes", body_len);
         ctx->req.body_received += body_len;
@@ -4250,6 +4762,39 @@ static void on_ws_frame(connection_t* conn, uint8_t* buffer, size_t len) {
                                                      &ws_ctx->frame_ctx,
                                                      &bytes_consumed);
 
+        if (result == WS_FRAME_ERROR) {
+            // Protocol error (e.g. unmasked client frame, oversized length):
+            // the parser is desynced, so no further bytes on this connection
+            // can be framed. This check MUST run before the bytes_consumed==0
+            // "need more" check below: errors are often reported with zero
+            // consumption, and treating them as need-more left the connection
+            // wedged forever (WS connections are exempt from the idle
+            // timeout - 16 bad frames exhausted the whole pool).
+            ESP_LOGW(TAG, "WS protocol error (conn %" PRIu8 ") - closing with 1002",
+                     conn->pool_index);
+            // Best-effort close frame, status 1002 (protocol error)
+            ws_send_close(conn, 1002, "protocol error");
+            if (ws_ctx->ws.connected) {
+                if (ws_ctx->route->handler) {
+                    httpd_ws_event_t disconnect_event = {
+                        .type = WS_EVENT_DISCONNECT,
+                        .data = NULL,
+                        .len = 0
+                    };
+                    ws_ctx->route->handler(&ws_ctx->ws, &disconnect_event);
+                }
+                ws_ctx->ws.connected = false;
+            }
+            // Release channel subscriptions and the active-WS slot, then let
+            // the event loop reap the connection.
+            httpd_ws_leave_all(&ws_ctx->ws);
+            if (g_server) {
+                connection_mark_ws_inactive(&g_server->connection_pool, conn->pool_index);
+            }
+            conn->state = CONN_STATE_CLOSED;
+            return;
+        }
+
         if (bytes_consumed == 0) {
             // No progress - need more data
             break;
@@ -4284,9 +4829,15 @@ static void on_ws_frame(connection_t* conn, uint8_t* buffer, size_t len) {
                 default:               frame_type = WS_TYPE_TEXT; break;
             }
 
+            // payload_ptr points either into the recv slice (single-slice
+            // frames, zero-copy) or into payload_buffer (reassembled frames);
+            // NULL only when payload_length == 0. It is valid ONLY for the
+            // duration of this handler dispatch - the event struct documents
+            // that handlers must copy data they need to retain, and nothing
+            // here stashes it past the call.
             httpd_ws_event_t event = {
                 .type = WS_EVENT_MESSAGE,
-                .data = ws_ctx->frame_ctx.payload_buffer,
+                .data = ws_ctx->frame_ctx.payload_ptr,
                 .len = ws_ctx->frame_ctx.payload_received,
                 .frame_type = frame_type
             };
@@ -4309,7 +4860,11 @@ static void on_ws_frame(connection_t* conn, uint8_t* buffer, size_t len) {
                     ws_ctx->route->handler(&ws_ctx->ws, &disconnect_event);
                 }
                 ws_ctx->ws.connected = false;
-                ws_ctx->channel_mask = 0;
+                httpd_ws_leave_all(&ws_ctx->ws);
+                if (g_server) {
+                    connection_mark_ws_inactive(&g_server->connection_pool,
+                                                conn->pool_index);
+                }
                 conn->state = CONN_STATE_CLOSED;
             }
             // Client-initiated close (CONN_STATE_WEBSOCKET):
@@ -4431,13 +4986,19 @@ static void on_disconnect(connection_t* conn) {
         if (request_contexts[idx]->uri_buf_is_heap) free(request_contexts[idx]->uri_buf);
         request_contexts[idx]->uri_buf = NULL;
         request_contexts[idx]->uri_buf_is_heap = false;
-        free(request_contexts[idx]->header_buf);
-        request_contexts[idx]->header_buf = NULL;
         free(request_contexts[idx]->body_buf);
         request_contexts[idx]->body_buf = NULL;
+        // Also releases the in-place header storage (headers are indexed
+        // inside recv_buf) - retained until now for deferred/provider
+        // handlers and, after a WebSocket upgrade, for WS handlers reading
+        // the upgrade-request headers over the connection's whole lifetime.
         if (request_contexts[idx]->recv_buf_is_heap) free(request_contexts[idx]->recv_buf);
         request_contexts[idx]->recv_buf = NULL;
         request_contexts[idx]->recv_buf_is_heap = false;
+        free(request_contexts[idx]->pipeline_buf);
+        request_contexts[idx]->pipeline_buf = NULL;
+        request_contexts[idx]->pipeline_buf_len = 0;
+        request_contexts[idx]->pipeline_buf_capacity = 0;
     }
 
     // Reset WebSocket context - free payload buffer, zero struct.
@@ -4718,6 +5279,13 @@ static void on_write_ready_impl(connection_t* conn) {
             if (callback) {
                 callback(&ctx->req, HTTPD_OK);
             }
+
+            // The response finished cleanly and the active flag is cleared:
+            // finish_sync_request (which early-returned at dispatch time
+            // while the async send was in flight) now re-arms the connection
+            // for the next keep-alive request, or closes it when
+            // Connection: close was requested.
+            finish_sync_request(conn, ctx);
         }
 
         // Check for data provider completion
@@ -4734,12 +5302,23 @@ static void on_write_ready_impl(connection_t* conn) {
             if (callback) {
                 callback(&ctx->req, HTTPD_OK);
             }
+
+            // Same as the async-send completion above: re-arm (or close for
+            // Connection: close) now that the provider response has drained.
+            finish_sync_request(conn, ctx);
         }
     }
 }
 
 // Serialized entry point (see SEND_LOCK above): the event loop's writer must
-// not interleave with app-task WebSocket sends on the same ring buffer
+// not interleave with app-task WebSocket sends on the same ring buffer.
+//
+// IMPORTANT: user callbacks dispatched from on_write_ready_impl (the data
+// provider callback, async_send on_done, provider on_complete) therefore run
+// UNDER the send mutex. They must not block waiting on another task that
+// itself calls httpd_ws_send / httpd_ws_broadcast / httpd_ws_publish (or any
+// other send-path API) - those take the same mutex, so that wait is a
+// guaranteed deadlock. Keep these callbacks short and non-blocking.
 static void on_write_ready(connection_t* conn) {
     SEND_LOCK();
     on_write_ready_impl(conn);
