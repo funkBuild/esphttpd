@@ -4520,8 +4520,14 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
             ctx->req._mw.final_user_ctx = match.user_ctx;
             ctx->req._mw.router = NULL;
 
-            // Execute middleware chain
-            httpd_err_t err = (mw_count > 0) ? _middleware_next(&ctx->req) : match.handler(&ctx->req);
+            // Always dispatch through _middleware_next, even with an empty
+            // chain: it is the single place that publishes the route's
+            // user_ctx into req->user_data, and it falls straight through to
+            // final_handler when chain_len == 0. The old fast path called the
+            // handler directly and skipped that assignment, so every user_ctx
+            // route saw NULL (crash: LoadProhibited at 0 in a static-file
+            // handler). Keep the assignment in exactly one place.
+            httpd_err_t err = _middleware_next(&ctx->req);
             if (err != HTTPD_OK) {
                 handle_error(err, &ctx->req);
             }
@@ -4589,8 +4595,14 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
             ctx->req._mw.final_handler = match.handler;
             ctx->req._mw.final_user_ctx = match.user_ctx;
 
-            // Execute middleware chain
-            httpd_err_t err = (mw_count > 0) ? _middleware_next(&ctx->req) : match.handler(&ctx->req);
+            // Always dispatch through _middleware_next, even with an empty
+            // chain: it is the single place that publishes the route's
+            // user_ctx into req->user_data, and it falls straight through to
+            // final_handler when chain_len == 0. The old fast path called the
+            // handler directly and skipped that assignment, so every user_ctx
+            // route saw NULL (crash: LoadProhibited at 0 in a static-file
+            // handler). Keep the assignment in exactly one place.
+            httpd_err_t err = _middleware_next(&ctx->req);
             if (err != HTTPD_OK) {
                 handle_error(err, &ctx->req);
             }

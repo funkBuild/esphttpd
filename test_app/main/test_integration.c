@@ -771,6 +771,72 @@ static void test_router_use_null(void)
     TEST_ASSERT_EQUAL(HTTPD_ERR_INVALID_ARG, result);
 }
 
+// Regression: a route registered with user_ctx must see it via
+// httpd_req_get_user_data() even when NO middleware is registered. The
+// no-middleware fast path used to call the handler directly, skipping the
+// `req->user_data = final_user_ctx` assignment that only _middleware_next
+// performs — so the handler dereferenced NULL (LoadProhibited at excvaddr 0).
+static void* uctx_seen = (void*)0xdeadbeef;
+static int uctx_handler_calls = 0;
+static httpd_err_t uctx_handler(httpd_req_t* req) {
+    uctx_handler_calls++;
+    uctx_seen = httpd_req_get_user_data(req);
+    return HTTPD_OK;
+}
+
+static const int uctx_marker = 42;
+
+static void test_user_ctx_without_middleware(void) {
+    start_test_server();
+    uctx_handler_calls = 0;
+    uctx_seen = (void*)0xdeadbeef;
+
+    httpd_route_t route = {
+        .method = HTTP_GET, .pattern = "/uctx", .handler = uctx_handler,
+        .user_ctx = (void*)&uctx_marker };
+    httpd_register_route(test_handle, &route);
+
+    connection_t conn = {0};
+    conn.fd = -1;
+    conn.pool_index = 0;
+    conn.state = CONN_STATE_NEW;
+
+    char req[] = "GET /uctx HTTP/1.1\r\n\r\n";
+    g_server->handlers.on_http_request(&conn, (uint8_t*)req, sizeof(req) - 1);
+
+    TEST_ASSERT_EQUAL(1, uctx_handler_calls);
+    TEST_ASSERT_EQUAL_PTR(&uctx_marker, uctx_seen);
+
+    stop_test_server();
+}
+
+// Same regression for the OTHER dispatch site: a route reached through a
+// mounted router, again with no middleware anywhere in the chain.
+static void test_user_ctx_without_middleware_router(void) {
+    start_test_server();
+    uctx_handler_calls = 0;
+    uctx_seen = (void*)0xdeadbeef;
+
+    httpd_router_t router = httpd_router_create();
+    TEST_ASSERT_NOT_NULL(router);
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_router_route(router, "/uctx", HTTP_GET,
+                                                   uctx_handler, (void*)&uctx_marker));
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_mount(test_handle, "/r", router));
+
+    connection_t conn = {0};
+    conn.fd = -1;
+    conn.pool_index = 0;
+    conn.state = CONN_STATE_NEW;
+
+    char req[] = "GET /r/uctx HTTP/1.1\r\n\r\n";
+    g_server->handlers.on_http_request(&conn, (uint8_t*)req, sizeof(req) - 1);
+
+    TEST_ASSERT_EQUAL(1, uctx_handler_calls);
+    TEST_ASSERT_EQUAL_PTR(&uctx_marker, uctx_seen);
+
+    stop_test_server();
+}
+
 // ==================== TEST RUNNER ====================
 
 void test_integration_run(void) {
@@ -779,6 +845,8 @@ void test_integration_run(void) {
     RUN_TEST(test_full_http_get_request);
     RUN_TEST(test_full_http_post_request);
     RUN_TEST(test_keepalive_rearm_after_post);
+    RUN_TEST(test_user_ctx_without_middleware);
+    RUN_TEST(test_user_ctx_without_middleware_router);
     RUN_TEST(test_pipelined_requests_dispatch_iteratively);
     RUN_TEST(test_websocket_upgrade);
     RUN_TEST(test_websocket_frame_processing);
