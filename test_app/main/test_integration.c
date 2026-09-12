@@ -146,6 +146,161 @@ static void test_pipelined_requests_dispatch_iteratively(void) {
     stop_test_server();
 }
 
+// Regression: a route's user_ctx must reach the handler even when no
+// middleware is registered. The no-middleware shortcut called the handler
+// directly and only _middleware_next published final_user_ctx, so with an
+// empty chain (the default config - CORS is the only built-in middleware and
+// it is off unless enabled) handlers received the NULL that
+// init_request_context left behind. Any handler dereferencing its user_ctx
+// took a LoadProhibited on the first request.
+static void* ctx_seen_by_handler = (void*)0xDEADBEEF;
+static int ctx_handler_calls = 0;
+static httpd_err_t ctx_handler(httpd_req_t* req) {
+    ctx_handler_calls++;
+    ctx_seen_by_handler = httpd_req_get_user_data(req);
+    return HTTPD_OK;
+}
+
+static int route_ctx_marker = 42;
+
+static void test_route_user_ctx_without_middleware(void) {
+    start_test_server();
+    ctx_handler_calls = 0;
+    ctx_seen_by_handler = (void*)0xDEADBEEF;
+
+    // No httpd_use() call: the middleware chain is empty.
+    httpd_route_t route = {
+        .method = HTTP_GET, .pattern = "/ctx",
+        .handler = ctx_handler, .user_ctx = &route_ctx_marker };
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_route(test_handle, &route));
+
+    connection_t conn = {0};
+    conn.fd = -1;
+    conn.pool_index = 0;
+    conn.state = CONN_STATE_NEW;
+
+    char req[] = "GET /ctx HTTP/1.1\r\n\r\n";
+    g_server->handlers.on_http_request(&conn, (uint8_t*)req, sizeof(req) - 1);
+
+    TEST_ASSERT_EQUAL(1, ctx_handler_calls);
+    TEST_ASSERT_EQUAL_PTR(&route_ctx_marker, ctx_seen_by_handler);
+
+    stop_test_server();
+}
+
+// Same guarantee on the mounted-router dispatch path.
+static void test_mounted_route_user_ctx_without_middleware(void) {
+    start_test_server();
+    ctx_handler_calls = 0;
+    ctx_seen_by_handler = (void*)0xDEADBEEF;
+
+    httpd_router_t router = httpd_router_create();
+    TEST_ASSERT_NOT_NULL(router);
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_router_route(router, "/ctx", HTTP_GET,
+                                                   ctx_handler, &route_ctx_marker));
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_mount(test_handle, "/api", router));
+
+    connection_t conn = {0};
+    conn.fd = -1;
+    conn.pool_index = 0;
+    conn.state = CONN_STATE_NEW;
+
+    char req[] = "GET /api/ctx HTTP/1.1\r\n\r\n";
+    g_server->handlers.on_http_request(&conn, (uint8_t*)req, sizeof(req) - 1);
+
+    TEST_ASSERT_EQUAL(1, ctx_handler_calls);
+    TEST_ASSERT_EQUAL_PTR(&route_ctx_marker, ctx_seen_by_handler);
+
+    stop_test_server();
+}
+
+// The guarantee that makes the fix safe: user_data is inside the region
+// init_request_context zeroes, so request N+1 on a keep-alive/pipelined
+// connection can never observe request N's value. Request N's handler here
+// replaces user_data with a heap pointer and frees it (exactly what
+// embedded_file_handler does with its stream), so if the zeroing boundary
+// (_zero_end) is ever reshuffled, request N+1 reads freed memory.
+static httpd_err_t ctx_overwrite_handler(httpd_req_t* req) {
+    ctx_handler_calls++;
+    void* per_request = malloc(4);
+    TEST_ASSERT_NOT_NULL(per_request);
+    httpd_req_set_user_data(req, per_request);
+    free(per_request);
+    return HTTPD_OK;
+}
+
+static void test_user_data_reset_between_pipelined_requests(void) {
+    start_test_server();
+    ctx_handler_calls = 0;
+    ctx_seen_by_handler = (void*)0xDEADBEEF;
+
+    httpd_route_t with_ctx = {
+        .method = HTTP_GET, .pattern = "/a",
+        .handler = ctx_overwrite_handler, .user_ctx = &route_ctx_marker };
+    httpd_route_t without_ctx = {
+        .method = HTTP_GET, .pattern = "/b", .handler = ctx_handler };
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_route(test_handle, &with_ctx));
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_route(test_handle, &without_ctx));
+
+    connection_t conn = {0};
+    conn.fd = -1;
+    conn.pool_index = 0;
+    conn.state = CONN_STATE_NEW;
+
+    char req[] = "GET /a HTTP/1.1\r\n\r\n"
+                 "GET /b HTTP/1.1\r\n\r\n";
+    g_server->handlers.on_http_request(&conn, (uint8_t*)req, sizeof(req) - 1);
+
+    TEST_ASSERT_EQUAL(2, ctx_handler_calls);   // both dispatched
+    // /b registers no user_ctx, so its handler must see NULL - not the
+    // freed pointer /a left behind, and not /a's route marker.
+    TEST_ASSERT_NULL(ctx_seen_by_handler);
+
+    stop_test_server();
+}
+
+// Pins the middleware/user_data contract the fix interacts with: middleware
+// now observes the route's user_ctx (it used to see NULL until the chain was
+// exhausted), and _middleware_next still re-publishes final_user_ctx before
+// the handler, so middleware CANNOT pass state down via user_data. Both halves
+// are asserted so a future change to either is a deliberate one.
+static void* ctx_seen_by_middleware = (void*)0xDEADBEEF;
+static int mw_other_marker = 7;
+
+static httpd_err_t ctx_probe_middleware(httpd_req_t* req, httpd_err_t (*next)(httpd_req_t*)) {
+    ctx_seen_by_middleware = httpd_req_get_user_data(req);
+    httpd_req_set_user_data(req, &mw_other_marker);
+    return next(req);
+}
+
+static void test_middleware_sees_route_ctx_and_handler_still_gets_it(void) {
+    start_test_server();
+    ctx_handler_calls = 0;
+    ctx_seen_by_handler = (void*)0xDEADBEEF;
+    ctx_seen_by_middleware = (void*)0xDEADBEEF;
+
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_use(test_handle, ctx_probe_middleware));
+
+    httpd_route_t route = {
+        .method = HTTP_GET, .pattern = "/ctx",
+        .handler = ctx_handler, .user_ctx = &route_ctx_marker };
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_route(test_handle, &route));
+
+    connection_t conn = {0};
+    conn.fd = -1;
+    conn.pool_index = 0;
+    conn.state = CONN_STATE_NEW;
+
+    char req[] = "GET /ctx HTTP/1.1\r\n\r\n";
+    g_server->handlers.on_http_request(&conn, (uint8_t*)req, sizeof(req) - 1);
+
+    TEST_ASSERT_EQUAL(1, ctx_handler_calls);
+    TEST_ASSERT_EQUAL_PTR(&route_ctx_marker, ctx_seen_by_middleware);
+    TEST_ASSERT_EQUAL_PTR(&route_ctx_marker, ctx_seen_by_handler);
+
+    stop_test_server();
+}
+
 // Test full HTTP GET request processing
 static void test_full_http_get_request(void) {
     // Setup server
@@ -780,6 +935,10 @@ void test_integration_run(void) {
     RUN_TEST(test_full_http_post_request);
     RUN_TEST(test_keepalive_rearm_after_post);
     RUN_TEST(test_pipelined_requests_dispatch_iteratively);
+    RUN_TEST(test_route_user_ctx_without_middleware);
+    RUN_TEST(test_mounted_route_user_ctx_without_middleware);
+    RUN_TEST(test_user_data_reset_between_pipelined_requests);
+    RUN_TEST(test_middleware_sees_route_ctx_and_handler_still_gets_it);
     RUN_TEST(test_websocket_upgrade);
     RUN_TEST(test_websocket_frame_processing);
     RUN_TEST(test_route_matching_integration);

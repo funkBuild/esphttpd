@@ -4076,7 +4076,12 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
             if (!ctx->recv_buf) {
                 ESP_LOGE(TAG, "Failed to allocate recv buffer");
                 ctx->parsing_in_progress = false;
+                // Same unrecoverable framing state as the 431/400 paths: this
+                // request was abandoned part-parsed, so its remaining bytes
+                // would be re-parsed as a fresh request (RFC 7230 6.6).
+                httpd_resp_set_header(&ctx->req, "Connection", "close");
                 httpd_resp_send_error(&ctx->req, 500, "Internal Server Error");
+                conn->state = CONN_STATE_CLOSED;
                 return;
             }
             ctx->recv_buf_capacity = len;
@@ -4094,7 +4099,9 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
             if (!new_buf) {
                 ESP_LOGE(TAG, "Failed to grow recv buffer");
                 ctx->parsing_in_progress = false;
+                httpd_resp_set_header(&ctx->req, "Connection", "close");
                 httpd_resp_send_error(&ctx->req, 500, "Internal Server Error");
+                conn->state = CONN_STATE_CLOSED;  // part-parsed: cannot re-frame
                 return;
             }
             memcpy(new_buf, old_buf, ctx->recv_buf_len);
@@ -4104,7 +4111,9 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
             if (!new_buf) {
                 ESP_LOGE(TAG, "Failed to grow recv buffer");
                 ctx->parsing_in_progress = false;
+                httpd_resp_set_header(&ctx->req, "Connection", "close");
                 httpd_resp_send_error(&ctx->req, 500, "Internal Server Error");
+                conn->state = CONN_STATE_CLOSED;  // part-parsed: cannot re-frame
                 return;
             }
         }
@@ -4218,7 +4227,11 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
             }
         } else {
             ESP_LOGE(TAG, "Failed to allocate URI buffer");
+            // Headers parsed but the request is abandoned before dispatch: any
+            // body still on the wire would be re-parsed as a fresh request.
+            httpd_resp_set_header(&ctx->req, "Connection", "close");
             httpd_resp_send_error(&ctx->req, 500, "Internal Server Error");
+            conn->state = CONN_STATE_CLOSED;
             return;
         }
     }
@@ -4520,7 +4533,12 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
             ctx->req._mw.final_user_ctx = match.user_ctx;
             ctx->req._mw.router = NULL;
 
-            // Execute middleware chain
+            // Execute middleware chain. The no-middleware shortcut calls the
+            // handler directly, so it must publish the route's user_ctx here -
+            // _middleware_next does it only on the chain-exhausted path, and
+            // init_request_context zeroed user_data, so skipping this handed
+            // handlers a NULL context (crash for any handler that derefs it).
+            ctx->req.user_data = match.user_ctx;
             httpd_err_t err = (mw_count > 0) ? _middleware_next(&ctx->req) : match.handler(&ctx->req);
             if (err != HTTPD_OK) {
                 handle_error(err, &ctx->req);
@@ -4589,8 +4607,14 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
             ctx->req._mw.final_handler = match.handler;
             ctx->req._mw.final_user_ctx = match.user_ctx;
 
-            // Execute middleware chain
-            httpd_err_t err = (mw_count > 0) ? _middleware_next(&ctx->req) : match.handler(&ctx->req);
+            // Same as the legacy path above: the direct-call shortcut has to
+            // publish user_ctx itself.
+            ctx->req.user_data = match.user_ctx;
+            // The legacy site gates on match.handler; mirror that here so a
+            // match without a handler 404s instead of jumping through NULL.
+            httpd_err_t err = (mw_count > 0) ? _middleware_next(&ctx->req)
+                            : match.handler ? match.handler(&ctx->req)
+                                            : HTTPD_ERR_NOT_FOUND;
             if (err != HTTPD_OK) {
                 handle_error(err, &ctx->req);
             }
