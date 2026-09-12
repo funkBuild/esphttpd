@@ -201,6 +201,7 @@ bool send_buffer_start_mem(send_buffer_t* sb, const uint8_t* data, size_t len) {
 // with d0 queued and d1 rejected, which would put a torn response on the wire.
 bool send_buffer_start_mem2(send_buffer_t* sb, const uint8_t* d0, size_t l0,
                             const uint8_t* d1, size_t l1) {
+    if (!sb) return false;
     // Normalize empty parts; shift a lone second part into the first slot
     if (!d0 || l0 == 0) {
         d0 = d1;
@@ -215,7 +216,12 @@ bool send_buffer_start_mem2(send_buffer_t* sb, const uint8_t* d0, size_t l0,
     if (!d0 || l0 == 0) {
         return false;  // Both parts empty/NULL (matches start_mem's contract)
     }
+    if (l0 > SIZE_MAX - l1) return false;
     size_t total = l0 + l1;
+    size_t pending = send_buffer_pending(sb);
+    size_t unsent = sb->mem_remaining;
+    if (pending > SIZE_MAX - unsent || total > SIZE_MAX - pending - unsent) return false;
+    if (!sb->mem_owned && pending + unsent + total > SEND_BUFFER_MAX_PENDING) return false;
 
     // If a stream is already pending, append behind its unsent bytes —
     // replacing the buffer here would silently drop response data.

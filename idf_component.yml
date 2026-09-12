@@ -1,3 +1,10 @@
 dependencies:
+  # Excluded on the linux target (tools/host_test host sanitizer harness): esp_littlefs.c
+  # embeds a `DIR` by value, and glibc's DIR is an opaque incomplete type, so the package
+  # cannot compile there. The host build substitutes a stub provider
+  # (tools/host_test/linux_overlay/esp_littlefs) whose mount reports "not found", so
+  # filesystem-backed tests fail visibly rather than silently passing against a fake FS.
   esp_littlefs:
     git: https://github.com/joltwallet/esp_littlefs.git
+    rules:
+      - if: "target != linux"

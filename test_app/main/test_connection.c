@@ -347,7 +347,7 @@ static void test_structure_sizes(void)
 #ifdef CONFIG_HTTPD_USE_RAW_API
     TEST_ASSERT_LESS_OR_EQUAL(64, conn_size); // With raw TCP fields (~60 bytes)
 #else
-    TEST_ASSERT_LESS_OR_EQUAL(48, conn_size); // Socket mode (~40 bytes)
+    TEST_ASSERT_LESS_OR_EQUAL(sizeof(void*) == 8 ? 56 : 48, conn_size); // Native/ESP pointer sizes
 #endif
 
     // Pool size

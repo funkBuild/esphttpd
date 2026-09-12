@@ -6,6 +6,8 @@
  * @brief High-performance HTTP/WebSocket server for ESP32
  *
  * Modern C API with proper error handling, thread safety, and extensibility.
+ * Registered route patterns support up to 32 nonempty path segments.
+ * Route registration and destruction must be serialized by the owner.
  *
  * Transport modes:
  * - Default: BSD sockets + select() in a dedicated FreeRTOS task

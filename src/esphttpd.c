@@ -1,7 +1,11 @@
+#include <stdatomic.h>
 /**
  * @file esphttpd.c
  * @brief HTTP/WebSocket server implementation
  */
+
+#include <fcntl.h>   /* open(), O_RDONLY: reached esphttpd.c transitively through IDF's
+                      * headers on the xtensa build, but not through glibc's. */
 
 #include "esp_attr.h"
 #include "esphttpd.h"
@@ -198,9 +202,10 @@ struct httpd_server {
 
     // State
     bool initialized;
-    volatile bool running;     // Read/written from different tasks
+    atomic_bool running;     // Read/written from different tasks
 #ifndef CONFIG_HTTPD_USE_RAW_API
-    volatile bool task_exited;  // Set by server_task before vTaskDelete
+    atomic_bool task_exited;  // Set by server_task before vTaskDelete
+    _Atomic(TaskHandle_t) task_handle;
 #endif
 };
 
@@ -395,8 +400,11 @@ typedef struct {
     size_t max_len;          // Maximum bytes to read
 } file_io_request_t;
 
+static void fs_stream_closed_cb(void);
 static QueueHandle_t s_file_io_request_queue = NULL;
-static TaskHandle_t s_file_io_task = NULL;
+static _Atomic(TaskHandle_t) s_file_io_task = NULL;
+static atomic_bool s_file_io_stopping;
+static bool s_file_io_stop_queued;
 // Set while a read for this slot is in the worker's hands. on_disconnect
 // checks it to hand fd ownership to the worker instead of closing underneath
 // an in-flight read.
@@ -416,13 +424,7 @@ static volatile bool s_file_io_pending[MAX_CONNECTIONS];
 // chunk of any larger file. Results are applied inline; the queue is gone.)
 static void file_io_worker_task(void* pvParameters) {
     file_io_request_t req;
-    uint8_t* bounce = (uint8_t*)malloc(SEND_BUFFER_SIZE);
-    if (!bounce) {
-        ESP_LOGE(TAG, "File I/O worker: bounce buffer alloc failed");
-        s_file_io_task = NULL;
-        vTaskDelete(NULL);
-        return;
-    }
+    uint8_t* bounce = pvParameters;
 
     for (;;) {
         if (xQueueReceive(s_file_io_request_queue, &req, portMAX_DELAY) != pdTRUE) {
@@ -489,44 +491,64 @@ static void file_io_worker_task(void* pvParameters) {
             // The connection died (or the slot was recycled) while the read
             // was in flight. on_disconnect saw s_file_io_pending and left the
             // fd open for us - close it here.
-            s_file_io_pending[req.pool_index] = false;
+            if (g_server && g_server->connection_pool.generation[req.pool_index] == req.generation)
+                s_file_io_pending[req.pool_index] = false;
             close(req.file_fd);
+            fs_stream_closed_cb();
             ESP_LOGD(TAG, "File I/O result dropped (conn [%u] gone)", (unsigned)req.pool_index);
         }
         HTTPD_UNLOCK_TCPIP();
     }
 
     free(bounce);
-    // Worker received stop sentinel - self-delete
+    // Publish completion only after the last access to queues/buffers.
+    s_file_io_task = NULL;
     vTaskDelete(NULL);
 }
 
 static void file_io_worker_start(void) {
-    if (s_file_io_task) return;  // Already running
-
-    s_file_io_request_queue = xQueueCreate(MAX_CONNECTIONS, sizeof(file_io_request_t));
-
-    xTaskCreate(file_io_worker_task, "httpd_fio", 2048, NULL, 5, &s_file_io_task);
-    ESP_LOGI(TAG, "File I/O worker task started");
+    if (s_file_io_task || s_file_io_stopping) return;
+    QueueHandle_t queue = xQueueCreate(MAX_CONNECTIONS, sizeof(file_io_request_t));
+    uint8_t *bounce = malloc(SEND_BUFFER_SIZE);
+    if (!queue || !bounce) {
+        if (queue) vQueueDelete(queue);
+        free(bounce);
+        return;
+    }
+    s_file_io_request_queue = queue;
+    s_file_io_stop_queued = false;
+    TaskHandle_t task = NULL;
+    if (xTaskCreate(file_io_worker_task, "httpd_fio", 2048, bounce, 5, &task) != pdPASS) {
+        s_file_io_request_queue = NULL;
+        vQueueDelete(queue);
+        free(bounce);
+        return;
+    }
+    s_file_io_task = task;
 }
 
-static void file_io_worker_stop(void) {
+static bool file_io_worker_stop(void) {
+    HTTPD_LOCK_TCPIP();
+    s_file_io_stopping = true; // prevents on_write_ready from adding more work
+    HTTPD_UNLOCK_TCPIP();
     if (s_file_io_task && s_file_io_request_queue) {
-        // Send sentinel to tell the worker to exit gracefully
         file_io_request_t stop_req = { .file_fd = -1 };
-        xQueueSend(s_file_io_request_queue, &stop_req, pdMS_TO_TICKS(100));
-
-        // Wait for the task to delete itself (up to 1 second)
-        for (int i = 0; i < 100 && s_file_io_task; i++) {
-            if (eTaskGetState(s_file_io_task) == eDeleted) break;
-            vTaskDelay(pdMS_TO_TICKS(10));
+        if (!s_file_io_stop_queued) {
+            if (xQueueSend(s_file_io_request_queue, &stop_req, pdMS_TO_TICKS(100)) != pdTRUE)
+                return false;
+            s_file_io_stop_queued = true;
         }
-        s_file_io_task = NULL;
+        TickType_t start = xTaskGetTickCount();
+        while (s_file_io_task) {
+            if (xTaskGetTickCount() - start >= pdMS_TO_TICKS(2000)) return false;
+            vTaskDelay(1);
+        }
     }
     if (s_file_io_request_queue) {
         vQueueDelete(s_file_io_request_queue);
         s_file_io_request_queue = NULL;
     }
+    return true;
 }
 
 // Submit a file read to the worker task (non-blocking).
@@ -534,6 +556,7 @@ static void file_io_worker_stop(void) {
 // set so raw_poll_cb retries (silently dropping the submit stalled transfers
 // forever).
 static bool file_io_submit_read(uint8_t pool_index, int file_fd, size_t max_len) {
+    if (s_file_io_stopping || pool_index >= MAX_CONNECTIONS) return false;
     if (!s_file_io_request_queue) {
         file_io_worker_start();
     }
@@ -573,7 +596,7 @@ static bool file_io_submit_read(uint8_t pool_index, int file_fd, size_t max_len)
 // enforced by a compile guard in raw_tcp.c.
 #ifndef CONFIG_HTTPD_USE_RAW_API
 static SemaphoreHandle_t s_send_mutex = NULL;
-#define SEND_LOCK()   do { if (s_send_mutex) xSemaphoreTakeRecursive(s_send_mutex, portMAX_DELAY); } while (0)
+#define SEND_LOCK()   do { if (s_send_mutex) while (xSemaphoreTakeRecursive(s_send_mutex, portMAX_DELAY) != pdTRUE) {} } while (0)
 #define SEND_UNLOCK() do { if (s_send_mutex) xSemaphoreGiveRecursive(s_send_mutex); } while (0)
 #else
 #define SEND_LOCK()   do { } while (0)
@@ -1429,7 +1452,17 @@ static void terminate_headers_in_place(request_context_t* ctx) {
 // Forward declaration for built-in CORS middleware
 static httpd_err_t cors_middleware(httpd_req_t* req, httpd_next_t next);
 
+static atomic_flag httpd_lifecycle_busy = ATOMIC_FLAG_INIT;
+static void httpd_lifecycle_leave(bool *held) {
+    if (*held) atomic_flag_clear(&httpd_lifecycle_busy);
+}
+#define HTTPD_LIFECYCLE_ENTER() \
+    bool httpd_lifecycle_held __attribute__((cleanup(httpd_lifecycle_leave))) = \
+        !atomic_flag_test_and_set(&httpd_lifecycle_busy); \
+    if (!httpd_lifecycle_held) return HTTPD_ERR_WOULD_BLOCK
+
 httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
+    HTTPD_LIFECYCLE_ENTER();
     if (!handle) return HTTPD_ERR_INVALID_ARG;
 
     struct httpd_server* server = &server_instance;
@@ -1462,6 +1495,7 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
     // Serializes app-task WebSocket sends against the server task's writer
     if (!s_send_mutex) {
         s_send_mutex = xSemaphoreCreateRecursiveMutex();
+        if (!s_send_mutex) return HTTPD_ERR_NO_MEM;
     }
 #endif
 
@@ -1553,6 +1587,7 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
     server->running = true;
     ESP_LOGI(TAG, "Server started in TEST MODE (no task created)");
 #elif defined(CONFIG_HTTPD_USE_RAW_API)
+    s_file_io_stopping = false;
     // Raw API mode: start listening via lwIP raw callbacks (no server task needed)
     HTTPD_LOCK_TCPIP();
     int raw_ret = raw_tcp_listen(&server->event_loop, &server->handlers);
@@ -1581,10 +1616,13 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
 #else
     // Start the server task
     server->task_exited = false;
+    server->running = true;
+    server->task_handle = NULL;
     BaseType_t ret = xTaskCreate(server_task, "httpd",
                                   cfg.stack_size, server,
                                   cfg.task_priority, NULL);
     if (ret != pdPASS) {
+        server->running = false;
         server->initialized = false;
         g_server = NULL;
         // Undo everything allocated/registered above: without these a retry
@@ -1603,23 +1641,26 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
         memset(connection_send_buffers, 0, sizeof(connection_send_buffers));
         return HTTPD_ERR_NO_MEM;
     }
-    server->running = true;
 #endif
 
     return HTTPD_OK;
 }
 
 httpd_err_t httpd_stop(httpd_handle_t handle) {
+    HTTPD_LIFECYCLE_ENTER();
     struct httpd_server* server = handle;
     if (!server || !server->initialized) {
         return HTTPD_ERR_NOT_RUNNING;
     }
 
+#if !defined(CONFIG_HTTPD_USE_RAW_API) && !defined(CONFIG_ESPHTTPD_TEST_MODE)
+    if (server->task_handle == xTaskGetCurrentTaskHandle()) return HTTPD_ERR_WOULD_BLOCK;
+#endif
     ESP_LOGI(TAG, "Stopping server");
 
 #ifdef CONFIG_HTTPD_USE_RAW_API
     // Stop file I/O worker if running
-    file_io_worker_stop();
+    if (!file_io_worker_stop()) return HTTPD_ERR_TIMEOUT;
 
 #ifndef CONFIG_ESPHTTPD_TEST_MODE
     // Raw API: close all connections and listen PCB under tcpip lock
@@ -1632,11 +1673,16 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
 
 #ifndef CONFIG_ESPHTTPD_TEST_MODE
     // Wait for server task to finish its current iteration and exit
+    TickType_t stop_started = xTaskGetTickCount();
     while (!server->task_exited) {
-        vTaskDelay(pdMS_TO_TICKS(10));
+        if (xTaskGetTickCount() - stop_started >= pdMS_TO_TICKS(2000))
+            return HTTPD_ERR_TIMEOUT;
+        vTaskDelay(pdMS_TO_TICKS(10) + 1);
     }
 #endif
 #endif
+
+    SEND_LOCK();
 
     // Fire WS_EVENT_DISCONNECT to the route handler for every live WebSocket
     // connection BEFORE any teardown: app code allocates per-socket state on
@@ -1707,7 +1753,9 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
     // WebSocket sends (httpd_ws_send/broadcast/publish take the same lock):
     // without it a concurrent send could queue into a ring buffer while it
     // is being freed here.
-    SEND_LOCK();
+#ifdef CONFIG_HTTPD_USE_RAW_API
+    HTTPD_LOCK_TCPIP();
+#endif
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
 
         // Free dynamically-allocated sub-buffers within pre-allocated contexts
@@ -1742,7 +1790,6 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
             connection_send_buffers[i] = NULL;
         }
     }
-    SEND_UNLOCK();
 
     // Free pre-allocated backing arrays
     free(preallocated_request_contexts);
@@ -1800,6 +1847,10 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
 #endif
     }
 
+#ifdef CONFIG_HTTPD_USE_RAW_API
+    HTTPD_UNLOCK_TCPIP();
+#endif
+    SEND_UNLOCK();
     return HTTPD_OK;
 }
 
@@ -1813,6 +1864,7 @@ bool httpd_is_running(httpd_handle_t handle) {
 #if !defined(CONFIG_HTTPD_USE_RAW_API) && !defined(CONFIG_ESPHTTPD_TEST_MODE)
 static void server_task(void* pvParameters) {
     struct httpd_server* server = (struct httpd_server*)pvParameters;
+    server->task_handle = xTaskGetCurrentTaskHandle();
     event_loop_run(&server->event_loop, &server->handlers);
     server->running = false;
     server->task_exited = true;
@@ -3374,7 +3426,8 @@ httpd_err_t httpd_ws_reject(httpd_req_t* req, int status, const char* reason) {
 }
 
 httpd_err_t httpd_ws_send(httpd_ws_t* ws, const void* data, size_t len, ws_type_t type) {
-    if (!ws || !ws->connected) return HTTPD_ERR_CONN_CLOSED;
+    if (!ws) return HTTPD_ERR_CONN_CLOSED;
+    if (!data && len) return HTTPD_ERR_IO; // preserve frame-validation error contract
 
     ws_opcode_internal_t opcode;
     switch (type) {
@@ -3386,21 +3439,23 @@ httpd_err_t httpd_ws_send(httpd_ws_t* ws, const void* data, size_t len, ws_type_
         default: return HTTPD_ERR_INVALID_ARG;
     }
 
-    connection_t* conn = (connection_t*)ws->_internal;
-    if (!conn) return HTTPD_ERR_CONN_CLOSED;
-
     // Serialize against the server task's on_write_ready (socket mode). Raw mode
     // relies on LOCK_TCPIP_CORE instead; SEND_LOCK is a no-op there.
     SEND_LOCK();
 #ifdef CONFIG_HTTPD_USE_RAW_API
     HTTPD_LOCK_TCPIP();
 #endif
-    int ret = ws_send_frame(conn, opcode, (const uint8_t*)data, len, false);
+    // The stop path holds the same lock through context destruction. Check
+    // server lifetime before touching the caller's borrowed WebSocket pointer.
+    int ret = -1;
+    bool connected = g_server && ws->connected && ws->_internal;
+    if (connected) ret = ws_send_frame(ws->_internal, opcode, (const uint8_t*)data, len, false);
 #ifdef CONFIG_HTTPD_USE_RAW_API
     HTTPD_UNLOCK_TCPIP();
 #endif
     SEND_UNLOCK();
 
+    if (!connected) return HTTPD_ERR_CONN_CLOSED;
     if (ret < 0) {
         return HTTPD_ERR_IO;
     }
@@ -3484,8 +3539,6 @@ httpd_err_t httpd_ws_close(httpd_ws_t* ws, uint16_t code, const char* reason) {
         close_len += reason_len;
     }
 
-    connection_t* conn = (connection_t*)ws->_internal;
-
     // Serialize against the server task's writer (socket mode); raw mode uses
     // LOCK_TCPIP_CORE and SEND_LOCK is a no-op there.
     SEND_LOCK();
@@ -3493,6 +3546,14 @@ httpd_err_t httpd_ws_close(httpd_ws_t* ws, uint16_t code, const char* reason) {
     HTTPD_LOCK_TCPIP();
 #endif
 
+    if (!g_server) {
+#ifdef CONFIG_HTTPD_USE_RAW_API
+        HTTPD_UNLOCK_TCPIP();
+#endif
+        SEND_UNLOCK();
+        return HTTPD_ERR_CONN_CLOSED;
+    }
+    connection_t* conn = (connection_t*)ws->_internal;
     ws_send_frame(conn, WS_OPCODE_CLOSE, close_data, close_len, false);
 
     // Per RFC 6455 section 5.5.1: after sending a Close frame, wait for the
@@ -5029,6 +5090,7 @@ static void on_disconnect(connection_t* conn) {
         connection_send_buffers[idx]->file_fd = -1;  // worker closes its copy
         connection_send_buffers[idx]->streaming = 0;
         connection_send_buffers[idx]->file_remaining = 0;
+        s_file_io_pending[idx] = false; // recycled slots may submit their own read
     }
 #endif
 
