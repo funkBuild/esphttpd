@@ -1262,9 +1262,24 @@ static void test_start_mem2_single_part_normalization(void)
     send_buffer_free(&sb);
 }
 
+static void test_start_mem_rejects_initial_overflow(void) {
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+    const uint8_t data[] = "abc";
+    TEST_ASSERT_FALSE(send_buffer_start_mem2(&sb, data, SIZE_MAX, data, 2));
+    TEST_ASSERT_FALSE(send_buffer_start_mem(&sb, data, (size_t)SEND_BUFFER_MAX_PENDING + 1));
+    TEST_ASSERT_NULL(sb.mem_owned);
+    TEST_ASSERT_TRUE(send_buffer_start_mem(&sb, data, 3));
+    TEST_ASSERT_FALSE(send_buffer_start_mem2(&sb, data, SIZE_MAX - 1, data, 2));
+    TEST_ASSERT_EQUAL_MEMORY(data, sb.mem_ptr, 3);
+    TEST_ASSERT_EQUAL_UINT32(3, sb.mem_remaining);
+    send_buffer_free(&sb);
+}
+
 void test_send_buffer_run(void)
 {
     // Basic functionality tests
+    RUN_TEST(test_start_mem_rejects_initial_overflow);
     RUN_TEST(test_buffer_init);
     RUN_TEST(test_buffer_alloc);
     RUN_TEST(test_queue_and_peek);

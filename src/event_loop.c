@@ -82,6 +82,7 @@ void event_loop_init(event_loop_t* loop, connection_pool_t* pool, const event_lo
 }
 
 void event_loop_stop(event_loop_t* loop) {
+    loop->stop_requested = true;
     loop->running = false;
 }
 
@@ -484,17 +485,19 @@ void event_loop_run(event_loop_t* loop, const event_handlers_t* handlers) {
     if (loop->listen_fd < 0) {
         if (event_loop_create_listener(loop) < 0) {
             ESP_LOGE(TAG, "Failed to create listener");
-            return;
+            goto cleanup;
         }
     }
 
     loop->running = true;
     ESP_LOGI(TAG, "Event loop started");
 
-    while (loop->running) {
+    while (loop->running && !loop->stop_requested) {
         event_loop_iteration(loop, handlers, loop->io_buffer);
     }
 
+cleanup:
+    loop->running = false;
     // Close listening socket
     if (loop->listen_fd >= 0) {
         close(loop->listen_fd);

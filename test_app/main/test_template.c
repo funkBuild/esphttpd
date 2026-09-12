@@ -328,6 +328,7 @@ static void test_template_escape_html_in_substitution(void) {
     // Should have escaped the HTML tags
     TEST_ASSERT_NOT_NULL(strstr((char*)output, "&lt;b&gt;"));
     TEST_ASSERT_NULL(strstr((char*)output, "<b>"));
+    template_flush(&ctx, output, sizeof(output));
 }
 
 static void test_template_no_escape_html_in_substitution(void) {

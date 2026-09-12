@@ -92,6 +92,8 @@ int filesystem_init_default(filesystem_t* fs) {
 }
 
 int filesystem_init(filesystem_t* fs, const filesystem_config_t* config) {
+    if (!fs || !config || !config->base_path || strlen(config->base_path) >= sizeof(fs->base_path) ||
+        (config->partition_label && strlen(config->partition_label) >= sizeof(fs->partition_label))) return -1;
     if (fs->mounted) {
         ESP_LOGW(TAG, "Filesystem already mounted");
         return 0;
@@ -122,6 +124,8 @@ int filesystem_init(filesystem_t* fs, const filesystem_config_t* config) {
     strncpy(fs->base_path, config->base_path, sizeof(fs->base_path) - 1);
     fs->base_path[sizeof(fs->base_path) - 1] = '\0';
     fs->base_path_len = (uint8_t)strlen(fs->base_path);
+    fs->has_partition_label = config->partition_label != NULL;
+    if (config->partition_label) strcpy(fs->partition_label, config->partition_label);
     fs->mounted = true;
     fs->open_files = 0;
     fs->max_open_files = (config->max_open_files <= 255) ? (uint8_t)config->max_open_files : 255;
@@ -142,7 +146,7 @@ void filesystem_unmount(filesystem_t* fs) {
         return;
     }
 
-    esp_vfs_littlefs_unregister(fs->base_path);
+    if (esp_vfs_littlefs_unregister(fs->has_partition_label ? fs->partition_label : NULL) != ESP_OK) return;
     fs->mounted = false;
     ESP_LOGI(TAG, "Filesystem unmounted");
 }

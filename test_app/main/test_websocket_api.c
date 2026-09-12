@@ -376,10 +376,14 @@ static void ws_remove_mock_send_buffer(void) {
 
 static int ws_lifecycle_connect_count = 0;
 static int ws_lifecycle_disconnect_count = 0;
+static httpd_ws_t *ws_lifecycle_socket;
 
 static httpd_err_t ws_lifecycle_handler(httpd_ws_t* ws, httpd_ws_event_t* event) {
     (void)ws;
-    if (event->type == WS_EVENT_CONNECT) ws_lifecycle_connect_count++;
+    if (event->type == WS_EVENT_CONNECT) {
+        ws_lifecycle_connect_count++;
+        ws_lifecycle_socket = ws;
+    }
     if (event->type == WS_EVENT_DISCONNECT) ws_lifecycle_disconnect_count++;
     return HTTPD_OK;
 }
@@ -468,6 +472,10 @@ static void test_ws_stop_fires_disconnect_event(void) {
     // Stop with the WS connection still active
     stop_test_server();
     TEST_ASSERT_EQUAL(1, ws_lifecycle_disconnect_count);
+
+    // Calls arriving after stop must reject before dereferencing freed contexts.
+    TEST_ASSERT_EQUAL(HTTPD_ERR_CONN_CLOSED, httpd_ws_send(ws_lifecycle_socket, "x", 1, WS_TYPE_TEXT));
+    TEST_ASSERT_EQUAL(HTTPD_ERR_CONN_CLOSED, httpd_ws_close(ws_lifecycle_socket, 1000, NULL));
 
     // httpd_stop already ran send_buffer_free on the installed mock (it was
     // wired in as slot 0's buffer); this just clears the bookkeeping.

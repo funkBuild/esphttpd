@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+
 #include "unity.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -98,8 +100,14 @@ void app_main(void)
     // For QEMU: print a marker that tests are complete
     printf("QEMU_TEST_COMPLETE: %s\n", failures == 0 ? "PASS" : "FAIL");
 
+#if CONFIG_IDF_TARGET_LINUX
+    // Host build (tools/host_test): exit with a real status. The process MUST actually
+    // exit or LeakSanitizer never reports -- it only runs at process exit.
+    exit(failures ? 1 : 0);
+#else
     // Keep alive for QEMU
     while(1) {
         vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
+#endif
 }

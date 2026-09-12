@@ -4,6 +4,7 @@
 #include "sdkconfig.h"
 
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #ifndef CONFIG_HTTPD_USE_RAW_API
 #include <sys/time.h>
@@ -48,7 +49,8 @@ typedef struct {
 #ifndef CONFIG_HTTPD_USE_RAW_API
     struct timeval select_timeout;  // Precomputed select timeout struct
 #endif
-    bool running;                   // Event loop is running
+    atomic_bool running;
+    atomic_bool stop_requested;                   // Event loop is running
 
 #ifndef CONFIG_HTTPD_USE_RAW_API
     // I/O buffer (heap allocated to save stack space)

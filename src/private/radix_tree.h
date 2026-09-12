@@ -14,6 +14,9 @@ extern "C" {
 // Configuration (with fallbacks for non-Kconfig builds)
 // ============================================================================
 
+// Maximum registered path depth; bounds recursive lookup/destruction stack use.
+#define RADIX_MAX_DEPTH 32
+
 #ifndef CONFIG_HTTPD_MAX_ROUTE_PARAMS
 #define CONFIG_HTTPD_MAX_ROUTE_PARAMS 8
 #endif
