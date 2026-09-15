@@ -4594,13 +4594,18 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
             ctx->req._mw.final_user_ctx = match.user_ctx;
             ctx->req._mw.router = NULL;
 
+            // Middleware observes the route's user_ctx. _middleware_next
+            // re-publishes final_user_ctx before the handler, so middleware
+            // cannot pass state down through user_data.
+            ctx->req.user_data = match.user_ctx;
+
             // Always dispatch through _middleware_next, even with an empty
-            // chain: it is the single place that publishes the route's
-            // user_ctx into req->user_data, and it falls straight through to
+            // chain: it re-publishes the route's user_ctx into req->user_data
+            // before the handler, and it falls straight through to
             // final_handler when chain_len == 0. The old fast path called the
             // handler directly and skipped that assignment, so every user_ctx
             // route saw NULL (crash: LoadProhibited at 0 in a static-file
-            // handler). Keep the assignment in exactly one place.
+            // handler).
             httpd_err_t err = _middleware_next(&ctx->req);
             if (err != HTTPD_OK) {
                 handle_error(err, &ctx->req);
@@ -4669,13 +4674,18 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
             ctx->req._mw.final_handler = match.handler;
             ctx->req._mw.final_user_ctx = match.user_ctx;
 
+            // Middleware observes the route's user_ctx. _middleware_next
+            // re-publishes final_user_ctx before the handler, so middleware
+            // cannot pass state down through user_data.
+            ctx->req.user_data = match.user_ctx;
+
             // Always dispatch through _middleware_next, even with an empty
-            // chain: it is the single place that publishes the route's
-            // user_ctx into req->user_data, and it falls straight through to
+            // chain: it re-publishes the route's user_ctx into req->user_data
+            // before the handler, and it falls straight through to
             // final_handler when chain_len == 0. The old fast path called the
             // handler directly and skipped that assignment, so every user_ctx
             // route saw NULL (crash: LoadProhibited at 0 in a static-file
-            // handler). Keep the assignment in exactly one place.
+            // handler).
             httpd_err_t err = _middleware_next(&ctx->req);
             if (err != HTTPD_OK) {
                 handle_error(err, &ctx->req);
