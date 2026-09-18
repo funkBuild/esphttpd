@@ -2,7 +2,7 @@
  * Performance Comparison Tests: Old Chunked API vs New Data Provider API
  *
  * Compares:
- * - /largefile/:size - Old synchronous chunked API (httpd_resp_send_chunk)
+ * - /largefile-buffered/:size - Old synchronous chunked API (httpd_resp_send_chunk)
  * - /largefile-provider/:size - New data provider API with Content-Length
  * - /largefile-provider-chunked/:size - New data provider API with chunked encoding
  */
@@ -88,8 +88,9 @@ describe('Data Provider API Performance', () => {
     }, TIMEOUTS.DOWNLOAD_SM + 5000);
   });
 
-  describe('Performance Comparison: 100KB', () => {
-    const SIZE_KB = 100;
+  // Synchronous sends must fit the production 32 KiB pending-byte cap.
+  describe('Performance Comparison: 16KB', () => {
+    const SIZE_KB = 16;
     const ITERATIONS = 3;
 
     let oldApiResults: PerfResult[] = [];
@@ -98,13 +99,13 @@ describe('Data Provider API Performance', () => {
 
     beforeAll(async () => {
       // Warm up requests
-      await axios.get(`/largefile/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: TIMEOUTS.DOWNLOAD_SM });
+      await axios.get(`/largefile-buffered/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: TIMEOUTS.DOWNLOAD_SM });
       await axios.get(`/largefile-provider/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: TIMEOUTS.DOWNLOAD_SM });
       await axios.get(`/largefile-provider-chunked/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: TIMEOUTS.DOWNLOAD_SM });
 
       // Run multiple iterations
       for (let i = 0; i < ITERATIONS; i++) {
-        oldApiResults.push(await measureDownload('/largefile', SIZE_KB));
+        oldApiResults.push(await measureDownload('/largefile-buffered', SIZE_KB));
         providerResults.push(await measureDownload('/largefile-provider', SIZE_KB));
         providerChunkedResults.push(await measureDownload('/largefile-provider-chunked', SIZE_KB));
       }
@@ -131,7 +132,7 @@ describe('Data Provider API Performance', () => {
       });
     });
 
-    it('should compare performance (100KB)', () => {
+    it('should compare performance (16KB)', () => {
       const avgOld = oldApiResults.reduce((a, b) => a + b.throughputKBps, 0) / ITERATIONS;
       const avgProvider = providerResults.reduce((a, b) => a + b.throughputKBps, 0) / ITERATIONS;
       const avgProviderChunked = providerChunkedResults.reduce((a, b) => a + b.throughputKBps, 0) / ITERATIONS;
@@ -140,7 +141,7 @@ describe('Data Provider API Performance', () => {
       const avgProviderMs = providerResults.reduce((a, b) => a + b.durationMs, 0) / ITERATIONS;
       const avgProviderChunkedMs = providerChunkedResults.reduce((a, b) => a + b.durationMs, 0) / ITERATIONS;
 
-      console.log('\n=== 100KB Performance Comparison ===');
+      console.log('\n=== 16KB Performance Comparison ===');
       console.log(`Old Chunked API:           ${avgOldMs.toFixed(0)}ms, ${avgOld.toFixed(1)} KB/s`);
       console.log(`Provider (Content-Length): ${avgProviderMs.toFixed(0)}ms, ${avgProvider.toFixed(1)} KB/s`);
       console.log(`Provider (Chunked):        ${avgProviderChunkedMs.toFixed(0)}ms, ${avgProviderChunked.toFixed(1)} KB/s`);
@@ -158,8 +159,8 @@ describe('Data Provider API Performance', () => {
     });
   });
 
-  describe('Performance Comparison: 256KB', () => {
-    const SIZE_KB = 256;
+  describe('Performance Comparison: 24KB', () => {
+    const SIZE_KB = 24;
     const ITERATIONS = 3;
 
     let oldApiResults: PerfResult[] = [];
@@ -168,13 +169,13 @@ describe('Data Provider API Performance', () => {
 
     beforeAll(async () => {
       // Warm up requests
-      await axios.get(`/largefile/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: TIMEOUTS.DOWNLOAD_MD });
+      await axios.get(`/largefile-buffered/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: TIMEOUTS.DOWNLOAD_MD });
       await axios.get(`/largefile-provider/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: TIMEOUTS.DOWNLOAD_MD });
       await axios.get(`/largefile-provider-chunked/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: TIMEOUTS.DOWNLOAD_MD });
 
       // Run multiple iterations
       for (let i = 0; i < ITERATIONS; i++) {
-        oldApiResults.push(await measureDownload('/largefile', SIZE_KB));
+        oldApiResults.push(await measureDownload('/largefile-buffered', SIZE_KB));
         providerResults.push(await measureDownload('/largefile-provider', SIZE_KB));
         providerChunkedResults.push(await measureDownload('/largefile-provider-chunked', SIZE_KB));
       }
@@ -201,7 +202,7 @@ describe('Data Provider API Performance', () => {
       });
     });
 
-    it('should compare performance (256KB)', () => {
+    it('should compare performance (24KB)', () => {
       const avgOld = oldApiResults.reduce((a, b) => a + b.throughputKBps, 0) / ITERATIONS;
       const avgProvider = providerResults.reduce((a, b) => a + b.throughputKBps, 0) / ITERATIONS;
       const avgProviderChunked = providerChunkedResults.reduce((a, b) => a + b.throughputKBps, 0) / ITERATIONS;
@@ -210,7 +211,7 @@ describe('Data Provider API Performance', () => {
       const avgProviderMs = providerResults.reduce((a, b) => a + b.durationMs, 0) / ITERATIONS;
       const avgProviderChunkedMs = providerChunkedResults.reduce((a, b) => a + b.durationMs, 0) / ITERATIONS;
 
-      console.log('\n=== 256KB Performance Comparison ===');
+      console.log('\n=== 24KB Performance Comparison ===');
       console.log(`Old Chunked API:           ${avgOldMs.toFixed(0)}ms, ${avgOld.toFixed(1)} KB/s`);
       console.log(`Provider (Content-Length): ${avgProviderMs.toFixed(0)}ms, ${avgProvider.toFixed(1)} KB/s`);
       console.log(`Provider (Chunked):        ${avgProviderChunkedMs.toFixed(0)}ms, ${avgProviderChunked.toFixed(1)} KB/s`);
@@ -229,13 +230,13 @@ describe('Data Provider API Performance', () => {
   });
 
   describe('Concurrent Downloads Comparison', () => {
-    const SIZE_KB = 64;
+    const SIZE_KB = 16;
 
     it('should compare concurrent performance', async () => {
       // Old API - 3 concurrent
       const oldStart = Date.now();
       const oldPromises = [1, 2, 3].map(() =>
-        axios.get(`/largefile/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: TIMEOUTS.DOWNLOAD_MD })
+        axios.get(`/largefile-buffered/${SIZE_KB}`, { responseType: 'arraybuffer', timeout: TIMEOUTS.DOWNLOAD_MD })
       );
       await Promise.all(oldPromises);
       const oldDuration = Date.now() - oldStart;
@@ -248,7 +249,7 @@ describe('Data Provider API Performance', () => {
       await Promise.all(providerPromises);
       const providerDuration = Date.now() - providerStart;
 
-      console.log('\n=== Concurrent Downloads (3 x 64KB) ===');
+      console.log('\n=== Concurrent Downloads (3 x 16KB) ===');
       console.log(`Old Chunked API:      ${oldDuration}ms`);
       console.log(`Provider API:         ${providerDuration}ms`);
 

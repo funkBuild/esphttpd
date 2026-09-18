@@ -933,12 +933,12 @@ static httpd_err_t handle_large_body(httpd_req_t* req) {
 
 // GET /largefile/:size - generates a large response for testing
 // Pattern: /largefile/* where * is the size in KB (e.g., /largefile/100 for 100KB)
-static httpd_err_t handle_largefile(httpd_req_t* req) {
+static httpd_err_t handle_largefile_buffered(httpd_req_t* req) {
     request_count++;
 
     // Extract size from URL (after /largefile/)
     const char* url = httpd_req_get_uri(req);
-    const char* size_str = url + 11;  // Skip "/largefile/"
+    const char* size_str = strrchr(url, '/') + 1;
     int size_kb = atoi(size_str);
 
     // Sanity check: limit to 1MB max
@@ -1098,18 +1098,13 @@ static ssize_t largefile_data_provider(httpd_req_t* req, uint8_t* buf, size_t ma
         size_t chunk_size = (to_write - written < bytes_in_block) ?
                             (to_write - written) : bytes_in_block;
 
-        if (block_offset == 0 && chunk_size >= 11) {
-            // Start of new block - write header "BLOCK_XXXX:"
-            int header_len = snprintf((char*)(buf + written), 12, "BLOCK_%04d:", state->block_num);
-            memcpy(buf + written + header_len, provider_block_template + header_len, chunk_size - header_len);
-        } else if (block_offset < 11) {
-            // Partial header - complex case, just use pattern
-            for (size_t i = 0; i < chunk_size; i++) {
-                buf[written + i] = 'A' + ((state->bytes_sent + i) % 26);
-            }
-        } else {
-            // Mid-block - copy from template
-            memcpy(buf + written, provider_block_template + block_offset, chunk_size);
+        // A provider buffer may split anywhere, including inside the header.
+        char header[12];
+        int header_len = snprintf(header, sizeof(header), "BLOCK_%04d:", state->block_num);
+        for (size_t i = 0; i < chunk_size; ++i) {
+            size_t offset = block_offset + i;
+            buf[written + i] = offset < (size_t)header_len
+                ? (uint8_t)header[offset] : (uint8_t)provider_block_template[offset];
         }
 
         written += chunk_size;
@@ -1205,7 +1200,7 @@ static httpd_err_t handle_largefile_provider_chunked(httpd_req_t* req) {
 
     // Extract size from URL (after /largefile-provider-chunked/)
     const char* url = httpd_req_get_uri(req);
-    const char* size_str = url + 28;  // Skip "/largefile-provider-chunked/"
+    const char* size_str = strrchr(url, '/') + 1;
     int size_kb = atoi(size_str);
 
     // Sanity check: limit to 1MB max
@@ -1779,11 +1774,18 @@ void app_main(void) {
         .handler = handle_large_body
     });
 
+    // Exercise synchronous buffering below its bounded pending-byte limit.
+    httpd_register_route(server, &(httpd_route_t){
+        .method = HTTP_GET,
+        .pattern = "/largefile-buffered/*",
+        .handler = handle_largefile_buffered
+    });
+
     // Large file download test routes
     httpd_register_route(server, &(httpd_route_t){
         .method = HTTP_GET,
         .pattern = "/largefile/*",
-        .handler = handle_largefile
+        .handler = handle_largefile_provider_chunked
     });
 
     httpd_register_route(server, &(httpd_route_t){

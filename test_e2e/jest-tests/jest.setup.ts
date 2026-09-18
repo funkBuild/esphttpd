@@ -38,7 +38,7 @@ axios.interceptors.response.use(
 export async function waitForServer(maxRetries = 10, delay = 1000): Promise<void> {
   for (let i = 0; i < maxRetries; i++) {
     try {
-      await axios.get('/');
+      await axios.get('/', { timeout: 2000 });
       console.log('✓ Server is responding');
       return;
     } catch (error) {

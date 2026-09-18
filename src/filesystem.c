@@ -314,6 +314,7 @@ int filesystem_serve_file(filesystem_t* fs,
         path_len > 0 && path[path_len - 1] == '/') {
         static const char index_suffix[] = "index.html";
         if (path_len + sizeof(index_suffix) > sizeof(index_path)) return -1;
+        // NOLINTNEXTLINE(bugprone-not-null-terminated-result) -- the next memcpy's sizeof(index_suffix) INCLUDES the NUL, so index_path is terminated 
         memcpy(index_path, path, path_len);
         memcpy(index_path + path_len, index_suffix, sizeof(index_suffix));
         if (!filesystem_get_metadata(fs, index_path, &metadata)) {

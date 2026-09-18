@@ -9,7 +9,7 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR"
 
 # Configuration
-PORT=8088
+PORT="${E2E_HTTP_PORT:-8088}"
 SERVER_URL="http://127.0.0.1:${PORT}"
 MAX_WAIT_SECONDS=60
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -52,39 +52,23 @@ cleanup() {
         wait "$QEMU_PID" 2>/dev/null || true
     fi
 
-    # Kill any remaining QEMU processes
-    pkill -9 qemu-system-xtensa 2>/dev/null || true
-
     # Wait for port to be released
     sleep 1
 
     log_ok "Cleanup complete"
 }
 
-kill_existing_qemu() {
-    log_info "Checking for existing QEMU processes..."
-
-    # Kill any QEMU processes
-    if pgrep -x qemu-system-xtensa > /dev/null 2>&1; then
-        log_warn "Found existing QEMU processes, killing them..."
-        pkill -9 qemu-system-xtensa 2>/dev/null || true
-        sleep 2
-    fi
-
-    # Check if port is in use
-    if lsof -i :${PORT} -sTCP:LISTEN -t >/dev/null 2>&1; then
-        log_warn "Port ${PORT} is in use, killing process..."
-        kill -9 $(lsof -i :${PORT} -sTCP:LISTEN -t) 2>/dev/null || true
-        sleep 2
-    fi
-
-    # Verify port is free
-    if lsof -i :${PORT} -sTCP:LISTEN -t >/dev/null 2>&1; then
-        log_error "Failed to free port ${PORT}"
+check_server_port() {
+    # Probe without depending on lsof; never terminate another suite's server.
+    if ! python3 - "$PORT" <<'PYPORT'
+import socket, sys
+with socket.socket() as sock:
+    sock.bind(('127.0.0.1', int(sys.argv[1])))
+PYPORT
+    then
+        log_error "Port ${PORT} is already in use; set E2E_HTTP_PORT to a free port"
         exit 1
     fi
-
-    log_ok "No conflicting processes"
 }
 
 wait_for_server() {
@@ -139,10 +123,10 @@ echo "  Jest:  ${JEST_LOG}"
 echo ""
 
 #------------------------------------------------------------------------------
-# Step 1: Kill existing processes
+# Step 1: Check the server port
 #------------------------------------------------------------------------------
 log_step "Step 1: Ensuring clean environment"
-kill_existing_qemu
+check_server_port
 
 #------------------------------------------------------------------------------
 # Step 2: Build the project
@@ -214,7 +198,7 @@ fi
 log_step "Step 5: Verifying connectivity"
 
 RESPONSE=$(curl -s "${SERVER_URL}/")
-if echo "$RESPONSE" | grep -q "ESP32"; then
+if echo "$RESPONSE" | grep -q "ESP32 E2E Test Server"; then
     log_ok "Server responding correctly"
     log_info "Response preview: $(echo "$RESPONSE" | head -c 100)..."
 else

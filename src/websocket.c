@@ -559,7 +559,10 @@ int ws_send_frame(connection_t* conn, ws_opcode_internal_t opcode, const uint8_t
     // Normalize: NULL payload means zero-length payload
     if (!payload) payload_len = 0;
 
-    uint8_t header[14]; // Max header size
+    // Zeroed: ws_build_frame_header writes only the bytes it counts into its
+    // return value, which varies by branch (2, 4, +4 when masked). Starting from
+    // a defined buffer means the copy below is defined for any header_len.
+    uint8_t header[14] = {0}; // Max header size
     size_t header_len = ws_build_frame_header(header, opcode, payload_len, mask);
 
     if (header_len == 0) {
@@ -613,7 +616,10 @@ int ws_send_frame(connection_t* conn, ws_opcode_internal_t opcode, const uint8_t
 }
 
 int ws_send_close(connection_t* conn, uint16_t code, const char* reason) {
-    uint8_t payload[125];
+    // Zeroed: only the first payload_len bytes are ever sent, but this buffer
+    // goes out on the wire -- starting from zeros means a miscounted length can
+    // never put leftover stack contents in a close frame.
+    uint8_t payload[125] = {0};
     size_t payload_len = 0;
 
     if (code != 0) {
@@ -628,6 +634,7 @@ int ws_send_close(connection_t* conn, uint16_t code, const char* reason) {
             if (reason_len > 123) {
                 reason_len = 123;
             }
+            // NOLINTNEXTLINE(bugprone-not-null-terminated-result) -- RFC 6455 close frame, sent by payload_len 
             memcpy(payload + 2, reason, reason_len);
             payload_len += reason_len;
         }

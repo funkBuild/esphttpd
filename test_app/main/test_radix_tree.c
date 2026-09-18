@@ -31,9 +31,22 @@ static httpd_err_t test_handler_3(httpd_req_t* req) {
     return HTTPD_OK;
 }
 
-static void reset_handler_state(void) {
-    handler_call_count = 0;
-    handler_user_ctx = NULL;
+
+
+static httpd_err_t test_ws_handler(httpd_ws_t* ws, httpd_ws_event_t* event) {
+    (void)ws;
+    (void)event;
+    return HTTPD_OK;
+}
+
+static httpd_err_t test_middleware_1(httpd_req_t* req, httpd_handler_t next) {
+    (void)next;
+    return test_handler_1(req);
+}
+
+static httpd_err_t test_middleware_2(httpd_req_t* req, httpd_handler_t next) {
+    (void)next;
+    return test_handler_2(req);
 }
 
 // ============================================================================
@@ -251,7 +264,7 @@ static void test_radix_websocket_route(void) {
     TEST_ASSERT_NOT_NULL(tree);
 
     // Insert WebSocket route
-    httpd_err_t err = radix_insert_ws(tree, "/ws", (httpd_ws_handler_t)test_handler_1,
+    httpd_err_t err = radix_insert_ws(tree, "/ws", test_ws_handler,
                                       (void*)0x5678, 30000, NULL, 0);
     TEST_ASSERT_EQUAL(HTTPD_OK, err);
 
@@ -260,7 +273,7 @@ static void test_radix_websocket_route(void) {
     radix_lookup(tree, "/ws", HTTP_GET, true, &ws_match, NULL, NULL);
     TEST_ASSERT_TRUE(ws_match.matched);
     TEST_ASSERT_TRUE(ws_match.is_websocket);
-    TEST_ASSERT_EQUAL_PTR(test_handler_1, ws_match.ws_handler);
+    TEST_ASSERT_EQUAL_PTR(test_ws_handler, ws_match.ws_handler);
     TEST_ASSERT_EQUAL_PTR((void*)0x5678, ws_match.ws_user_ctx);
 
 
@@ -534,7 +547,7 @@ static void test_router_websocket(void) {
 
     // Register WebSocket route
     TEST_ASSERT_EQUAL(HTTPD_OK, httpd_router_websocket(router, "/ws",
-                                                        (httpd_ws_handler_t)test_handler_1));
+                                                        test_ws_handler));
 
     // Test lookup
     radix_match_t m;
@@ -553,8 +566,8 @@ static void test_router_middleware(void) {
     TEST_ASSERT_NOT_NULL(router);
 
     // Add middleware
-    httpd_middleware_t mw1 = (httpd_middleware_t)test_handler_1;
-    httpd_middleware_t mw2 = (httpd_middleware_t)test_handler_2;
+    httpd_middleware_t mw1 = test_middleware_1;
+    httpd_middleware_t mw2 = test_middleware_2;
 
     TEST_ASSERT_EQUAL(HTTPD_OK, httpd_router_use(router, mw1));
     TEST_ASSERT_EQUAL(HTTPD_OK, httpd_router_use(router, mw2));
@@ -593,10 +606,7 @@ static httpd_err_t chain_handler_c(httpd_req_t* req) {
     return HTTPD_OK;
 }
 
-static void reset_chain_state(void) {
-    chain_handler_index = 0;
-    memset(chain_handler_order, 0, sizeof(chain_handler_order));
-}
+
 
 static void test_handler_chain_single(void) {
     ESP_LOGI(TAG, "Test: Single handler chain (backwards compat)");

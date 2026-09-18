@@ -529,6 +529,7 @@ int template_var_env(const char* var_name, uint8_t* output,
         len = output_size;
     }
 
+    // NOLINTNEXTLINE(bugprone-not-null-terminated-result) -- handler contract returns the byte count; output is uint8_t*, not a string
     memcpy(output, value, len);
     return len;
 }

@@ -1157,7 +1157,7 @@ const char* httpd_get_mime_type(const char* path) {
     // Single-pass: lowercase and compute length simultaneously (max 5 chars)
     char lower[6];
     size_t ext_len = 0;
-    while (ext[ext_len] && ext_len < 6) {
+    while (ext_len < 6 && ext[ext_len]) {  /* bound first, then index */
         lower[ext_len] = ext[ext_len] | 0x20;
         ext_len++;
     }
@@ -2301,9 +2301,11 @@ httpd_err_t httpd_resp_set_header(httpd_req_t* req, const char* key, const char*
             return HTTPD_ERR_NO_MEM;
         }
         uint8_t* p = req->_resp_hdr_buf + req->_resp_hdr_len;
+        // NOLINTNEXTLINE(bugprone-not-null-terminated-result) -- header bytes, sent by _resp_hdr_len 
         memcpy(p, key, key_len);
         p[key_len] = ':';
         p[key_len + 1] = ' ';
+        // NOLINTNEXTLINE(bugprone-not-null-terminated-result) -- header bytes, sent by _resp_hdr_len 
         memcpy(p + key_len + 2, value, val_len);
         p[key_len + 2 + val_len] = '\r';
         p[key_len + 2 + val_len + 1] = '\n';
@@ -2510,7 +2512,9 @@ httpd_err_t httpd_resp_send_chunk(httpd_req_t* req, const char* chunk, ssize_t l
                 if (avail >= frame_size) {
                     // Build frame directly in buffer
                     memcpy(write_ptr, size_header, header_len);
+                    // NOLINTNEXTLINE(bugprone-not-null-terminated-result) -- chunked-transfer frame, committed by frame_size 
                     memcpy(write_ptr + header_len, chunk, chunk_len);
+                    // NOLINTNEXTLINE(bugprone-not-null-terminated-result) -- chunked-transfer frame, committed by frame_size 
                     memcpy(write_ptr + header_len + chunk_len, "\r\n", 2);
                     send_buffer_commit(sb, frame_size);
 
@@ -3535,6 +3539,7 @@ httpd_err_t httpd_ws_close(httpd_ws_t* ws, uint16_t code, const char* reason) {
         if (reason_len > 123) {
             reason_len = 123;
         }
+        // NOLINTNEXTLINE(bugprone-not-null-terminated-result) -- RFC 6455 close frame, sent by close_len 
         memcpy(&close_data[2], reason, reason_len);
         close_len += reason_len;
     }
