@@ -5,6 +5,7 @@
 #include "http_parser.h"
 #include "websocket.h"
 #include "radix_tree.h"
+#include "send_buffer.h"
 #include "esp_log.h"
 #include <stdlib.h>
 #include <string.h>
@@ -106,6 +107,141 @@ static void test_keepalive_rearm_after_post(void) {
 
     TEST_ASSERT_EQUAL(2, ka_handler_calls);
     TEST_ASSERT_EQUAL(CONN_STATE_NEW, conn.state);
+
+    stop_test_server();
+}
+
+// RFC 9112 section 6: Content-Length frames a body whatever the method. A GET
+// whose body arrives in a LATER segment used to be left in header state, so
+// the body was parsed as a second request (smuggling). The body must be
+// drained instead, and the connection re-armed afterwards.
+static void test_get_body_in_later_segment_is_drained(void) {
+    start_test_server();
+    ka_handler_calls = 0;
+
+    httpd_route_t get_route = {
+        .method = HTTP_GET, .pattern = "/ka", .handler = ka_handler };
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_route(test_handle, &get_route));
+
+    connection_t conn = {0};
+    conn.fd = -1;
+    conn.pool_index = 0;
+    conn.state = CONN_STATE_NEW;
+
+    static const char smuggled[] = "GET /ka HTTP/1.1\r\n\r\n";
+    char req1[128];
+    int n = snprintf(req1, sizeof(req1),
+                     "GET /ka HTTP/1.1\r\nConnection: keep-alive\r\n"
+                     "Content-Length: %u\r\n\r\n", (unsigned)(sizeof(smuggled) - 1));
+    TEST_ASSERT_TRUE(n > 0 && n < (int)sizeof(req1));
+    g_server->handlers.on_http_request(&conn, (uint8_t*)req1, (size_t)n);
+    TEST_ASSERT_EQUAL(1, ka_handler_calls);
+    TEST_ASSERT_EQUAL(CONN_STATE_HTTP_BODY, conn.state);
+
+    // Body segment: routed as body (as the event loop does), never dispatched
+    g_server->handlers.on_http_body(&conn, (uint8_t*)smuggled, sizeof(smuggled) - 1);
+    TEST_ASSERT_EQUAL(1, ka_handler_calls);
+    TEST_ASSERT_EQUAL(CONN_STATE_NEW, conn.state);
+    TEST_ASSERT_EQUAL(0, conn.content_length);
+
+    // The next real request on the connection dispatches normally
+    char req2[] = "GET /ka HTTP/1.1\r\nConnection: keep-alive\r\n\r\n";
+    g_server->handlers.on_http_request(&conn, (uint8_t*)req2, sizeof(req2) - 1);
+    TEST_ASSERT_EQUAL(2, ka_handler_calls);
+
+    stop_test_server();
+}
+
+// Handler that leaves a file stream running, as httpd_resp_sendfile does
+// (mock fd: only the send-buffer bookkeeping is exercised, no FS is mounted)
+static int stream_handler_calls = 0;
+static int after_stream_calls = 0;
+static httpd_err_t stream_handler(httpd_req_t* req) {
+    stream_handler_calls++;
+    connection_t* conn = (connection_t*)req->_internal;
+    send_buffer_t** bufs = (send_buffer_t**)g_test_send_buffers;
+    send_buffer_t* sb = bufs[conn->pool_index];
+    if (!sb->allocated) TEST_ASSERT_TRUE(send_buffer_alloc(sb));
+    TEST_ASSERT_TRUE(send_buffer_start_file(sb, 123 /* mock fd */, 64));
+    return HTTPD_OK;
+}
+static httpd_err_t after_stream_handler(httpd_req_t* req) {
+    (void)req;
+    after_stream_calls++;
+    return HTTPD_OK;
+}
+
+// RFC 9112 9.3.2: responses to pipelined requests go out in request order. A
+// pipelined request used to be dispatched while the previous response's file
+// stream was still running, so its response went out ahead of the file body
+// (and a second sendfile closed the first stream mid-body). It must now wait
+// until the stream has drained.
+static void test_pipelined_request_waits_for_file_stream(void) {
+    start_test_server();
+    stream_handler_calls = 0;
+    after_stream_calls = 0;
+
+    httpd_route_t r1 = { .method = HTTP_GET, .pattern = "/file", .handler = stream_handler };
+    httpd_route_t r2 = { .method = HTTP_GET, .pattern = "/next", .handler = after_stream_handler };
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_route(test_handle, &r1));
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_route(test_handle, &r2));
+
+    connection_t conn = {0};
+    conn.fd = -1;
+    conn.pool_index = 0;
+    conn.state = CONN_STATE_NEW;
+
+    char reqs[] = "GET /file HTTP/1.1\r\nConnection: keep-alive\r\n\r\n"
+                  "GET /next HTTP/1.1\r\nConnection: keep-alive\r\n\r\n";
+    g_server->handlers.on_http_request(&conn, (uint8_t*)reqs, sizeof(reqs) - 1);
+    TEST_ASSERT_EQUAL(1, stream_handler_calls);
+    TEST_ASSERT_EQUAL(0, after_stream_calls);  // queued behind the stream
+
+    // Bytes arriving while the stream runs are buffered, not dispatched
+    char req3[] = "GET /next HTTP/1.1\r\nConnection: keep-alive\r\n\r\n";
+    g_server->handlers.on_http_request(&conn, (uint8_t*)req3, sizeof(req3) - 1);
+    TEST_ASSERT_EQUAL(0, after_stream_calls);
+
+    // Stream completes and drains: the write-ready path re-arms and runs the
+    // pipelined requests in order
+    send_buffer_t** bufs = (send_buffer_t**)g_test_send_buffers;
+    send_buffer_t* sb = bufs[0];
+    sb->file_fd = -1;  // mock fd: no real close()
+    send_buffer_stop_file(sb);
+    TEST_ASSERT_FALSE(send_buffer_has_data(sb));
+    g_server->handlers.on_write_ready(&conn);
+    TEST_ASSERT_EQUAL(2, after_stream_calls);
+    TEST_ASSERT_EQUAL(CONN_STATE_NEW, conn.state);
+
+    stop_test_server();
+}
+
+// The event loop's header deadline is armed while a request's headers are
+// incomplete and disarmed once they complete.
+static void test_header_pending_tracks_partial_headers(void) {
+    start_test_server();
+    ka_handler_calls = 0;
+    httpd_route_t route = { .method = HTTP_GET, .pattern = "/ka", .handler = ka_handler };
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_route(test_handle, &route));
+
+    connection_t conn = {0};
+    conn.fd = -1;
+    conn.pool_index = 0;
+    conn.state = CONN_STATE_NEW;
+
+    g_server->event_loop.tick_count = 42;
+    char part1[] = "GET /ka HTTP/1.1\r\nHo";
+    g_server->handlers.on_http_request(&conn, (uint8_t*)part1, sizeof(part1) - 1);
+    TEST_ASSERT_EQUAL(0, ka_handler_calls);
+    TEST_ASSERT_EQUAL(1, conn.header_pending);
+    TEST_ASSERT_EQUAL(42, conn.request_start);
+
+    g_server->event_loop.tick_count = 45;
+    char part2[] = "st: x\r\nConnection: keep-alive\r\n\r\n";
+    g_server->handlers.on_http_request(&conn, (uint8_t*)part2, sizeof(part2) - 1);
+    TEST_ASSERT_EQUAL(1, ka_handler_calls);
+    TEST_ASSERT_EQUAL(0, conn.header_pending);
+    TEST_ASSERT_EQUAL(42, conn.request_start);  // stamped at the first byte
 
     stop_test_server();
 }
@@ -1000,6 +1136,9 @@ void test_integration_run(void) {
     RUN_TEST(test_full_http_get_request);
     RUN_TEST(test_full_http_post_request);
     RUN_TEST(test_keepalive_rearm_after_post);
+    RUN_TEST(test_get_body_in_later_segment_is_drained);
+    RUN_TEST(test_pipelined_request_waits_for_file_stream);
+    RUN_TEST(test_header_pending_tracks_partial_headers);
     RUN_TEST(test_user_ctx_without_middleware);
     RUN_TEST(test_user_ctx_without_middleware_router);
     RUN_TEST(test_pipelined_requests_dispatch_iteratively);

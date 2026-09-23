@@ -4094,6 +4094,21 @@ static void finish_sync_request(connection_t* conn, request_context_t* ctx) {
         conn->state == CONN_STATE_CLOSED) {
         return;
     }
+    // Same for a file stream (httpd_resp_sendfile): send_nonblocking's
+    // ordering checks cannot queue behind an fd-backed stream, so draining a
+    // pipelined request now sent response N+1 ahead of the file body, and a
+    // second sendfile closed the first stream mid-body (RFC 9112 9.3.2).
+    // on_write_ready_impl calls back here once the response has drained.
+    send_buffer_t* stream_sb = get_send_buffer(conn);
+    if (ctx->rearm_after_stream ||
+        (stream_sb && send_buffer_is_streaming(stream_sb))) {
+        ctx->rearm_after_stream = true;
+        if (!stream_sb || send_buffer_is_streaming(stream_sb) ||
+            send_buffer_is_mem_streaming(stream_sb) || send_buffer_has_data(stream_sb)) {
+            return;
+        }
+        ctx->rearm_after_stream = false;
+    }
     if (ctx->req.content_length > 0 &&
         request_body_wire_received(ctx) < ctx->req.content_length) {
         return;  // body still in flight; on_http_body drains it and re-arms
@@ -4162,7 +4177,7 @@ static void on_http_request_impl(connection_t* conn, uint8_t* buffer, size_t len
     // init_request_context below would memset the live async state without
     // firing its completion callback (context leak + interleaved responses).
     if (!ctx->parsing_in_progress &&
-        (ctx->data_provider.active || ctx->async_send.active)) {
+        (ctx->data_provider.active || ctx->async_send.active || ctx->rearm_after_stream)) {
         if (!append_pipeline_bytes(ctx, buffer, len)) {
             ESP_LOGW(TAG, "Failed to buffer %zu pipelined bytes (conn %" PRIu8 ")",
                      len, conn->pool_index);
@@ -5484,6 +5499,14 @@ static void on_write_ready_impl(connection_t* conn) {
 
             // Same as the async-send completion above: re-arm (or close for
             // Connection: close) now that the provider response has drained.
+            finish_sync_request(conn, ctx);
+        }
+
+        // A file-streamed response has fully drained: re-arm now (see
+        // finish_sync_request), draining any pipelined request bytes that
+        // were buffered meanwhile.
+        if (ctx && ctx->rearm_after_stream && !send_buffer_is_streaming(sb) &&
+            !send_buffer_is_mem_streaming(sb)) {
             finish_sync_request(conn, ctx);
         }
     }
