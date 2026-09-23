@@ -638,11 +638,18 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                 conn->state = CONN_STATE_HTTP_HEADERS;
                 conn->header_bytes = i + 1;
 
-                // Check if we expect a body
-                if ((conn->method == HTTP_POST ||
-                     conn->method == HTTP_PUT ||
-                     conn->method == HTTP_PATCH) &&
-                    conn->content_length > 0) {
+                // Check if we expect a body. RFC 9112 section 6: framing is
+                // independent of method semantics, so a Content-Length on
+                // GET/DELETE/HEAD/OPTIONS also announces a body. Gating on
+                // POST/PUT/PATCH left such a body on the wire; when it arrived
+                // in a later segment it was parsed as a new request (request
+                // smuggling). Handlers that ignore the body get it drained by
+                // on_http_body before the connection re-arms.
+                if (conn->content_length > 0) {
+                    // A WebSocket handshake carries no body (RFC 6455 4.1).
+                    // One that claims a body is served as a plain request
+                    // rather than upgraded with body bytes queued behind it.
+                    conn->upgrade_ws = 0;
                     conn->state = CONN_STATE_HTTP_BODY;
                     conn->bytes_received = 0;
                     ctx->state = PARSE_STATE_BODY;
