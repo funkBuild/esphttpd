@@ -76,10 +76,47 @@ static void test_LIBS_1_zero_len_ping_split(void) {
     free(ctx.payload_buffer);
 }
 
+// LIBS-1 (other header shapes): the mask split mid-way (3+1 bytes), the
+// 16-bit extended-length form carrying length 0, and an empty CLOSE must all
+// finish in the call that delivers the last header byte, consuming it.
+static void test_LIBS_1_zero_len_other_splits(void) {
+    connection_t conn; ws_frame_context_t ctx = {0};
+    size_t used = 0;
+    ws_frame_result_t r;
+
+    setup(&conn, &ctx);
+    uint8_t a1[] = { 0x82, 0x80, 1, 2, 3 };
+    r = ws_process_frame(&conn, a1, sizeof a1, &ctx, &used);
+    CHECK(r == WS_FRAME_NEED_MORE && used == 5, "mask 3/1 part 1: r=%d used=%zu", r, used);
+    uint8_t a2[] = { 4, 0x81 };  // last mask byte + start of the next frame
+    r = ws_process_frame(&conn, a2, sizeof a2, &ctx, &used);
+    CHECK(r == WS_FRAME_COMPLETE && used == 1 && ctx.payload_received == 0,
+          "mask 3/1 part 2: r=%d used=%zu (expected COMPLETE/1)", r, used);
+
+    setup(&conn, &ctx);
+    uint8_t b1[] = { 0x81, 0xFE, 0x00, 0x00 };
+    r = ws_process_frame(&conn, b1, sizeof b1, &ctx, &used);
+    CHECK(r == WS_FRAME_NEED_MORE && used == 4, "ext16 len 0 part 1: r=%d used=%zu", r, used);
+    uint8_t b2[] = { 9, 9, 9, 9 };
+    r = ws_process_frame(&conn, b2, sizeof b2, &ctx, &used);
+    CHECK(r == WS_FRAME_COMPLETE && used == 4, "ext16 len 0 part 2: r=%d used=%zu", r, used);
+
+    setup(&conn, &ctx);
+    sent_bytes = 0;
+    uint8_t c1[] = { 0x88, 0x80 };
+    r = ws_process_frame(&conn, c1, sizeof c1, &ctx, &used);
+    uint8_t c2[] = { 5, 6, 7, 8 };
+    r = ws_process_frame(&conn, c2, sizeof c2, &ctx, &used);
+    CHECK(r == WS_FRAME_CLOSE && used == 4 && sent_bytes > 0,
+          "empty CLOSE split: r=%d used=%zu close bytes sent=%zd (expected CLOSE/4 + echo)", r, used, sent_bytes);
+    free(ctx.payload_buffer);
+}
+
 int main(void) {
     ws_set_send_func(fake_send);
     test_LIBS_1_zero_len_frame_header_at_slice_end();
     test_LIBS_1_zero_len_ping_split();
+    test_LIBS_1_zero_len_other_splits();
     printf("%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);
     return failures ? 1 : 0;
 }

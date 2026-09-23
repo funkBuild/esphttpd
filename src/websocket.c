@@ -357,6 +357,13 @@ ws_frame_result_t ws_process_frame(connection_t* conn,
                     conn->ws_payload_read = 0;
                     ctx->state = WS_STATE_PAYLOAD;
                     i += remaining_mask;
+                    // A zero-length frame is complete once its header is.
+                    // Finish it now: if the mask ended the slice, the loop
+                    // would exit with NEED_MORE and the frame would only
+                    // complete on the next call with 0 bytes consumed.
+                    if (conn->ws_payload_len == 0) {
+                        goto fast_payload;
+                    }
                 } else {
                     // Partial mask - read what we can
                     memcpy(((uint8_t*)&conn->ws_mask_key) + ctx->mask_bytes_read,

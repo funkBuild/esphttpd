@@ -4896,8 +4896,10 @@ static void on_ws_frame(connection_t* conn, uint8_t* buffer, size_t len) {
             return;
         }
 
-        if (bytes_consumed == 0) {
-            // No progress - need more data
+        if (bytes_consumed == 0 && result == WS_FRAME_NEED_MORE) {
+            // No progress - need more data. Only NEED_MORE means that: a
+            // COMPLETE or CLOSE result is acted on below even if this call
+            // consumed nothing, so a finished frame is never discarded.
             break;
         }
 
