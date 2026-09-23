@@ -1693,7 +1693,7 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
     // still fire so app state is released; handlers must tolerate failed
     // sends during shutdown.)
     {
-        uint32_t ws_mask = server->connection_pool.ws_active_mask;
+        uint32_t ws_mask = connection_mask_load(&server->connection_pool.ws_active_mask);
         while (ws_mask) {
             int i = __builtin_ctz(ws_mask);
             ws_mask &= ws_mask - 1;
@@ -3505,7 +3505,7 @@ int httpd_ws_broadcast(httpd_handle_t handle, const char* pattern,
 #endif
 
     // O(k) iteration where k = number of active WebSocket connections
-    uint32_t mask = server->connection_pool.ws_active_mask;
+    uint32_t mask = connection_mask_load(&server->connection_pool.ws_active_mask);
     while (mask) {
         int i = __builtin_ctz(mask);  // Get index of lowest set bit
         mask &= mask - 1;  // Clear lowest set bit
@@ -3590,7 +3590,7 @@ unsigned int httpd_ws_get_connection_count(httpd_handle_t handle) {
     if (!server) return 0;
 
     // O(1) using popcount on ws_active_mask
-    return __builtin_popcount(server->connection_pool.ws_active_mask);
+    return connection_ws_active_count(&server->connection_pool);
 }
 
 void* httpd_ws_get_user_data(httpd_ws_t* ws) {
@@ -3775,7 +3775,7 @@ int httpd_ws_publish(httpd_handle_t handle, const char* channel,
 #endif
 
     // O(k) iteration where k = number of active WebSocket connections
-    uint32_t ws_mask = server->connection_pool.ws_active_mask;
+    uint32_t ws_mask = connection_mask_load(&server->connection_pool.ws_active_mask);
     while (ws_mask) {
         int i = __builtin_ctz(ws_mask);  // Get index of lowest set bit
         ws_mask &= ws_mask - 1;  // Clear lowest set bit

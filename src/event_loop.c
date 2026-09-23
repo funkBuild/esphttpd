@@ -182,7 +182,8 @@ static void handle_new_connection(event_loop_t* loop, const event_handlers_t* ha
     }
 
     // Find free connection slot using O(1) bit manipulation
-    uint32_t free_mask = ~loop->pool->active_mask;
+    uint32_t free_mask = ~connection_mask_load(&loop->pool->active_mask);
+    free_mask &= (MAX_CONNECTIONS < 32) ? ((1U << (MAX_CONNECTIONS & 31)) - 1U) : 0xFFFFFFFFU;
     if (free_mask == 0) {
         ESP_LOGW(TAG, "No free connection slots, rejecting connection");
         close(client_fd);
@@ -332,7 +333,7 @@ int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, u
     int activity;
     const size_t buffer_size = loop->config.io_buffer_size;  // Cache config value
     connection_t* const base = loop->pool->connections;  // Cache base pointer for efficient indexing
-    bool has_write_pending = (loop->pool->write_pending_mask != 0);
+    bool has_write_pending = (connection_mask_load(&loop->pool->write_pending_mask) != 0);
 
     // Initialize fd_sets
     FD_ZERO(&read_fds);
@@ -435,7 +436,7 @@ int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, u
 
     // Handle writable connections first (drain pending data before reading more)
     if (has_write_pending && handlers->on_write_ready) {
-        mask = loop->pool->write_pending_mask;
+        mask = connection_mask_load(&loop->pool->write_pending_mask);
         while (mask) {
             int i = __builtin_ctz(mask);
             mask &= mask - 1;  // Clear lowest set bit

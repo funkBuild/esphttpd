@@ -145,47 +145,68 @@ void connection_cleanup_closed(connection_pool_t* pool);
 int connection_count_active(connection_pool_t* pool);
 
 // Utility functions
+//
+// write_pending_mask and ws_active_mask are written from BOTH the server task
+// and app tasks (httpd_ws_send/close via send_nonblocking), which can run on
+// different cores. A plain `|=`/`&=` is a load/modify/store on Xtensa, so two
+// concurrent updates could lose one another's bit (a stalled write-pending
+// flag, or a stale broadcast slot). Every mask update is therefore an atomic
+// RMW, and readers use atomic loads. Relaxed ordering suffices: the masks are
+// hints re-checked against per-connection state, not a publication barrier.
+// active_mask and generation[] are only written by the server task.
+static inline uint32_t connection_mask_load(const uint32_t* mask) {
+    return __atomic_load_n(mask, __ATOMIC_RELAXED);
+}
+
+static inline void connection_mask_set(uint32_t* mask, int index) {
+    __atomic_fetch_or(mask, 1U << index, __ATOMIC_RELAXED);
+}
+
+static inline void connection_mask_clear(uint32_t* mask, int index) {
+    __atomic_fetch_and(mask, ~(1U << index), __ATOMIC_RELAXED);
+}
+
 static inline bool connection_is_active(connection_pool_t* pool, int index) {
-    return (pool->active_mask & (1U << index)) != 0;
+    return (connection_mask_load(&pool->active_mask) & (1U << index)) != 0;
 }
 
 static inline void connection_mark_active(connection_pool_t* pool, int index) {
-    pool->active_mask |= (1U << index);
+    connection_mask_set(&pool->active_mask, index);
 }
 
 static inline void connection_mark_inactive(connection_pool_t* pool, int index) {
-    pool->active_mask &= ~(1U << index);
+    connection_mask_clear(&pool->active_mask, index);
     pool->generation[index]++;  // invalidate stale references to this slot
 }
 
 static inline bool connection_has_write_pending(connection_pool_t* pool, int index) {
-    return (pool->write_pending_mask & (1U << index)) != 0;
+    return (connection_mask_load(&pool->write_pending_mask) & (1U << index)) != 0;
 }
 
 static inline void connection_mark_write_pending(connection_pool_t* pool, int index, bool pending) {
     if (pending) {
-        pool->write_pending_mask |= (1U << index);
+        connection_mask_set(&pool->write_pending_mask, index);
     } else {
-        pool->write_pending_mask &= ~(1U << index);
+        connection_mask_clear(&pool->write_pending_mask, index);
     }
 }
 
 // WebSocket active tracking for O(k) broadcast iteration
 static inline bool connection_is_ws_active(connection_pool_t* pool, int index) {
-    return (pool->ws_active_mask & (1U << index)) != 0;
+    return (connection_mask_load(&pool->ws_active_mask) & (1U << index)) != 0;
 }
 
 static inline void connection_mark_ws_active(connection_pool_t* pool, int index) {
-    pool->ws_active_mask |= (1U << index);
+    connection_mask_set(&pool->ws_active_mask, index);
 }
 
 static inline void connection_mark_ws_inactive(connection_pool_t* pool, int index) {
-    pool->ws_active_mask &= ~(1U << index);
+    connection_mask_clear(&pool->ws_active_mask, index);
 }
 
 // Get count of active WebSocket connections using popcount
 static inline int connection_ws_active_count(connection_pool_t* pool) {
-    return __builtin_popcount(pool->ws_active_mask);
+    return __builtin_popcount(connection_mask_load(&pool->ws_active_mask));
 }
 
 #ifdef __cplusplus

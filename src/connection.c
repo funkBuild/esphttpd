@@ -54,10 +54,11 @@ void connection_cleanup_closed(connection_pool_t* pool)
 #endif
 
             // Clear bitmasks using pre-isolated bit
+            // (atomic RMW: app tasks update the write/ws masks concurrently)
             uint32_t clear_bit = ~bit;
-            pool->active_mask &= clear_bit;
-            pool->write_pending_mask &= clear_bit;
-            pool->ws_active_mask &= clear_bit;
+            __atomic_fetch_and(&pool->active_mask, clear_bit, __ATOMIC_RELAXED);
+            __atomic_fetch_and(&pool->write_pending_mask, clear_bit, __ATOMIC_RELAXED);
+            __atomic_fetch_and(&pool->ws_active_mask, clear_bit, __ATOMIC_RELAXED);
         }
     }
 }
