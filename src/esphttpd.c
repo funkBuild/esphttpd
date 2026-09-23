@@ -3112,6 +3112,10 @@ httpd_err_t httpd_req_defer(httpd_req_t* req, httpd_body_cb_t on_body, httpd_don
         size_t pre_data_len = ctx->body_buf_len - ctx->body_buf_pos;
         httpd_err_t err = on_body(req, &ctx->body_buf[ctx->body_buf_pos], pre_data_len);
         if (err != HTTPD_OK) {
+            // As in on_http_body: the rest of the body stays unread, so the
+            // error response must advertise the close.
+            conn->keep_alive = 0;
+            httpd_resp_set_header(req, "Connection", "close");
             on_done(req, err);
             ctx->defer.active = false;
             conn->deferred = 0;
@@ -4812,6 +4816,12 @@ static void on_http_body(connection_t* conn, uint8_t* buffer, size_t len) {
         if (err != HTTPD_OK) {
             // Error in callback - call done with error and close
             ESP_LOGW(TAG, "Deferred body callback returned error: %d", err);
+            // on_done usually sends the error response, and the connection
+            // then closes with request body still unread. Advertise the close
+            // so keep-alive clients do not reuse the socket and hit a reset
+            // (the storage-full upload path did exactly that).
+            conn->keep_alive = 0;
+            httpd_resp_set_header(&ctx->req, "Connection", "close");
             if (ctx->defer.on_done) {
                 ctx->defer.on_done(&ctx->req, err);
             }
