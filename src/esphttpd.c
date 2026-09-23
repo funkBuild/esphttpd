@@ -101,6 +101,17 @@ typedef struct {
     uint16_t value_len;
 } req_header_entry_t;
 
+// Security-relevant headers are indexed even after the MAX_REQ_HEADERS cap
+// is reached. The general index silently drops headers past the cap; for an
+// Origin/Host policy check that turns "the browser sent a cross-site Origin"
+// into "no Origin", i.e. a check that fails OPEN. These names are kept in a
+// small overflow index instead, so httpd_req_get_header() always finds them.
+static const char* const pinned_header_names[] = {
+    "Host", "Origin", "Referer", "Content-Type", "X-Forwarded-Host",
+};
+#define PINNED_HEADER_NAME_COUNT (sizeof(pinned_header_names) / sizeof(pinned_header_names[0]))
+#define MAX_PINNED_HEADERS 8
+
 // HTTP route entry (new API)
 typedef struct {
     const char* pattern;
@@ -316,11 +327,18 @@ typedef struct {
         httpd_req_continuation_t cont;    // Continuation state
         bool active;                      // Continuation mode active
     } continuation;
+    uint8_t pinned_header_count;          // Entries in pinned_headers (overflow index)
+    // A sync handler started a file stream (httpd_resp_sendfile): re-arming
+    // for the next request waits until the response has fully drained, so a
+    // pipelined request cannot answer ahead of (or truncate) the file body.
+    bool rearm_after_stream;
     char _zero_end[0];                    // Marker: memset stops here
 
     // === Scratch buffers that DON'T need zeroing per request ===
     // (only accessed up to their respective counts, or written before read)
     req_header_entry_t headers[MAX_REQ_HEADERS];  // Header index (accessed up to header_count)
+    req_header_entry_t pinned_headers[MAX_PINNED_HEADERS];  // Overflow index for
+                                          // pinned_header_names once headers[] is full
     uint8_t resp_hdr_buf[512];            // Staged response headers (accessed up to resp_hdr_len);
                                           // transmitted with the status line when the response starts
     uint8_t inline_recv_buf[512];         // Embedded buffer for single-packet requests
@@ -1400,9 +1418,26 @@ void esphttpd_store_header(connection_t* conn,
 // Trimming semantics are unchanged from the copying implementation: the
 // parser excludes leading OWS from the value pointer and includes trailing
 // OWS in value_len, and the old path copied exactly key_len/value_len bytes.
+static bool header_is_pinned(const uint8_t* key, uint16_t key_len) {
+    for (size_t i = 0; i < PINNED_HEADER_NAME_COUNT; i++) {
+        if (strlen(pinned_header_names[i]) == key_len &&
+            header_casecmp((const char*)key, pinned_header_names[i], key_len)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void store_header_in_req(request_context_t* ctx, const uint8_t* key, uint16_t key_len,
                                 const uint8_t* value, uint16_t value_len) {
-    if (ctx->req.header_count >= MAX_REQ_HEADERS) return;
+    req_header_entry_t* entry;
+    if (ctx->req.header_count < MAX_REQ_HEADERS) {
+        entry = &ctx->headers[ctx->req.header_count];
+    } else if (ctx->pinned_header_count < MAX_PINNED_HEADERS && header_is_pinned(key, key_len)) {
+        entry = &ctx->pinned_headers[ctx->pinned_header_count];
+    } else {
+        return;
+    }
     if (!ctx->recv_buf) return;  // Not parsing from the recv buffer (e.g. bare parser tests)
 
     const uint8_t* base = ctx->recv_buf;
@@ -1419,12 +1454,15 @@ static void store_header_in_req(request_context_t* ctx, const uint8_t* key, uint
         return;
     }
 
-    req_header_entry_t* entry = &ctx->headers[ctx->req.header_count];
     entry->key_offset = (uint16_t)key_off;
     entry->key_len = key_len;
     entry->value_offset = (uint16_t)value_off;
     entry->value_len = value_len;
-    ctx->req.header_count++;
+    if (entry == &ctx->pinned_headers[ctx->pinned_header_count]) {
+        ctx->pinned_header_count++;
+    } else {
+        ctx->req.header_count++;
+    }
 }
 
 // NUL-terminate the indexed headers in place inside recv_buf: the ':' that
@@ -1440,6 +1478,11 @@ static void terminate_headers_in_place(request_context_t* ctx) {
     if (!base) return;
     for (uint8_t i = 0; i < ctx->req.header_count; i++) {
         const req_header_entry_t* e = &ctx->headers[i];
+        base[(size_t)e->key_offset + e->key_len] = '\0';
+        base[(size_t)e->value_offset + e->value_len] = '\0';
+    }
+    for (uint8_t i = 0; i < ctx->pinned_header_count; i++) {
+        const req_header_entry_t* e = &ctx->pinned_headers[i];
         base[(size_t)e->key_offset + e->key_len] = '\0';
         base[(size_t)e->value_offset + e->value_len] = '\0';
     }
@@ -2130,6 +2173,16 @@ const char* httpd_req_get_header(httpd_req_t* req, const char* key) {
         // Filter by length and first char before expensive header_casecmp
         if (entry->key_len == key_len &&
             (base[entry->key_offset] | 0x20) == first_lower &&
+            header_casecmp(&base[entry->key_offset], key, key_len)) {
+            return &base[entry->value_offset];
+        }
+    }
+
+    // Overflow index: security-relevant headers that arrived after the
+    // general index filled up (see pinned_header_names)
+    for (int i = 0; i < ctx->pinned_header_count; i++) {
+        req_header_entry_t* entry = &ctx->pinned_headers[i];
+        if (entry->key_len == key_len &&
             header_casecmp(&base[entry->key_offset], key, key_len)) {
             return &base[entry->value_offset];
         }

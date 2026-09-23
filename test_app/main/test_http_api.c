@@ -1023,6 +1023,71 @@ static void test_req_get_header_index_full(void) {
     stop_test_server();
 }
 
+static char hdr_pin_origin[HDR_SNAP_LEN];
+static char hdr_pin_host[HDR_SNAP_LEN];
+static char hdr_pin_xfh[HDR_SNAP_LEN];
+static char hdr_pin_ct[HDR_SNAP_LEN];
+static char hdr_pin_h17[HDR_SNAP_LEN];
+
+static httpd_err_t hdr_pin_handler(httpd_req_t* req) {
+    hdr_handler_calls++;
+    hdr_snap(hdr_pin_origin, httpd_req_get_header(req, "origin"));
+    hdr_snap(hdr_pin_host, httpd_req_get_header(req, "Host"));
+    hdr_snap(hdr_pin_xfh, httpd_req_get_header(req, "X-Forwarded-Host"));
+    hdr_snap(hdr_pin_ct, httpd_req_get_header(req, "Content-Type"));
+    hdr_snap(hdr_pin_h17, httpd_req_get_header(req, "X-H17"));
+    return HTTPD_OK;
+}
+
+// Origin/Host policy checks must not fail open: a header that arrives after
+// the general index is full is dropped, so Origin/Host/Referer/Content-Type/
+// X-Forwarded-Host are kept in an overflow index and stay visible.
+static void test_req_get_header_pinned_after_index_full(void) {
+    start_test_server();
+
+    httpd_route_t route = { .method = HTTP_GET, .pattern = "/pin", .handler = hdr_pin_handler };
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_route(test_server, &route));
+
+    connection_t* conn = connection_get(&g_server->connection_pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    memset(conn, 0, sizeof(*conn));
+    conn->fd = -1;
+    conn->pool_index = 0;
+    conn->state = CONN_STATE_NEW;
+
+    // X-H01..X-H17 overflow the 16-entry index before any pinned header
+    char req_bytes[1024];
+    int n = snprintf(req_bytes, sizeof(req_bytes), "GET /pin HTTP/1.1\r\n");
+    for (int i = 1; i <= 17 && n < (int)sizeof(req_bytes); i++) {
+        n += snprintf(req_bytes + n, sizeof(req_bytes) - n, "X-H%02d: v%02d\r\n", i, i);
+    }
+    n += snprintf(req_bytes + n, sizeof(req_bytes) - n,
+                  "Host: device.local\r\n"
+                  "Origin: http://evil.example\r\n"
+                  "X-Forwarded-Host: proxy.example\r\n"
+                  "Content-Type: text/plain\r\n"
+                  "\r\n");
+    TEST_ASSERT_TRUE(n > 0 && n < (int)sizeof(req_bytes));
+
+    hdr_handler_calls = 0;
+    g_server->handlers.on_http_request(conn, (uint8_t*)req_bytes, (size_t)n);
+
+    TEST_ASSERT_EQUAL(1, hdr_handler_calls);
+    TEST_ASSERT_EQUAL_STRING("http://evil.example", hdr_pin_origin);
+    TEST_ASSERT_EQUAL_STRING("device.local", hdr_pin_host);
+    TEST_ASSERT_EQUAL_STRING("proxy.example", hdr_pin_xfh);
+    TEST_ASSERT_EQUAL_STRING("text/plain", hdr_pin_ct);
+    // Non-pinned headers past the cap are still dropped
+    TEST_ASSERT_EQUAL_STRING("(null)", hdr_pin_h17);
+
+    test_request_context_t** ctxs = (test_request_context_t**)g_test_request_contexts;
+    TEST_ASSERT_NOT_NULL(ctxs[0]);
+    TEST_ASSERT_EQUAL(MAX_REQ_HEADERS, ctxs[0]->req.header_count);
+    TEST_ASSERT_EQUAL(4, ctxs[0]->pinned_header_count);
+
+    stop_test_server();
+}
+
 static char hdr_mig_early[HDR_SNAP_LEN];
 static char hdr_mig_split[HDR_SNAP_LEN];
 static char hdr_mig_late[HDR_SNAP_LEN];
@@ -1123,6 +1188,7 @@ void test_http_api_run(void) {
     RUN_TEST(test_req_get_header_in_place_during_dispatch);
     RUN_TEST(test_req_get_header_keep_alive_isolation);
     RUN_TEST(test_req_get_header_index_full);
+    RUN_TEST(test_req_get_header_pinned_after_index_full);
     RUN_TEST(test_req_get_header_survives_recv_buf_migration);
 
     // Response status tests

@@ -181,10 +181,13 @@ typedef struct {
         httpd_req_continuation_t cont;    // Continuation state
         bool active;                      // Continuation mode active
     } continuation;
+    uint8_t pinned_header_count;          // Entries in pinned_headers (overflow index)
+    bool rearm_after_stream;              // Re-arm deferred until a file stream drains
     char _zero_end[0];                    // Marker: memset stops here
 
     // === Scratch buffers that DON'T need zeroing per request ===
     test_req_header_entry_t headers[MAX_REQ_HEADERS];  // Header index
+    test_req_header_entry_t pinned_headers[8];  // Overflow index (MAX_PINNED_HEADERS)
     uint8_t resp_hdr_buf[512];            // Staged response headers (must match esphttpd.c)
     uint8_t inline_recv_buf[512];         // Embedded buffer for single-packet requests
     char inline_uri_buf[64];             // Embedded buffer for typical URI lengths
