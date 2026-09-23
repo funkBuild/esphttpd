@@ -94,7 +94,9 @@ typedef struct {
     uint16_t header_bytes;       // Bytes of headers received
     uint16_t ws_payload_len;     // Current frame payload length
     uint16_t ws_payload_read;    // Payload bytes already processed
-    uint16_t route_id;           // Current route ID
+    uint16_t request_start;      // Low 16 bits of the tick at which the pending
+                                 // request's first byte arrived (header deadline;
+                                 // compared modulo 2^16)
     uint16_t url_offset;         // Offset in shared URL buffer
     uint16_t url_len;            // URL length
 
@@ -120,6 +122,7 @@ typedef struct {
     uint8_t defer_paused : 1;   // Deferred receiving paused (flow control) (1 bit)
     uint8_t continuation : 1;   // Body handling via continuation callbacks (1 bit)
     uint8_t pipeline_dispatch_active : 1; // Iterative pipeline drain in progress
+    uint8_t header_pending : 1; // Request headers partially received (header deadline armed)
 } connection_t;
 
 // Connection pool management

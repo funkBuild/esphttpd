@@ -557,6 +557,99 @@ static void test_paused_defer_not_reaped_by_timeout(void) {
     TEST_ASSERT_EQUAL(CONN_STATE_CLOSED, paused->state);
 }
 
+// Slowloris: the idle timeout is refreshed by every received byte, so a
+// request whose headers trickle in must be cut off by the header deadline
+// (default 10 s) counted from the request's first byte, not its last.
+static void test_header_deadline_closes_trickling_request(void) {
+    event_loop_t loop = {0};
+    connection_pool_t pool = {0};
+    event_loop_config_t config = {
+        .timeout_ms = 30000,
+        .select_timeout_ms = 1000,
+        .io_buffer_size = 1024,
+    };
+    event_loop_init(&loop, &pool, &config);
+    TEST_ASSERT_EQUAL(10, loop.header_timeout_ticks);
+
+    connection_t* slow = &pool.connections[0];
+    slow->fd = -1;  // no real socket: the best-effort 408 send fails harmlessly
+    slow->state = CONN_STATE_HTTP_HEADERS;
+    slow->header_pending = 1;
+    slow->request_start = 0;
+    connection_mark_active(&pool, 0);
+
+    connection_t* idle = &pool.connections[1];
+    idle->fd = -1;
+    idle->state = CONN_STATE_NEW;  // keep-alive, between requests
+    connection_mark_active(&pool, 1);
+
+    // Recent activity (a byte just arrived) but the deadline has passed
+    loop.tick_count = 11;
+    slow->last_activity = loop.tick_count;
+    idle->last_activity = 0;
+    event_loop_check_timeouts(&loop);
+
+    TEST_ASSERT_EQUAL(CONN_STATE_CLOSED, slow->state);
+    // An idle keep-alive connection keeps the normal 30 s idle timeout
+    TEST_ASSERT_EQUAL(CONN_STATE_NEW, idle->state);
+
+    // A request still inside its deadline is untouched
+    slow->state = CONN_STATE_HTTP_HEADERS;
+    slow->request_start = 5;
+    event_loop_check_timeouts(&loop);
+    TEST_ASSERT_EQUAL(CONN_STATE_HTTP_HEADERS, slow->state);
+}
+
+// Pool full: the longest-idle keep-alive connection is reclaimed for the new
+// client; connections with work in progress are never evicted.
+static void test_evict_oldest_idle_keepalive(void) {
+    event_loop_t loop = {0};
+    connection_pool_t pool = {0};
+    event_loop_config_t config = {
+        .timeout_ms = 30000,
+        .select_timeout_ms = 1000,
+        .io_buffer_size = 1024,
+    };
+    event_loop_init(&loop, &pool, &config);
+    loop.tick_count = 100;
+
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        connection_t* c = &pool.connections[i];
+        c->fd = -1;
+        c->pool_index = i;
+        c->state = CONN_STATE_HTTP_BODY;  // busy
+        c->last_activity = 0;             // very old, but busy
+        connection_mark_active(&pool, i);
+    }
+    // Nothing evictable: every connection has a request in progress
+    TEST_ASSERT_EQUAL(-1, event_loop_evict_idle(&loop, NULL));
+
+    // Candidates and non-candidates
+    pool.connections[2].state = CONN_STATE_NEW;     // idle, age 60
+    pool.connections[2].last_activity = 40;
+    pool.connections[5].state = CONN_STATE_NEW;     // idle, age 90 (oldest)
+    pool.connections[5].last_activity = 10;
+    pool.connections[7].state = CONN_STATE_NEW;     // partial headers: busy
+    pool.connections[7].header_pending = 1;
+    pool.connections[7].last_activity = 0;
+    pool.connections[9].state = CONN_STATE_NEW;     // response still draining
+    pool.connections[9].last_activity = 0;
+    connection_mark_write_pending(&pool, 9, true);
+    pool.connections[11].state = CONN_STATE_NEW;    // WebSocket-tracked
+    pool.connections[11].last_activity = 0;
+    connection_mark_ws_active(&pool, 11);
+
+    TEST_ASSERT_EQUAL(5, event_loop_evict_idle(&loop, NULL));
+    TEST_ASSERT_FALSE(connection_is_active(&pool, 5));
+    TEST_ASSERT_TRUE(connection_is_active(&pool, 2));
+    TEST_ASSERT_TRUE(connection_is_active(&pool, 7));
+    TEST_ASSERT_TRUE(connection_is_active(&pool, 9));
+    TEST_ASSERT_TRUE(connection_is_active(&pool, 11));
+
+    TEST_ASSERT_EQUAL(2, event_loop_evict_idle(&loop, NULL));
+    TEST_ASSERT_EQUAL(-1, event_loop_evict_idle(&loop, NULL));
+}
+
 // ==================== TEST RUNNER ====================
 
 void test_event_loop_run(void) {
@@ -586,6 +679,8 @@ void test_event_loop_run(void) {
     RUN_TEST(test_ws_close_timeout_zero_gets_default);
     RUN_TEST(test_ws_closing_uses_shorter_timeout);
     RUN_TEST(test_paused_defer_not_reaped_by_timeout);
+    RUN_TEST(test_header_deadline_closes_trickling_request);
+    RUN_TEST(test_evict_oldest_idle_keepalive);
 
     ESP_LOGI(TAG, "Event Loop tests completed");
 }

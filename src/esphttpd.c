@@ -4142,7 +4142,18 @@ static void finish_sync_request(connection_t* conn, request_context_t* ctx) {
     }
 }
 
+static void on_http_request_impl(connection_t* conn, uint8_t* buffer, size_t len);
+
+// Receive-side entry for request bytes. After each pass, publish whether a
+// request's headers are still incomplete, which arms the event loop's
+// header-completion deadline (request_start is stamped when parsing starts).
 static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
+    on_http_request_impl(conn, buffer, len);
+    request_context_t* ctx = get_request_context(conn);
+    conn->header_pending = (ctx && ctx->parsing_in_progress) ? 1 : 0;
+}
+
+static void on_http_request_impl(connection_t* conn, uint8_t* buffer, size_t len) {
     request_context_t* ctx = get_request_context(conn);
     if (!ctx) return;
 
@@ -4164,6 +4175,7 @@ static void on_http_request(connection_t* conn, uint8_t* buffer, size_t len) {
     if (!ctx->parsing_in_progress) {
         init_request_context(ctx, conn);
         ctx->parsing_in_progress = true;
+        if (g_server) conn->request_start = (uint16_t)g_server->event_loop.tick_count;
     }
 
     // Accumulate incoming data into the per-connection recv buffer.

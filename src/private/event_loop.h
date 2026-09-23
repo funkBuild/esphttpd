@@ -29,6 +29,7 @@ typedef struct {
     size_t io_buffer_size;          // I/O buffer size (typically 1024)
 #endif
     uint16_t ws_close_timeout_ms;       // WebSocket close handshake timeout (0 = default 5s)
+    uint16_t header_timeout_ms;         // Deadline to complete request headers (0 = default 10s)
     bool nodelay;                   // TCP_NODELAY option
     bool reuseaddr;                 // SO_REUSEADDR option
 } event_loop_config_t;
@@ -45,6 +46,7 @@ typedef struct {
     uint32_t tick_count;            // Tick counter for timeouts
     uint32_t timeout_ticks;         // Precomputed timeout in ticks
     uint32_t ws_close_timeout_ticks; // Precomputed WS close handshake timeout in ticks
+    uint32_t header_timeout_ticks;  // Precomputed request-header deadline in ticks
     int64_t last_tick_us;           // Wall-clock time of the last tick advance (µs)
 #ifndef CONFIG_HTTPD_USE_RAW_API
     struct timeval select_timeout;  // Precomputed select timeout struct
@@ -100,6 +102,10 @@ int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, u
 
 // Utility functions (socket mode only)
 void event_loop_check_timeouts(event_loop_t* loop);
+
+// Pool full: close the longest-idle keep-alive connection (nothing in
+// progress) and return its slot, or -1 when no connection is evictable
+int event_loop_evict_idle(event_loop_t* loop, const event_handlers_t* handlers);
 #endif
 
 // Stop the event loop (both modes)

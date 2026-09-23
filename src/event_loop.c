@@ -54,6 +54,7 @@ void event_loop_init(event_loop_t* loop, connection_pool_t* pool, const event_lo
     if (loop->config.timeout_ms == 0) loop->config.timeout_ms = 30000;
     if (loop->config.backlog == 0) loop->config.backlog = 5;
     if (loop->config.ws_close_timeout_ms == 0) loop->config.ws_close_timeout_ms = 5000;
+    if (loop->config.header_timeout_ms == 0) loop->config.header_timeout_ms = 10000;
 #ifdef CONFIG_HTTPD_USE_RAW_API
     loop->listen_pcb = NULL;
     // Compute timeout in poll intervals (each poll = CONFIG_HTTPD_RAW_POLL_INTERVAL * 500ms)
@@ -61,6 +62,8 @@ void event_loop_init(event_loop_t* loop, connection_pool_t* pool, const event_lo
     uint32_t divisor = poll_interval_ms > 0 ? poll_interval_ms : 1000;
     loop->timeout_ticks = loop->config.timeout_ms / divisor;
     loop->ws_close_timeout_ticks = loop->config.ws_close_timeout_ms / divisor;
+    loop->header_timeout_ticks = loop->config.header_timeout_ms / divisor;
+    if (loop->header_timeout_ticks == 0) loop->header_timeout_ticks = 1;
 #else
     loop->listen_fd = -1;
     if (loop->config.select_timeout_ms == 0) loop->config.select_timeout_ms = 1000;
@@ -71,6 +74,8 @@ void event_loop_init(event_loop_t* loop, connection_pool_t* pool, const event_lo
     if (loop->timeout_ticks == 0) loop->timeout_ticks = 1;
     loop->ws_close_timeout_ticks = loop->config.ws_close_timeout_ms / loop->config.select_timeout_ms;
     if (loop->ws_close_timeout_ticks == 0) loop->ws_close_timeout_ticks = 1;
+    loop->header_timeout_ticks = loop->config.header_timeout_ms / loop->config.select_timeout_ms;
+    if (loop->header_timeout_ticks == 0) loop->header_timeout_ticks = 1;
     // Precompute select timeout struct (avoid repeated struct construction)
     loop->select_timeout.tv_sec = loop->config.select_timeout_ms / 1000;
     loop->select_timeout.tv_usec = (loop->config.select_timeout_ms % 1000) * 1000;
@@ -185,17 +190,20 @@ static void handle_new_connection(event_loop_t* loop, const event_handlers_t* ha
     uint32_t free_mask = ~connection_mask_load(&loop->pool->active_mask);
     free_mask &= (MAX_CONNECTIONS < 32) ? ((1U << (MAX_CONNECTIONS & 31)) - 1U) : 0xFFFFFFFFU;
     if (free_mask == 0) {
-        ESP_LOGW(TAG, "No free connection slots, rejecting connection");
-        close(client_fd);
-        return;
+        // Pool full: reclaim the longest-idle keep-alive connection rather
+        // than refusing the newcomer. Otherwise a handful of clients that
+        // hold idle keep-alive sockets (or trickle a request every idle
+        // period) lock every other client out of the UI/API.
+        int victim = event_loop_evict_idle(loop, handlers);
+        if (victim < 0) {
+            ESP_LOGW(TAG, "No free connection slots, rejecting connection");
+            close(client_fd);
+            return;
+        }
+        free_mask = 1U << victim;
     }
 
     int slot = __builtin_ctz(free_mask);
-    if (slot >= MAX_CONNECTIONS) {
-        ESP_LOGW(TAG, "No free connection slots, rejecting connection");
-        close(client_fd);
-        return;
-    }
 
     // Initialize connection using memset (faster than 18+ individual assignments)
     connection_t* conn = &loop->pool->connections[slot];
@@ -283,6 +291,46 @@ static void handle_connection_data(event_loop_t* loop, connection_t* conn,
     }
 }
 
+// Pick the connection that has been idle longest between keep-alive requests
+// and close it to make room. Only a connection with nothing in progress is a
+// candidate: re-armed for its next request (CONN_STATE_NEW) with no partial
+// headers, no pending response bytes, and not a WebSocket or deferred upload.
+// Returns the freed slot, or -1 if nothing is evictable.
+int event_loop_evict_idle(event_loop_t* loop, const event_handlers_t* handlers) {
+    int victim = -1;
+    uint32_t oldest_age = 0;
+    uint32_t mask = connection_mask_load(&loop->pool->active_mask);
+    while (mask) {
+        int i = __builtin_ctz(mask);
+        mask &= mask - 1;
+        connection_t* conn = &loop->pool->connections[i];
+        if (conn->state != CONN_STATE_NEW || conn->header_pending ||
+            conn->deferred || conn->continuation ||
+            connection_has_write_pending(loop->pool, i) ||
+            connection_is_ws_active(loop->pool, i)) {
+            continue;
+        }
+        uint32_t age = loop->tick_count - conn->last_activity;
+        if (victim < 0 || age > oldest_age) {
+            victim = i;
+            oldest_age = age;
+        }
+    }
+    if (victim < 0) return -1;
+
+    connection_t* conn = &loop->pool->connections[victim];
+    ESP_LOGD(TAG, "Pool full: evicting idle keep-alive connection [%d]", victim);
+    conn->state = CONN_STATE_CLOSED;
+    if (handlers && handlers->on_disconnect) {
+        handlers->on_disconnect(conn);
+    }
+    close(conn->fd);
+    connection_mark_inactive(loop->pool, victim);
+    connection_mark_write_pending(loop->pool, victim, false);
+    connection_mark_ws_inactive(loop->pool, victim);
+    return victim;
+}
+
 void event_loop_check_timeouts(event_loop_t* loop) {
     // Use precomputed timeout_ticks (avoid division in hot path)
     uint32_t timeout_ticks = loop->timeout_ticks;
@@ -312,6 +360,29 @@ void event_loop_check_timeouts(event_loop_t* loop) {
         // dies while paused is only reaped after resume + a full idle timeout.
         if (conn->defer_paused) {
             conn->last_activity = loop->tick_count;
+            continue;
+        }
+
+        // Header-completion deadline (slowloris): the idle timeout alone is
+        // refreshed by every received byte, so a client trickling one header
+        // byte per idle period held its slot forever. A request whose headers
+        // are not complete within header_timeout_ticks of its first byte gets
+        // 408 (RFC 9110 15.5.9) and is closed.
+        if (conn->header_pending &&
+            (conn->state == CONN_STATE_NEW || conn->state == CONN_STATE_HTTP_HEADERS) &&
+            (uint16_t)((uint16_t)loop->tick_count - conn->request_start) >
+                loop->header_timeout_ticks) {
+            ESP_LOGD(TAG, "Connection [%d] request headers timed out", i);
+            // Best effort, and only when no earlier response bytes are still
+            // queued (the 408 must not overtake them)
+            if (!connection_has_write_pending(loop->pool, i)) {
+                static const char resp_408[] =
+                    "HTTP/1.1 408 Request Timeout\r\n"
+                    "Connection: close\r\n"
+                    "Content-Length: 0\r\n\r\n";
+                (void)send(conn->fd, resp_408, sizeof(resp_408) - 1, MSG_DONTWAIT);
+            }
+            conn->state = CONN_STATE_CLOSED;
             continue;
         }
 
