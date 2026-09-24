@@ -769,7 +769,11 @@ httpd_err_t httpd_resp_sendfile_async(httpd_req_t* req, const char* path,
  *
  * @param req Request context (use httpd_req_get_user_data for state)
  * @param buf Buffer to write data into
- * @param max_len Maximum bytes to write
+ * @param max_len Maximum bytes to write. Can be as large as the connection's
+ *                send ring less one byte (CONFIG_HTTPD_SEND_BUFFER_SIZE - 1,
+ *                4095 by default): a Content-Length provider is refilled once
+ *                the ring has drained and gets all of it. Never assume a
+ *                smaller bound (e.g. copying through a fixed local buffer).
  * @return Bytes written (>0), 0 for EOF, or negative httpd_err_t on error
  *
  * Important:
