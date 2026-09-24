@@ -497,9 +497,23 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
                         ctx->current_header_key = &buffer[i];
                         ctx->header_key_len = 0;
                     }
-                    ctx->header_key_len++;
-                    if (__builtin_expect(ctx->header_key_len > 64, 0)) { // Max header key length
-                        return PARSE_ERROR;
+                    // Consume the whole run of name bytes here rather than one
+                    // byte per trip through the state switch: stop AT the next
+                    // ':', CR, LF or whitespace (handled by the next iteration
+                    // exactly as before) or at the end of the slice.
+                    {
+                        uint16_t key_len = ctx->header_key_len;
+                        size_t j = i;
+                        for (;;) {
+                            if (__builtin_expect(++key_len > 64, 0)) { // Max header key length
+                                return PARSE_ERROR;
+                            }
+                            if (++j >= buffer_len) break;
+                            const uint8_t n = buffer[j];
+                            if (n == ':' || n == '\r' || n == '\n' || is_whitespace(n)) break;
+                        }
+                        ctx->header_key_len = key_len;
+                        i = j - 1;  // i++ below moves to the terminator / slice end
                     }
                 }
                 break;

@@ -32,6 +32,7 @@
 #include "event_loop.h"
 #include "radix_tree.h"
 #include "send_buffer.h"
+#include "http_parser.h"
 #include "test_exports.h"
 #include "esp_cpu.h"
 #include "esp_netif.h"
@@ -405,6 +406,24 @@ static void do_request_drain5744(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Parser alone (http_parse_request over the browser request; the header
+// index store is skipped because the slot has no recv_buf)
+// ---------------------------------------------------------------------------
+
+static connection_t s_parse_conn;
+static void setup_parse(void) {
+    server_fresh();
+    set_req(REQ_BROWSER);
+}
+static void do_parse(void) {
+    http_parser_context_t pctx;
+    memset(&pctx, 0, sizeof(pctx));
+    memset(&s_parse_conn, 0, sizeof(s_parse_conn));
+    s_parse_conn.pool_index = 1;  // slot 1: never used by a request here
+    s_sink_int += (int)http_parse_request(&s_parse_conn, (const uint8_t*)s_req, s_req_len, &pctx);
+}
+
+// ---------------------------------------------------------------------------
 // Radix lookup
 // ---------------------------------------------------------------------------
 
@@ -549,6 +568,7 @@ static void bench_task(void* arg) {
     bench("calib_nop_loop_x1000", 100, do_calib, NULL);
     bench("req_min", 200, do_request, setup_min);
     bench("req_browser_15hdr", 100, do_request, setup_browser);
+    bench("parse_browser_15hdr", 100, do_parse, setup_parse);
     bench("req_query_4q_3hdr", 100, do_request, setup_query);
     bench("req_route64_params", 100, do_request, setup_route64);
     bench("req_mw4", 200, do_request, setup_mw4);
