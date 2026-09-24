@@ -160,12 +160,14 @@ void event_loop_wake(event_loop_t* loop) {
     }
 }
 
-// Consume wake bytes. Clear the pending flag FIRST: a producer that changed
-// state before waking is covered by the fd-set rebuild that follows this
-// drain; one that wakes after the clear sends a fresh byte that breaks the
-// next select.
+// Consume wake bytes. The pending flag is cleared on EVERY select return
+// (see event_loop_iteration), not only here: a wake datagram can be delayed
+// or lost inside lwIP (loopback queue / full tcpip mailbox), and a flag that
+// only a successful drain clears would then suppress every later wake. Any
+// select return is followed by an fd-set rebuild, which covers producers
+// that changed state before their wake; producers after the clear send a
+// fresh byte that breaks the next select.
 static void wake_pair_drain(int fd) {
-    atomic_store(&s_wake_pending, false);
     uint8_t buf[16];
     while (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) > 0) {
     }
@@ -601,6 +603,7 @@ int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, u
     activity = select(max_fd + 1, &read_fds,
                      has_write_pending ? &write_fds : NULL,
                      NULL, &timeout);
+    atomic_store(&s_wake_pending, false);  // fd sets are rebuilt before the next select
 
     if (activity < 0) {
         if (errno != EINTR) {
