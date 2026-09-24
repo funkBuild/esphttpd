@@ -116,6 +116,7 @@ def run_qemu_tests(timeout=30):
     qemu_args = [
         qemu_cmd,
         '-machine', 'esp32s3',
+        '-m', '8M',
         '-drive', 'file=build/qemu_flash.bin,format=raw,if=mtd',
         '-serial', 'stdio',
         '-display', 'none'

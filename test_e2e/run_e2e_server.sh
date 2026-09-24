@@ -81,6 +81,7 @@ echo -e "${CYAN}==================== QEMU Output ====================${NC}"
 qemu-system-xtensa \
     -nographic \
     -machine esp32s3 \
+    -m 8M \
     -drive file=build/flash.bin,if=mtd,format=raw \
     -nic user,model=open_eth,hostfwd=tcp:127.0.0.1:8080-:80 \
     -serial mon:stdio \

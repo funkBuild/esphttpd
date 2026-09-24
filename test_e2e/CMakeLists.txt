@@ -4,6 +4,11 @@ cmake_minimum_required(VERSION 3.16)
 set(EXTRA_COMPONENT_DIRS "..")
 
 # Include the ESP-IDF project
+# Production memory layout (8 MB PSRAM, PSRAM task stacks) when built inside
+# esp_node_firmware; see tools/qemu/production_memory.cmake there.
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../../../tools/qemu/production_memory.cmake")
+    include("${CMAKE_CURRENT_LIST_DIR}/../../../tools/qemu/production_memory.cmake")
+endif()
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 # Set the project name

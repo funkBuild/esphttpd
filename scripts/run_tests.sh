@@ -49,7 +49,7 @@ find_qemu() {
 
     # Search common locations
     local qemu_paths=(
-        "$HOME/.espressif/tools/qemu-xtensa/esp_develop_9.0.0_20240606/qemu/bin/qemu-system-xtensa"
+        "$HOME/.espressif/tools/qemu-xtensa/esp_develop_9.2.2_20260417/qemu/bin/qemu-system-xtensa"  # pinned by IDF 5.5.5
         "$HOME/.espressif/tools/qemu-xtensa/*/qemu/bin/qemu-system-xtensa"
     )
 
@@ -134,7 +134,7 @@ main() {
         0x8000 partition_table/partition-table.bin 2>&1 | tee -a "$LOG_FILE"
 
     # Create efuse file
-    [ ! -f qemu_efuse.bin ] && dd if=/dev/zero of=qemu_efuse.bin bs=1K count=4 2>/dev/null
+    python3 "$SCRIPT_DIR/../../../tools/qemu/make_efuse.py" qemu_efuse.bin  # IDF default S3 eFuses (chip rev 0.3)
 
     # Run QEMU
     print_header "Running Tests Under QEMU"
@@ -145,9 +145,10 @@ main() {
 
     # Start QEMU in background, writing to both the pipe and log file
     "$qemu_bin" -M esp32s3 \
+        -m 8M \
         -drive file=qemu_flash.bin,if=mtd,format=raw \
         -drive file=qemu_efuse.bin,if=none,format=raw,id=efuse \
-        -global driver=nvram.esp32c3.efuse,property=drive,value=efuse \
+        -global driver=nvram.esp32s3.efuse,property=drive,value=efuse \
         -global driver=timer.esp32s3.timg,property=wdt_disable,value=true \
         -nic user,model=open_eth \
         -nographic 2>&1 | tee "$fifo" >> "$LOG_FILE" &

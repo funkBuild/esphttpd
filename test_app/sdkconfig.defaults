@@ -39,9 +39,9 @@ CONFIG_LWIP_SO_REUSE=y
 CONFIG_LWIP_SO_RCVBUF=y
 CONFIG_LWIP_TCP_NODELAY=y
 
-# Disable hardware crypto acceleration (not emulated by QEMU)
+# Software SHA/AES: QEMU's SHA/AES DMA cannot read PSRAM buffers
 CONFIG_MBEDTLS_HARDWARE_SHA=n
 CONFIG_MBEDTLS_HARDWARE_AES=n
 
-# Memory settings
-CONFIG_ESP32S3_SPIRAM_SUPPORT=n
+# Memory settings: PSRAM + production memory layout come from
+# tools/qemu/sdkconfig.production_memory when built inside esp_node_firmware.

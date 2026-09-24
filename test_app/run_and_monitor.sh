@@ -76,6 +76,7 @@ run_qemu_with_monitoring() {
     # Start QEMU with output to pipe
     qemu-system-xtensa \
         -machine esp32s3 \
+        -m 8M \
         -drive file=build/qemu_flash.bin,format=raw,if=mtd \
         -serial pipe:$PIPE \
         -display none \

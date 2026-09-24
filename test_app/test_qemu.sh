@@ -80,6 +80,7 @@ run_tests() {
     timeout --preserve-status ${TIMEOUT_SEC} \
         qemu-system-xtensa \
             -machine esp32s3 \
+            -m 8M \
             -drive file=build/flash_image.bin,format=raw,if=mtd \
             -serial mon:stdio \
             -display none \
