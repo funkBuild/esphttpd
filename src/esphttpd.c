@@ -5347,8 +5347,15 @@ static void on_write_ready_impl(connection_t* conn) {
         }
     }
 
-    // If data provider active and not EOF, refill buffer from provider
-    if (ctx && ctx->data_provider.active && !ctx->data_provider.eof_reached) {
+    // If data provider active and not EOF, refill buffer from provider.
+    // A Content-Length provider is refilled only once the ring has drained
+    // (as a file stream is): an empty ring is reset to offset 0, so the
+    // provider gets the whole ring instead of whatever sliver a partial send
+    // freed - down to 1 byte at the wrap point. A chunked provider keeps
+    // topping up, because there every refill's size is a chunk boundary on
+    // the wire.
+    if (ctx && ctx->data_provider.active && !ctx->data_provider.eof_reached &&
+        (ctx->data_provider.use_chunked || !send_buffer_has_data(sb))) {
         uint8_t* write_ptr;
         size_t contiguous = send_buffer_write_ptr(sb, &write_ptr);
 
