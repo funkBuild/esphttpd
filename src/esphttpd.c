@@ -4193,6 +4193,77 @@ static void finish_sync_request(connection_t* conn, request_context_t* ctx) {
 
 static void on_http_request_impl(connection_t* conn, uint8_t* buffer, size_t len);
 
+// Run a matched route: copy its path parameters, build the middleware chain
+// (server middleware, then - for a mounted router - the router's and the
+// route's own middleware, clamped to the chain buffer), and dispatch through
+// _middleware_next. Always through _middleware_next, even with an empty
+// chain: it re-publishes the route's user_ctx into req->user_data before the
+// handler (a direct call once left every user_ctx route with NULL - crash:
+// LoadProhibited at 0 in a static-file handler). Middleware observes the
+// route's user_ctx; it cannot pass state down through user_data.
+static void dispatch_matched_route(connection_t* conn, request_context_t* ctx,
+                                   const radix_match_t* match, httpd_router_t router,
+                                   const httpd_middleware_t* route_mw, uint8_t route_mw_count,
+                                   int64_t req_start_us) {
+    uint8_t param_count = match->param_count < 8 ? match->param_count : 8;
+    if (param_count > 0) {
+        memcpy(ctx->req.params, match->params, param_count * sizeof(httpd_param_t));
+    }
+    ctx->req.param_count = param_count;
+
+    // Server global middleware. Clamp to the chain buffer: mw_chain has
+    // MAX_TOTAL entries while middleware_count can reach
+    // MAX_SERVER_MIDDLEWARES, a separate Kconfig range.
+    uint8_t mw_count = g_server->middleware_count < CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE
+                     ? g_server->middleware_count : CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE;
+    if (mw_count > 0) {
+        memcpy(ctx->mw_chain, g_server->middlewares, mw_count * sizeof(httpd_middleware_t));
+    }
+    // Router middleware, then the route's own (collected by radix_lookup)
+    if (router && mw_count < CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE) {
+        uint8_t avail = CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE - mw_count;
+        uint8_t router_mw = router->middleware_count < avail ? router->middleware_count : avail;
+        if (router_mw > 0) {
+            memcpy(ctx->mw_chain + mw_count, router->middlewares, router_mw * sizeof(httpd_middleware_t));
+            mw_count += router_mw;
+        }
+    }
+    if (route_mw_count > 0 && mw_count < CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE) {
+        uint8_t avail = CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE - mw_count;
+        uint8_t to_copy = route_mw_count < avail ? route_mw_count : avail;
+        memcpy(ctx->mw_chain + mw_count, route_mw, to_copy * sizeof(httpd_middleware_t));
+        mw_count += to_copy;
+    }
+
+    ctx->req._mw.chain = ctx->mw_chain;
+    ctx->req._mw.chain_len = mw_count;
+    ctx->req._mw.current = 0;
+    ctx->req._mw.router = router;
+
+    if (match->is_websocket) {
+        // WebSocket routes via mounted routers are not implemented (only a
+        // router lookup can match one). Previously this logged a warning and
+        // sent NOTHING - the client hung with zero bytes on the wire until
+        // its own timeout.
+        ESP_LOGW(TAG, "WebSocket routes not yet implemented in new router system");
+        handle_error(HTTPD_ERR_WS_REJECTED, &ctx->req);
+        HTTPD_LOG_REQUEST_END(ctx, conn, req_start_us, " ws-router-unimplemented");
+        conn->state = CONN_STATE_CLOSED;
+        return;
+    }
+
+    ctx->req._mw.final_handler = match->handler;
+    ctx->req._mw.final_user_ctx = match->user_ctx;
+    ctx->req.user_data = match->user_ctx;
+
+    httpd_err_t err = _middleware_next(&ctx->req);
+    if (err != HTTPD_OK) {
+        handle_error(err, &ctx->req);
+    }
+    HTTPD_LOG_REQUEST_END(ctx, conn, req_start_us, "");
+    finish_sync_request(conn, ctx);
+}
+
 // Receive-side entry for request bytes. After each pass, publish whether a
 // request's headers are still incomplete, which arms the event loop's
 // header-completion deadline (request_start is stamped when parsing starts).
@@ -4638,199 +4709,43 @@ static void on_http_request_impl(connection_t* conn, uint8_t* buffer, size_t len
         }
     }
 
-    // Try mounted routers first
-    bool route_found = false;
+    // Try mounted routers first (prefix match, then the router's radix tree)
     radix_match_t match;
     // Sized to radix_lookup's clamp: it accumulates per-NODE middleware across
     // the traversal up to MAX_TOTAL, not the per-route MAX_ROUTE limit
     httpd_middleware_t route_mw[CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE];
     uint8_t route_mw_count = 0;
-    httpd_router_t matched_router = NULL;  // httpd_router_t is already a pointer
-
-    // Fast path: single router case (common configuration)
-    if (__builtin_expect(g_server->mounted_router_count == 1, 1)) {
-        mounted_router_t* mr = &g_server->mounted_routers[0];
-        if (ctx->req.path_len >= mr->prefix_len &&
-            memcmp(ctx->req.path, mr->prefix, mr->prefix_len) == 0) {
-            const char* stripped_path = ctx->req.path + mr->prefix_len;
-            if (stripped_path[0] == '\0') stripped_path = "/";
-            radix_lookup(mr->router->tree, stripped_path,
-                        ctx->req.method, ctx->req.is_websocket, &match,
-                        route_mw, &route_mw_count);
-            if (match.matched) {
-                ctx->req.base_url = mr->prefix;
-                ctx->req.base_url_len = mr->prefix_len;
-                matched_router = mr->router;
-                route_found = true;
-            }
+    for (uint8_t i = 0; i < g_server->mounted_router_count; i++) {
+        mounted_router_t* mr = &g_server->mounted_routers[i];
+        if (ctx->req.path_len < mr->prefix_len ||
+            memcmp(ctx->req.path, mr->prefix, mr->prefix_len) != 0) {
+            continue;
         }
-    } else {
-        // Multiple routers - iterate
-        for (uint8_t i = 0; i < g_server->mounted_router_count; i++) {
-            mounted_router_t* mr = &g_server->mounted_routers[i];
-
-            // Check if path starts with prefix
-            if (ctx->req.path_len >= mr->prefix_len &&
-                memcmp(ctx->req.path, mr->prefix, mr->prefix_len) == 0) {
-
-                // Path matches prefix - look up in router's radix tree
-                const char* stripped_path = ctx->req.path + mr->prefix_len;
-                if (stripped_path[0] == '\0') {
-                    stripped_path = "/";  // Handle exact prefix match
-                }
-
-                radix_lookup(mr->router->tree, stripped_path,
-                            ctx->req.method, ctx->req.is_websocket, &match,
-                            route_mw, &route_mw_count);
-
-                if (match.matched) {
-                    // Set base URL
-                    ctx->req.base_url = mr->prefix;
-                    ctx->req.base_url_len = mr->prefix_len;
-                    matched_router = mr->router;
-                    route_found = true;
-                    break;
-                }
-            }
+        const char* stripped_path = ctx->req.path + mr->prefix_len;
+        if (stripped_path[0] == '\0') {
+            stripped_path = "/";  // Handle exact prefix match
         }
-    }
-
-    // Fall back to legacy route table if no router matched (O(log n) radix tree lookup)
-    // Reuse the same match variable to avoid a second radix_match_t on the stack
-    if (!route_found && g_server->legacy_routes) {
-        radix_lookup(g_server->legacy_routes, ctx->req.path,
-                    ctx->req.method, false, &match, NULL, NULL);
-
-        if (match.matched && match.handler) {
-            route_found = true;
-
-            // Copy parameters from radix match using memcpy (faster than field-by-field)
-            uint8_t param_count = match.param_count < 8 ? match.param_count : 8;
-            if (param_count > 0) {
-                memcpy(ctx->req.params, match.params, param_count * sizeof(httpd_param_t));
-            }
-            ctx->req.param_count = param_count;
-
-            // Build middleware chain: server global only (no router middleware for legacy routes)
-            // Clamp to the chain buffer size (mw_chain has MAX_TOTAL entries while
-            // middleware_count can reach MAX_SERVER_MIDDLEWARES, a separate Kconfig range)
-            uint8_t mw_count = g_server->middleware_count < CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE
-                              ? g_server->middleware_count : CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE;
-
-            // Use memcpy instead of loop for middleware chain copying
-            if (mw_count > 0) {
-                memcpy(ctx->mw_chain, g_server->middlewares, mw_count * sizeof(httpd_middleware_t));
-            }
-
-            // Set up middleware context
-            ctx->req._mw.chain = ctx->mw_chain;
-            ctx->req._mw.chain_len = mw_count;
-            ctx->req._mw.current = 0;
-            ctx->req._mw.final_handler = match.handler;
-            ctx->req._mw.final_user_ctx = match.user_ctx;
-            ctx->req._mw.router = NULL;
-
-            // Middleware observes the route's user_ctx. _middleware_next
-            // re-publishes final_user_ctx before the handler, so middleware
-            // cannot pass state down through user_data.
-            ctx->req.user_data = match.user_ctx;
-
-            // Always dispatch through _middleware_next, even with an empty
-            // chain: it re-publishes the route's user_ctx into req->user_data
-            // before the handler, and it falls straight through to
-            // final_handler when chain_len == 0. The old fast path called the
-            // handler directly and skipped that assignment, so every user_ctx
-            // route saw NULL (crash: LoadProhibited at 0 in a static-file
-            // handler).
-            httpd_err_t err = _middleware_next(&ctx->req);
-            if (err != HTTPD_OK) {
-                handle_error(err, &ctx->req);
-            }
-            HTTPD_LOG_REQUEST_END(ctx, conn, req_start_us, "");
-            finish_sync_request(conn, ctx);
-
+        radix_lookup(mr->router->tree, stripped_path,
+                    ctx->req.method, ctx->req.is_websocket, &match,
+                    route_mw, &route_mw_count);
+        if (match.matched) {
+            ctx->req.base_url = mr->prefix;
+            ctx->req.base_url_len = mr->prefix_len;
+            dispatch_matched_route(conn, ctx, &match, mr->router,
+                                   route_mw, route_mw_count, req_start_us);
             return;
         }
     }
 
-    // Handle routed request (from mounted router)
-    if (route_found && match.matched) {
-        // Copy parameters from radix match using memcpy (faster than field-by-field)
-        uint8_t param_count = match.param_count < 8 ? match.param_count : 8;
-        if (param_count > 0) {
-            memcpy(ctx->req.params, match.params, param_count * sizeof(httpd_param_t));
+    // Fall back to legacy route table if no router matched (O(log n) radix
+    // tree lookup; server middleware only, no WebSocket matching)
+    if (g_server->legacy_routes) {
+        radix_lookup(g_server->legacy_routes, ctx->req.path,
+                    ctx->req.method, false, &match, NULL, NULL);
+        if (match.matched && match.handler) {
+            dispatch_matched_route(conn, ctx, &match, NULL, NULL, 0, req_start_us);
+            return;
         }
-        ctx->req.param_count = param_count;
-
-        // Build middleware chain: server global + router + route using memcpy
-        uint8_t mw_count = 0;
-
-        // Add server global middleware
-        uint8_t server_mw = g_server->middleware_count < CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE
-                           ? g_server->middleware_count : CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE;
-        if (server_mw > 0) {
-            memcpy(ctx->mw_chain, g_server->middlewares, server_mw * sizeof(httpd_middleware_t));
-            mw_count = server_mw;
-        }
-
-        // Add router middleware
-        if (matched_router && mw_count < CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE) {
-            uint8_t avail = CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE - mw_count;
-            uint8_t router_mw = matched_router->middleware_count < avail
-                               ? matched_router->middleware_count : avail;
-            if (router_mw > 0) {
-                memcpy(ctx->mw_chain + mw_count, matched_router->middlewares, router_mw * sizeof(httpd_middleware_t));
-                mw_count += router_mw;
-            }
-        }
-
-        // Add route middleware (collected directly by radix_lookup into route_mw)
-        if (route_mw_count > 0 && mw_count < CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE) {
-            uint8_t avail = CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE - mw_count;
-            uint8_t to_copy = route_mw_count < avail ? route_mw_count : avail;
-            memcpy(ctx->mw_chain + mw_count, route_mw, to_copy * sizeof(httpd_middleware_t));
-            mw_count += to_copy;
-        }
-
-        // Set up middleware context
-        ctx->req._mw.chain = ctx->mw_chain;
-        ctx->req._mw.chain_len = mw_count;
-        ctx->req._mw.current = 0;
-        ctx->req._mw.router = matched_router;
-
-        if (match.is_websocket) {
-            // WebSocket routes via mounted routers are not implemented.
-            // Previously this logged a warning and sent NOTHING - the client
-            // hung with zero bytes on the wire until its own timeout.
-            ESP_LOGW(TAG, "WebSocket routes not yet implemented in new router system");
-            handle_error(HTTPD_ERR_WS_REJECTED, &ctx->req);
-            HTTPD_LOG_REQUEST_END(ctx, conn, req_start_us, " ws-router-unimplemented");
-            conn->state = CONN_STATE_CLOSED;
-        } else {
-            ctx->req._mw.final_handler = match.handler;
-            ctx->req._mw.final_user_ctx = match.user_ctx;
-
-            // Middleware observes the route's user_ctx. _middleware_next
-            // re-publishes final_user_ctx before the handler, so middleware
-            // cannot pass state down through user_data.
-            ctx->req.user_data = match.user_ctx;
-
-            // Always dispatch through _middleware_next, even with an empty
-            // chain: it re-publishes the route's user_ctx into req->user_data
-            // before the handler, and it falls straight through to
-            // final_handler when chain_len == 0. The old fast path called the
-            // handler directly and skipped that assignment, so every user_ctx
-            // route saw NULL (crash: LoadProhibited at 0 in a static-file
-            // handler).
-            httpd_err_t err = _middleware_next(&ctx->req);
-            if (err != HTTPD_OK) {
-                handle_error(err, &ctx->req);
-            }
-            HTTPD_LOG_REQUEST_END(ctx, conn, req_start_us, "");
-            finish_sync_request(conn, ctx);
-        }
-
-        return;
     }
 
     // No route found
