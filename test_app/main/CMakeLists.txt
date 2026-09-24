@@ -17,7 +17,8 @@ idf_component_register(
         "test_router_api.c"
         "test_websocket_api.c"
         "test_middleware.c"
+        "test_live_loopback.c"
     INCLUDE_DIRS "."
     REQUIRES unity esphttpd
-    PRIV_REQUIRES esp_timer
+    PRIV_REQUIRES esp_timer esp_netif vfs
 )

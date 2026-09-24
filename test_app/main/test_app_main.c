@@ -27,6 +27,7 @@ void test_http_api_run(void);
 void test_router_api_run(void);
 void test_websocket_api_run(void);
 void test_middleware_run(void);
+void test_live_loopback_run(void);
 
 void app_main(void)
 {
@@ -83,6 +84,9 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Running Middleware tests...");
     test_middleware_run();
+
+    ESP_LOGI(TAG, "Running live loopback tests...");
+    test_live_loopback_run();
 
     ESP_LOGI(TAG, "Running Performance benchmarks...");
     test_performance_run();
