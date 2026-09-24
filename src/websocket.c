@@ -496,32 +496,40 @@ void ws_mask_payload(uint8_t* __restrict payload, size_t len, uint32_t mask_key,
     const uint8_t* mask_bytes = (const uint8_t*)&mask_key;
     size_t i = 0;
 
-    // Handle bytes until mask rotation is aligned to 4-byte boundary
-    // Once (offset + i) % 4 == 0, we can XOR with the full mask_key word
-    while (i < len && ((offset + i) & 3) != 0) {
+    // Byte-wise until the POINTER is word aligned (at most 3 bytes). Aligning
+    // on the mask phase instead left the pointer wherever the frame header
+    // put it - a received frame's payload after a 2+4-byte header is 2 bytes
+    // off a word boundary - and every such payload was XORed a byte at a time.
+    while (i < len && ((uintptr_t)(payload + i) & 3) != 0) {
         payload[i] ^= mask_bytes[(offset + i) & 3];
         i++;
     }
 
-    // Check if payload pointer is 4-byte aligned for word-at-a-time XOR
-    bool aligned = ((uintptr_t)(payload + i) & 3) == 0;
+    if (len - i >= 4) {
+        // The mask as seen from this aligned address: rotated to the phase
+        // of byte i, assembled byte-wise so it is right on either endianness
+        uint32_t word;
+        uint8_t* wb = (uint8_t*)&word;
+        const size_t phase = (offset + i) & 3;
+        wb[0] = mask_bytes[phase];
+        wb[1] = mask_bytes[(phase + 1) & 3];
+        wb[2] = mask_bytes[(phase + 2) & 3];
+        wb[3] = mask_bytes[(phase + 3) & 3];
 
-    // Fast path: Process 8 bytes at a time (unrolled for better ILP)
-    // Only use word-at-a-time when payload pointer is aligned
-    if (aligned) {
-        for (; i + 8 <= len; i += 8) {
-            *(uint32_t*)(payload + i) ^= mask_key;
-            *(uint32_t*)(payload + i + 4) ^= mask_key;
+        // 16 bytes per iteration (independent loads/stores for ILP)
+        for (; i + 16 <= len; i += 16) {
+            uint32_t* p = (uint32_t*)(payload + i);
+            p[0] ^= word;
+            p[1] ^= word;
+            p[2] ^= word;
+            p[3] ^= word;
         }
-
-        // Handle remaining 4-byte chunk
-        if (i + 4 <= len) {
-            *(uint32_t*)(payload + i) ^= mask_key;
-            i += 4;
+        for (; i + 4 <= len; i += 4) {
+            *(uint32_t*)(payload + i) ^= word;
         }
     }
 
-    // Handle final 0-3 bytes with correct mask offset
+    // Final 0-3 bytes with correct mask offset
     for (; i < len; i++) {
         payload[i] ^= mask_bytes[(offset + i) & 3];
     }
