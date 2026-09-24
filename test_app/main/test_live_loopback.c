@@ -107,8 +107,11 @@ static int ram_open(const char* path, int flags, int mode) {
     return -1;
 }
 
+static volatile int s_ram_read_delay_ms;  // simulate slow flash reads
+
 static ssize_t ram_read(int fd, void* dst, size_t size) {
     if (fd < 0 || fd >= RAM_MAX_FDS || !s_ram_fds[fd].used) { errno = EBADF; return -1; }
+    if (s_ram_read_delay_ms > 0) vTaskDelay(pdMS_TO_TICKS(s_ram_read_delay_ms));
     const ram_file_t* f = &s_ram_files[s_ram_fds[fd].file];
     size_t left = f->len - s_ram_fds[fd].pos;
     if (size > left) size = left;
@@ -956,6 +959,111 @@ static void test_live_wake_stop_latency(void) {
     TEST_ASSERT_TRUE_MESSAGE(ms < WAKE_LATENCY_MAX_MS, "stop waited for the select timeout");
 }
 
+// ============================================================================
+// Send-lock scope: a slow data provider or file read on one HTTP connection
+// must not block app-task WebSocket sends to other connections
+// ============================================================================
+
+#define SEND_BLOCK_MAX_MS 100
+
+static SemaphoreHandle_t s_slow_entered;
+static SemaphoreHandle_t s_slow_release;
+static int s_slow_calls;
+
+static ssize_t prov_slow(httpd_req_t* req, uint8_t* buf, size_t max_len) {
+    (void)req;
+    (void)max_len;
+    if (s_slow_calls++ == 0) {
+        xSemaphoreGive(s_slow_entered);
+        // Bounded so the pre-fix build (sender blocked behind this call)
+        // fails the latency assertion instead of deadlocking the test
+        xSemaphoreTake(s_slow_release, pdMS_TO_TICKS(1000));
+        memcpy(buf, "slow!", 5);
+        return 5;
+    }
+    return 0;
+}
+
+static httpd_err_t h_slow_prov(httpd_req_t* req) {
+    return httpd_resp_send_provider(req, 5, prov_slow, NULL);
+}
+
+static void register_slow(httpd_handle_t h) {
+    register_all(h);
+    httpd_route_t r = { HTTP_GET, "/slowprov", h_slow_prov, NULL };
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_route(h, &r));
+}
+
+static void test_live_lock_ws_send_not_blocked_by_provider(void) {
+    s_slow_entered = xSemaphoreCreateBinary();
+    s_slow_release = xSemaphoreCreateBinary();
+    s_slow_calls = 0;
+    live_start(register_slow);
+    int ws = ws_open();
+    int fd = cli_connect();
+    cli_send_str(fd, "GET /slowprov HTTP/1.1\r\nHost: x\r\n\r\n");
+    TEST_ASSERT_EQUAL(pdTRUE, xSemaphoreTake(s_slow_entered, pdMS_TO_TICKS(2000)));
+
+    int64_t t0 = esp_timer_get_time();
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_ws_send(s_ws, "x", 1, WS_TYPE_TEXT));
+    int64_t ms = (esp_timer_get_time() - t0) / 1000;
+    xSemaphoreGive(s_slow_release);
+    printf("LOCK ws send during slow provider took %" PRId64 " ms\n", ms);
+
+    expect_bytes(ws, "\x81\x01x", 3);
+    expect_str(fd, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nslow!");
+    TEST_ASSERT_TRUE_MESSAGE(ms < SEND_BLOCK_MAX_MS, "WS send blocked behind a data provider");
+
+    close(fd);
+    close(ws);
+    live_stop();
+    vSemaphoreDelete(s_slow_entered);
+    vSemaphoreDelete(s_slow_release);
+}
+
+static void test_live_lock_ws_send_not_blocked_by_file_read(void) {
+    live_start(register_all);
+    int ws = ws_open();
+    int fd = cli_connect();
+    s_ram_read_delay_ms = 150;
+    cli_send_str(fd, "GET /file/big.bin HTTP/1.1\r\nHost: x\r\n\r\n");
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    int64_t worst = 0;
+    for (int i = 0; i < 5; i++) {
+        int64_t t0 = esp_timer_get_time();
+        TEST_ASSERT_EQUAL(HTTPD_OK, httpd_ws_send(s_ws, "y", 1, WS_TYPE_TEXT));
+        int64_t ms = (esp_timer_get_time() - t0) / 1000;
+        if (ms > worst) worst = ms;
+        vTaskDelay(pdMS_TO_TICKS(60));
+    }
+    printf("LOCK worst ws send during slow file reads took %" PRId64 " ms\n", worst);
+    for (int i = 0; i < 5; i++) {
+        uint8_t f[3];
+        TEST_ASSERT_EQUAL_size_t(3, cli_recv_exact(ws, f, 3));
+        TEST_ASSERT_EQUAL_MEMORY("\x81\x01y", f, 3);
+    }
+
+    static const char big_hdr[] =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 20000\r\n\r\n";
+    size_t total = sizeof(big_hdr) - 1 + BIG_FILE_SIZE;
+    uint8_t* got = malloc(total);
+    TEST_ASSERT_NOT_NULL(got);
+    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    size_t n = cli_recv_exact(fd, got, total);
+    s_ram_read_delay_ms = 0;
+    TEST_ASSERT_EQUAL_size_t(total, n);
+    TEST_ASSERT_EQUAL_MEMORY(big_hdr, got, sizeof(big_hdr) - 1);
+    TEST_ASSERT_EQUAL_MEMORY(s_big_data, got + sizeof(big_hdr) - 1, BIG_FILE_SIZE);
+    free(got);
+    TEST_ASSERT_TRUE_MESSAGE(worst < SEND_BLOCK_MAX_MS, "WS send blocked behind a file read");
+
+    close(fd);
+    close(ws);
+    live_stop();
+}
+
 void test_live_loopback_run(void) {
     ESP_LOGI(TAG, "Running live loopback golden tests");
     RUN_TEST(test_live_golden_basic_responses);
@@ -969,4 +1077,6 @@ void test_live_loopback_run(void) {
     RUN_TEST(test_live_wake_ws_queued_send_latency);
     RUN_TEST(test_live_wake_defer_resume_latency);
     RUN_TEST(test_live_wake_stop_latency);
+    RUN_TEST(test_live_lock_ws_send_not_blocked_by_provider);
+    RUN_TEST(test_live_lock_ws_send_not_blocked_by_file_read);
 }

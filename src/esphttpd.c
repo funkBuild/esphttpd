@@ -5299,6 +5299,20 @@ static void on_disconnect(connection_t* conn) {
     SEND_UNLOCK();
 }
 
+// Blocking work inside on_write_ready_impl — flash reads for a file stream,
+// the user's data provider, completion callbacks and the pipelined requests
+// they re-arm — runs with the global send mutex RELEASED, so app-task
+// WebSocket sends to other connections are not stalled behind it. Only for
+// plain HTTP connections, where it is safe: no other task writes into an
+// HTTP connection's send buffer (the cross-task send APIs target WebSocket
+// connections only, and httpd_stop joins the loop task before touching any
+// buffer), so ring positions taken before the release stay valid. A
+// recursively held mutex (caller already inside a send path) simply stays
+// held, as before.
+static inline bool send_lock_releasable(const connection_t* conn) {
+    return conn->state != CONN_STATE_WEBSOCKET && conn->state != CONN_STATE_WS_CLOSING;
+}
+
 // Called by event loop when socket is writable and has pending data
 static void on_write_ready_impl(connection_t* conn) {
     send_buffer_t* sb = get_send_buffer(conn);
@@ -5306,6 +5320,7 @@ static void on_write_ready_impl(connection_t* conn) {
 
     // Safety check for pre-allocated contexts
     if (!sb || !ctx) return;
+    const bool unlock_for_blocking = send_lock_releasable(conn);
 
     // Main send loop - keep filling and sending until EAGAIN or complete
     for (;;) {
@@ -5343,7 +5358,11 @@ static void on_write_ready_impl(connection_t* conn) {
             // If we have data to send, send it first - worker will refill later
 #else
             // Read directly into ring buffer - no intermediate copy
+            if (unlock_for_blocking) SEND_UNLOCK();
             ssize_t bytes_read = read(sb->file_fd, write_ptr, to_read);
+            int read_errno = errno;
+            if (unlock_for_blocking) SEND_LOCK();
+            errno = read_errno;
             if (bytes_read > 0) {
                 send_buffer_commit(sb, bytes_read);
                 sb->file_remaining -= bytes_read;
@@ -5410,7 +5429,9 @@ static void on_write_ready_impl(connection_t* conn) {
                 uint8_t* data_ptr = ctx->data_provider.use_chunked ? write_ptr + 8 : write_ptr;
 
                 // Call user's data provider
+                if (unlock_for_blocking) SEND_UNLOCK();
                 ssize_t bytes = ctx->data_provider.provider(&ctx->req, data_ptr, max_data);
+                if (unlock_for_blocking) SEND_LOCK();
 
                 if (bytes > 0) {
                     if (ctx->data_provider.use_chunked) {
@@ -5444,7 +5465,9 @@ static void on_write_ready_impl(connection_t* conn) {
                     ctx->data_provider.provider = NULL;
                     ctx->data_provider.on_complete = NULL;
                     if (callback) {
+                        if (unlock_for_blocking) SEND_UNLOCK();
                         callback(&ctx->req, (httpd_err_t)bytes);
+                        if (unlock_for_blocking) SEND_LOCK();
                     }
                     conn->state = CONN_STATE_CLOSED;
                     return;
@@ -5530,6 +5553,11 @@ static void on_write_ready_impl(connection_t* conn) {
     if (!send_buffer_has_data(sb)) {
         connection_mark_write_pending(&g_server->connection_pool, conn->pool_index, false);
 
+        // User completion callbacks and the pipelined requests that
+        // finish_sync_request dispatches run without the send mutex (see
+        // send_lock_releasable); each send they make takes it itself.
+        if (unlock_for_blocking) SEND_UNLOCK();
+
         // Keep the ring allocation for the connection's lifetime: freeing it
         // here made every buffered response on a keep-alive connection pay a
         // 4KB free+malloc cycle. on_disconnect/httpd_stop release it.
@@ -5580,18 +5608,17 @@ static void on_write_ready_impl(connection_t* conn) {
             !send_buffer_is_mem_streaming(sb)) {
             finish_sync_request(conn, ctx);
         }
+        if (unlock_for_blocking) SEND_LOCK();
     }
 }
 
 // Serialized entry point (see SEND_LOCK above): the event loop's writer must
 // not interleave with app-task WebSocket sends on the same ring buffer.
 //
-// IMPORTANT: user callbacks dispatched from on_write_ready_impl (the data
-// provider callback, async_send on_done, provider on_complete) therefore run
-// UNDER the send mutex. They must not block waiting on another task that
-// itself calls httpd_ws_send / httpd_ws_broadcast / httpd_ws_publish (or any
-// other send-path API) - those take the same mutex, so that wait is a
-// guaranteed deadlock. Keep these callbacks short and non-blocking.
+// For plain HTTP connections the user callbacks dispatched from
+// on_write_ready_impl (data provider, async_send on_done, provider
+// on_complete) and file reads run with the mutex released (see
+// send_lock_releasable), so they no longer stall other senders.
 static void on_write_ready(connection_t* conn) {
     SEND_LOCK();
     on_write_ready_impl(conn);
