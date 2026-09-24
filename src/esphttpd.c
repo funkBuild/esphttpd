@@ -5195,6 +5195,23 @@ static inline bool send_lock_releasable(const connection_t* conn) {
     return conn->state != CONN_STATE_WEBSOCKET && conn->state != CONN_STATE_WS_CLOSING;
 }
 
+#ifndef CONFIG_HTTPD_USE_RAW_API
+// A write-ready send failed with a real error (not EAGAIN): fail the async
+// send's completion and close the connection
+static void write_ready_send_failed(connection_t* conn, request_context_t* ctx) {
+    ESP_LOGE(TAG, "Send error on conn [%d]: %s", conn->pool_index, strerror(errno));
+    if (ctx && ctx->async_send.active) {
+        httpd_send_cb_t callback = ctx->async_send.on_done;
+        ctx->async_send.active = false;
+        ctx->async_send.on_done = NULL;
+        if (callback) {
+            callback(&ctx->req, HTTPD_ERR_IO);
+        }
+    }
+    conn->state = CONN_STATE_CLOSED;
+}
+#endif
+
 // Called by event loop when socket is writable and has pending data
 static void on_write_ready_impl(connection_t* conn) {
     send_buffer_t* sb = get_send_buffer(conn);
@@ -5273,6 +5290,32 @@ static void on_write_ready_impl(connection_t* conn) {
         }
         }
     }
+
+#ifndef CONFIG_HTTPD_USE_RAW_API
+    // Memory stream with nothing staged ahead of it in the ring: send straight
+    // from the stream. Copying it into the ring first only to send it from
+    // there was a second full copy of every overflowed byte (the stream is
+    // already an owned copy of the caller's data).
+    if (send_buffer_is_mem_streaming(sb) && !send_buffer_has_data(sb)) {
+        if (sb->mem_remaining > 0) {
+            ssize_t sent = send(conn->fd, sb->mem_ptr, sb->mem_remaining, MSG_DONTWAIT);
+            if (sent < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    return;  // Socket buffer full, will retry on next write-ready
+                }
+                write_ready_send_failed(conn, ctx);
+                return;
+            }
+            sb->mem_ptr += sent;
+            sb->mem_remaining -= (uint32_t)sent;
+        }
+        if (sb->mem_remaining == 0) {
+            send_buffer_stop_mem(sb);
+            ESP_LOGD(TAG, "Memory streaming complete for conn [%d]", conn->pool_index);
+        }
+        continue;
+    }
+#endif
 
     // If streaming from memory buffer, refill the ring buffer (memcpy into ring buffer)
     if (send_buffer_is_mem_streaming(sb)) {
@@ -5398,17 +5441,7 @@ static void on_write_ready_impl(connection_t* conn) {
                 // Socket buffer full, will retry on next write-ready
                 return;
             }
-            // Real error - invoke async callback with error and close connection
-            ESP_LOGE(TAG, "Send error on conn [%d]: %s", conn->pool_index, strerror(errno));
-            if (ctx && ctx->async_send.active) {
-                httpd_send_cb_t callback = ctx->async_send.on_done;
-                ctx->async_send.active = false;
-                ctx->async_send.on_done = NULL;
-                if (callback) {
-                    callback(&ctx->req, HTTPD_ERR_IO);
-                }
-            }
-            conn->state = CONN_STATE_CLOSED;
+            write_ready_send_failed(conn, ctx);
             return;
         }
 #endif
