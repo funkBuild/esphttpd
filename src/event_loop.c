@@ -15,6 +15,8 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "private/websocket.h"
 
 static const char TAG[] __attribute__((unused)) = "EVENT_LOOP";
@@ -96,7 +98,79 @@ void event_loop_init(event_loop_t* loop, connection_pool_t* pool, const event_lo
 void event_loop_stop(event_loop_t* loop) {
     loop->stop_requested = true;
     loop->running = false;
+    event_loop_wake(loop);
 }
+
+#ifdef CONFIG_HTTPD_USE_RAW_API
+void event_loop_wake(event_loop_t* loop) {
+    (void)loop;  // raw API: driven by lwIP callbacks, nothing to wake
+}
+#else
+// ============================================================================
+// Wake pair: a loopback UDP socket connected to itself. A byte sent to it
+// makes the loop's select() return so it rebuilds its fd sets.
+//
+// Process-lifetime, created once by the loop task and never closed: a sender
+// on another task reads s_wake_fd without a lock, so closing it at loop exit
+// could let that sender write into an unrelated socket that reused the fd
+// number. One socket serves every (sequential) server instance.
+// ============================================================================
+static atomic_int s_wake_fd = -1;
+static atomic_bool s_wake_pending;             // a wake byte is in flight
+static TaskHandle_t volatile s_wake_loop_task; // task currently running the loop
+
+static void wake_pair_open(void) {
+    if (atomic_load(&s_wake_fd) >= 0) return;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        ESP_LOGW(TAG, "Wake socket unavailable (%s): cross-task wakeups fall back "
+                 "to the select timeout", strerror(errno));
+        return;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;  // ephemeral
+    socklen_t addr_len = sizeof(addr);
+    if (fd >= FD_SETSIZE ||
+        bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
+        getsockname(fd, (struct sockaddr*)&addr, &addr_len) < 0 ||
+        connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
+        fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
+        ESP_LOGW(TAG, "Wake socket setup failed (%s): cross-task wakeups fall back "
+                 "to the select timeout", strerror(errno));
+        close(fd);
+        return;
+    }
+    atomic_store(&s_wake_fd, fd);
+}
+
+void event_loop_wake(event_loop_t* loop) {
+    (void)loop;
+    int fd = atomic_load(&s_wake_fd);
+    if (fd < 0) return;
+    // The loop task rebuilds its fd sets before every select: nothing to do
+    if (xTaskGetCurrentTaskHandle() == s_wake_loop_task) return;
+    // Coalesce: one byte in flight is enough to break the current select
+    if (atomic_exchange(&s_wake_pending, true)) return;
+    static const uint8_t b = 0;
+    if (send(fd, &b, 1, MSG_DONTWAIT) < 0) {
+        atomic_store(&s_wake_pending, false);  // allow a later retry
+    }
+}
+
+// Consume wake bytes. Clear the pending flag FIRST: a producer that changed
+// state before waking is covered by the fd-set rebuild that follows this
+// drain; one that wakes after the clear sends a fresh byte that breaks the
+// next select.
+static void wake_pair_drain(int fd) {
+    atomic_store(&s_wake_pending, false);
+    uint8_t buf[16];
+    while (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) > 0) {
+    }
+}
+#endif
 
 // ============================================================================
 // Socket-based event loop (select mode)
@@ -469,6 +543,13 @@ int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, u
     // Add listening socket
     FD_SET(loop->listen_fd, &read_fds);
 
+    // Add the wake socket (cross-task producers break select() through it)
+    const int wake_fd = atomic_load(&s_wake_fd);
+    if (wake_fd >= 0) {
+        FD_SET(wake_fd, &read_fds);
+        if (wake_fd > max_fd) max_fd = wake_fd;
+    }
+
     // Add active connections using bitmask iteration
     uint32_t mask = loop->pool->active_mask;
     while (mask) {
@@ -495,11 +576,11 @@ int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, u
         // then closes and the client is throttled instead of us pulling body
         // bytes off the socket and discarding them. The connection stays in
         // active_mask, so its writes and timeouts are still serviced below.
-        // Note: httpd_req_defer_resume() from another task only clears
-        // defer_paused; the fd set is rebuilt here each iteration, so the
-        // resume takes effect at the next select wakeup (up to one select
-        // timeout of latency). While paused, the timeout scan refreshes
-        // last_activity so the connection cannot idle out.
+        // Note: httpd_req_defer_resume() from another task clears
+        // defer_paused and wakes the loop (event_loop_wake), so the fd set
+        // rebuilt here re-arms the read side promptly. While paused, the
+        // timeout scan refreshes last_activity so the connection cannot
+        // idle out.
         if (!conn->defer_paused) {
             FD_SET(conn->fd, &read_fds);
         }
@@ -552,6 +633,10 @@ int event_loop_iteration(event_loop_t* loop, const event_handlers_t* handlers, u
 
     if (activity == 0) {
         return 0;
+    }
+
+    if (wake_fd >= 0 && FD_ISSET(wake_fd, &read_fds)) {
+        wake_pair_drain(wake_fd);
     }
 
     // Handle new connections
@@ -615,6 +700,9 @@ void event_loop_run(event_loop_t* loop, const event_handlers_t* handlers) {
         }
     }
 
+    wake_pair_open();
+    s_wake_loop_task = xTaskGetCurrentTaskHandle();
+
     loop->running = true;
     ESP_LOGI(TAG, "Event loop started");
 
@@ -623,6 +711,7 @@ void event_loop_run(event_loop_t* loop, const event_handlers_t* handlers) {
     }
 
 cleanup:
+    s_wake_loop_task = NULL;
     loop->running = false;
     // Close listening socket
     if (loop->listen_fd >= 0) {

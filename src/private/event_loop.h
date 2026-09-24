@@ -115,6 +115,15 @@ int event_loop_evict_idle(event_loop_t* loop, const event_handlers_t* handlers);
 // Stop the event loop (both modes)
 void event_loop_stop(event_loop_t* loop);
 
+// Wake the event loop out of select() so it rebuilds its fd sets now. For
+// producers on OTHER tasks that change what the loop must wait on (bytes
+// queued behind a full socket, a resumed deferred upload, a stop request);
+// without it the change is only seen at the next select timeout (1 s).
+// Safe from any task; coalesced (at most one wake datagram in flight); a
+// no-op from the loop task itself, which rebuilds its sets before every
+// select anyway. No-op in raw API mode (lwIP callbacks, no select).
+void event_loop_wake(event_loop_t* loop);
+
 #ifdef __cplusplus
 }
 #endif

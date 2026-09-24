@@ -847,6 +847,115 @@ static void test_live_ws_cross_task_send_ordering(void) {
     live_stop();
 }
 
+// ============================================================================
+// Cross-task wake latency: work queued from another task must not wait for
+// the event loop's 1 s select() timeout to be noticed
+// ============================================================================
+
+#define WAKE_LATENCY_MAX_MS 300
+
+// Slow reader: an app-task WebSocket send overflows the socket and queues.
+// The loop, idle in select() with no write interest, must pick the queued
+// bytes up promptly once the client starts reading.
+static void test_live_wake_ws_queued_send_latency(void) {
+    live_start(register_all);
+    int fd = ws_open();
+    vTaskDelay(pdMS_TO_TICKS(50));  // loop is now parked in select()
+
+    const size_t len = 24000;
+    uint8_t* payload = malloc(len);
+    TEST_ASSERT_NOT_NULL(payload);
+    for (size_t i = 0; i < len; i++) payload[i] = (uint8_t)(i * 13);
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_ws_send(s_ws, payload, len, WS_TYPE_BINARY));
+    int64_t t0 = esp_timer_get_time();
+
+    uint8_t* got = malloc(len);
+    TEST_ASSERT_NOT_NULL(got);
+    uint8_t op;
+    int n = ws_read_server_frame(fd, &op, got, len);
+    int64_t ms = (esp_timer_get_time() - t0) / 1000;
+    TEST_ASSERT_EQUAL_INT((int)len, n);
+    TEST_ASSERT_EQUAL_UINT8(0x2, op);
+    TEST_ASSERT_EQUAL_MEMORY(payload, got, len);
+    free(payload);
+    free(got);
+    printf("LATENCY queued ws send drained in %" PRId64 " ms\n", ms);
+    TEST_ASSERT_TRUE_MESSAGE(ms < WAKE_LATENCY_MAX_MS, "queued WS bytes waited for the select timeout");
+
+    close(fd);
+    live_stop();
+}
+
+static httpd_req_t* volatile s_defer_req;
+static volatile size_t s_defer_bytes;
+static SemaphoreHandle_t s_defer_paused;
+
+static httpd_err_t defer_body(httpd_req_t* req, const void* data, size_t len) {
+    (void)data;
+    if (s_defer_bytes == 0) {
+        httpd_req_defer_pause(req);
+        s_defer_req = req;
+        xSemaphoreGive(s_defer_paused);
+    }
+    s_defer_bytes += len;
+    return HTTPD_OK;
+}
+
+static void defer_done(httpd_req_t* req, httpd_err_t err) {
+    char body[32];
+    int n = snprintf(body, sizeof(body), "done:%d:%u", (int)err, (unsigned)s_defer_bytes);
+    httpd_resp_send(req, body, n);
+}
+
+static httpd_err_t h_defer_upload(httpd_req_t* req) {
+    return httpd_req_defer(req, defer_body, defer_done);
+}
+
+static void register_defer(httpd_handle_t h) {
+    register_all(h);
+    httpd_route_t r = { HTTP_POST, "/up", h_defer_upload, NULL };
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_route(h, &r));
+}
+
+// A paused deferred upload resumed from another task: its read fd must be
+// re-armed promptly, not at the next select timeout.
+static void test_live_wake_defer_resume_latency(void) {
+    s_defer_paused = xSemaphoreCreateBinary();
+    s_defer_req = NULL;
+    s_defer_bytes = 0;
+    live_start(register_defer);
+    int fd = cli_connect();
+    cli_send_str(fd, "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 8192\r\n\r\n");
+    vTaskDelay(pdMS_TO_TICKS(50));
+    uint8_t* body = calloc(1, 4096);
+    TEST_ASSERT_NOT_NULL(body);
+    cli_send(fd, body, 4096);
+    TEST_ASSERT_EQUAL(pdTRUE, xSemaphoreTake(s_defer_paused, pdMS_TO_TICKS(2000)));
+    cli_send(fd, body, 4096);       // sits in the socket while paused
+    free(body);
+    vTaskDelay(pdMS_TO_TICKS(50));  // loop parked in select() without our fd
+
+    int64_t t0 = esp_timer_get_time();
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_req_defer_resume(s_defer_req));
+    expect_str(fd, "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\ndone:0:8192");
+    int64_t ms = (esp_timer_get_time() - t0) / 1000 - 100;  // minus expect_str's 100 ms extra-bytes wait
+    printf("LATENCY defer resume -> response in %" PRId64 " ms\n", ms);
+    TEST_ASSERT_TRUE_MESSAGE(ms < WAKE_LATENCY_MAX_MS, "resume waited for the select timeout");
+
+    close(fd);
+    live_stop();
+    vSemaphoreDelete(s_defer_paused);
+}
+
+// httpd_stop's event_loop_stop from another task: the loop notices promptly
+static void test_live_wake_stop_latency(void) {
+    live_start(register_all);
+    vTaskDelay(pdMS_TO_TICKS(50));  // loop parked in select()
+    int64_t ms = live_stop();
+    printf("LATENCY loop stop noticed in %" PRId64 " ms\n", ms);
+    TEST_ASSERT_TRUE_MESSAGE(ms < WAKE_LATENCY_MAX_MS, "stop waited for the select timeout");
+}
+
 void test_live_loopback_run(void) {
     ESP_LOGI(TAG, "Running live loopback golden tests");
     RUN_TEST(test_live_golden_basic_responses);
@@ -857,4 +966,7 @@ void test_live_loopback_run(void) {
     RUN_TEST(test_live_golden_filesystem_max_open);
     RUN_TEST(test_live_golden_websocket);
     RUN_TEST(test_live_ws_cross_task_send_ordering);
+    RUN_TEST(test_live_wake_ws_queued_send_latency);
+    RUN_TEST(test_live_wake_defer_resume_latency);
+    RUN_TEST(test_live_wake_stop_latency);
 }

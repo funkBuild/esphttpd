@@ -625,6 +625,21 @@ static SemaphoreHandle_t s_send_mutex = NULL;
 #define SEND_UNLOCK() do { } while (0)
 #endif
 
+// Cross-task producers (app tasks calling the WebSocket send APIs or
+// resuming a deferred upload) change what the event loop has to select on.
+// The loop only rebuilds its fd sets when select() returns, so nudge it —
+// otherwise queued bytes / a resumed read side wait up to one select timeout.
+// event_loop_wake is coalesced and a no-op on the loop task itself; only
+// bytes left queued (write interest needed) warrant a wake after a send.
+static void wake_loop_if_write_pending(void) {
+#ifndef CONFIG_HTTPD_USE_RAW_API
+    struct httpd_server* server = g_server;
+    if (server && connection_mask_load(&server->connection_pool.write_pending_mask) != 0) {
+        event_loop_wake(&server->event_loop);
+    }
+#endif
+}
+
 // Drain send buffer - sends as much buffered data as possible
 // Returns true if buffer is now empty, false if more data pending
 static bool drain_send_buffer(connection_t* conn) {
@@ -3249,6 +3264,8 @@ httpd_err_t httpd_req_defer_resume(httpd_req_t* req) {
 
     ctx->defer.paused = false;
     conn->defer_paused = 0;
+    // Re-arm the read side now, not at the next select timeout
+    if (g_server) event_loop_wake(&g_server->event_loop);
     ESP_LOGD(TAG, "Deferred request resumed");
     return HTTPD_OK;
 }
@@ -3534,6 +3551,7 @@ httpd_err_t httpd_ws_send(httpd_ws_t* ws, const void* data, size_t len, ws_type_
         return HTTPD_ERR_IO;
     }
 
+    wake_loop_if_write_pending();
     return HTTPD_OK;
 }
 
@@ -3591,6 +3609,7 @@ int httpd_ws_broadcast(httpd_handle_t handle, const char* pattern,
 #endif
     SEND_UNLOCK();
 
+    wake_loop_if_write_pending();
     return sent;
 }
 
@@ -3648,6 +3667,7 @@ httpd_err_t httpd_ws_close(httpd_ws_t* ws, uint16_t code, const char* reason) {
 #endif
     SEND_UNLOCK();
 
+    wake_loop_if_write_pending();
     return HTTPD_OK;
 }
 
@@ -3860,6 +3880,7 @@ int httpd_ws_publish(httpd_handle_t handle, const char* channel,
 #endif
     SEND_UNLOCK();
 
+    wake_loop_if_write_pending();
     return sent;
 }
 
