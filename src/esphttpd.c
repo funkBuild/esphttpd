@@ -360,16 +360,33 @@ typedef struct {
     uint8_t route_index;                  // Index into ws_routes[] for O(1) broadcast filter
 } ws_context_t;
 
-// Per-connection contexts (pointer arrays into pre-allocated backing storage)
-static request_context_t* request_contexts[MAX_CONNECTIONS];
-static ws_context_t* ws_contexts[MAX_CONNECTIONS];
-static send_buffer_t* connection_send_buffers[MAX_CONNECTIONS];
+// Everything a connection slot owns, in ONE allocation made at httpd_start
+// and freed at httpd_stop (no per-connect/disconnect malloc/free, no heap
+// fragmentation; one allocation instead of three).
+typedef struct {
+    request_context_t req;
+    ws_context_t ws;
+    send_buffer_t sb;
+} conn_slot_t;
+static EXT_RAM_BSS_ATTR conn_slot_t* s_conn_slots;
 
-// Pre-allocated backing arrays (allocated once at httpd_start, freed at httpd_stop)
-// Eliminates per-connect/disconnect malloc/free and prevents heap fragmentation
-static request_context_t* preallocated_request_contexts;
-static ws_context_t* preallocated_ws_contexts;
-static send_buffer_t* preallocated_send_buffers;
+// Per-connection lookup tables (pointers into s_conn_slots; NULL while the
+// server is stopped). In PSRAM .bss: 3 x MAX_CONNECTIONS pointers of scarce
+// internal DRAM otherwise. Kept as tables because test builds swap entries
+// (g_test_request_contexts / g_test_send_buffers).
+static EXT_RAM_BSS_ATTR request_context_t* request_contexts[MAX_CONNECTIONS];
+static EXT_RAM_BSS_ATTR ws_context_t* ws_contexts[MAX_CONNECTIONS];
+static EXT_RAM_BSS_ATTR send_buffer_t* connection_send_buffers[MAX_CONNECTIONS];
+
+// Release the slot allocation and clear the lookup tables (httpd_start
+// rollback and httpd_stop, after any per-slot sub-buffers were freed)
+static void conn_slots_release(void) {
+    free(s_conn_slots);
+    s_conn_slots = NULL;
+    memset(request_contexts, 0, sizeof(request_contexts));
+    memset(ws_contexts, 0, sizeof(ws_contexts));
+    memset(connection_send_buffers, 0, sizeof(connection_send_buffers));
+}
 
 // Global server instance (for now - could be made multi-instance later)
 static EXT_RAM_BSS_ATTR struct httpd_server server_instance;
@@ -1524,28 +1541,18 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
     }
 #endif
 
-    // Pre-allocate per-connection context arrays (one contiguous block each)
-    // This eliminates malloc/free on every connect/disconnect and prevents heap fragmentation
-    preallocated_request_contexts = (request_context_t*)calloc(MAX_CONNECTIONS, sizeof(request_context_t));
-    preallocated_ws_contexts = (ws_context_t*)calloc(MAX_CONNECTIONS, sizeof(ws_context_t));
-    preallocated_send_buffers = (send_buffer_t*)calloc(MAX_CONNECTIONS, sizeof(send_buffer_t));
-
-    if (!preallocated_request_contexts || !preallocated_ws_contexts || !preallocated_send_buffers) {
+    // Pre-allocate every connection slot's contexts in one block
+    s_conn_slots = (conn_slot_t*)calloc(MAX_CONNECTIONS, sizeof(conn_slot_t));
+    if (!s_conn_slots) {
         ESP_LOGE(TAG, "Failed to pre-allocate per-connection contexts");
-        free(preallocated_request_contexts);
-        free(preallocated_ws_contexts);
-        free(preallocated_send_buffers);
-        preallocated_request_contexts = NULL;
-        preallocated_ws_contexts = NULL;
-        preallocated_send_buffers = NULL;
         return HTTPD_ERR_NO_MEM;
     }
 
-    // Point pointer arrays at pre-allocated backing storage and initialize send buffers
+    // Point the lookup tables at the slots and initialize send buffers
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        request_contexts[i] = &preallocated_request_contexts[i];
-        ws_contexts[i] = &preallocated_ws_contexts[i];
-        connection_send_buffers[i] = &preallocated_send_buffers[i];
+        request_contexts[i] = &s_conn_slots[i].req;
+        ws_contexts[i] = &s_conn_slots[i].ws;
+        connection_send_buffers[i] = &s_conn_slots[i].sb;
         send_buffer_init(connection_send_buffers[i]);
     }
 
@@ -1556,15 +1563,7 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
     server->legacy_routes = radix_tree_create();
     if (!server->legacy_routes) {
         ESP_LOGE(TAG, "Failed to create legacy routes radix tree");
-        free(preallocated_request_contexts);
-        free(preallocated_ws_contexts);
-        free(preallocated_send_buffers);
-        preallocated_request_contexts = NULL;
-        preallocated_ws_contexts = NULL;
-        preallocated_send_buffers = NULL;
-        memset(request_contexts, 0, sizeof(request_contexts));
-        memset(ws_contexts, 0, sizeof(ws_contexts));
-        memset(connection_send_buffers, 0, sizeof(connection_send_buffers));
+        conn_slots_release();
         return HTTPD_ERR_NO_MEM;
     }
 
@@ -1625,15 +1624,7 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
         radix_tree_destroy(server->legacy_routes);
         server->legacy_routes = NULL;
         server->middleware_count = 0;
-        free(preallocated_request_contexts);
-        free(preallocated_ws_contexts);
-        free(preallocated_send_buffers);
-        preallocated_request_contexts = NULL;
-        preallocated_ws_contexts = NULL;
-        preallocated_send_buffers = NULL;
-        memset(request_contexts, 0, sizeof(request_contexts));
-        memset(ws_contexts, 0, sizeof(ws_contexts));
-        memset(connection_send_buffers, 0, sizeof(connection_send_buffers));
+        conn_slots_release();
         return HTTPD_ERR_IO;
     }
     server->running = true;
@@ -1655,15 +1646,7 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
         radix_tree_destroy(server->legacy_routes);
         server->legacy_routes = NULL;
         server->middleware_count = 0;
-        free(preallocated_request_contexts);
-        free(preallocated_ws_contexts);
-        free(preallocated_send_buffers);
-        preallocated_request_contexts = NULL;
-        preallocated_ws_contexts = NULL;
-        preallocated_send_buffers = NULL;
-        memset(request_contexts, 0, sizeof(request_contexts));
-        memset(ws_contexts, 0, sizeof(ws_contexts));
-        memset(connection_send_buffers, 0, sizeof(connection_send_buffers));
+        conn_slots_release();
         return HTTPD_ERR_NO_MEM;
     }
 #endif
@@ -1816,13 +1799,8 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
         }
     }
 
-    // Free pre-allocated backing arrays
-    free(preallocated_request_contexts);
-    preallocated_request_contexts = NULL;
-    free(preallocated_ws_contexts);
-    preallocated_ws_contexts = NULL;
-    free(preallocated_send_buffers);
-    preallocated_send_buffers = NULL;
+    // Free the slot allocation (per-slot pointers were NULLed above)
+    conn_slots_release();
 
     server->initialized = false;
     server->running = false;
