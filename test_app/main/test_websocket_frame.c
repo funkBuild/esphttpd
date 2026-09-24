@@ -534,6 +534,37 @@ static void test_mask_payload_small_lengths(void)
     }
 }
 
+// Every buffer alignment x mask phase x length (including the long runs the
+// word-wise path covers) matches a plain byte-by-byte XOR. Received frames
+// put the payload at any alignment (a 2+4-byte header leaves it 2 bytes off
+// a word boundary), and a payload split across recv calls resumes at any
+// mask phase (offset).
+static void test_mask_payload_matches_bytewise_any_alignment(void)
+{
+    static const uint32_t keys[] = { 0x04030201u, 0xa55a0ff0u };
+    static uint8_t buf[1100], ref[1100];
+    static const size_t lens[] = { 0, 1, 2, 3, 4, 5, 7, 8, 9, 11, 12, 15, 16, 17, 31, 64, 125, 1027 };
+    for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+        const uint8_t* mb = (const uint8_t*)&keys[k];
+        for (size_t align = 0; align < 4; align++) {
+            for (size_t offset = 0; offset < 8; offset++) {
+                for (size_t li = 0; li < sizeof(lens) / sizeof(lens[0]); li++) {
+                    size_t len = lens[li];
+                    for (size_t i = 0; i < sizeof(buf); i++) {
+                        buf[i] = ref[i] = (uint8_t)(i * 31 + 7);
+                    }
+                    for (size_t i = 0; i < len; i++) {
+                        ref[align + i] ^= mb[(offset + i) & 3];
+                    }
+                    ws_mask_payload(buf + align, len, keys[k], offset);
+                    // Bytes outside [align, align+len) untouched as well
+                    TEST_ASSERT_EQUAL_MEMORY(ref, buf, sizeof(buf));
+                }
+            }
+        }
+    }
+}
+
 // Test mask_payload with offsets 0, 1, 2, 3
 static void test_mask_payload_all_offsets(void)
 {
@@ -1470,6 +1501,7 @@ void test_websocket_frame_run(void)
     RUN_TEST(test_mask_payload_single_byte);
     RUN_TEST(test_mask_payload_small_lengths);
     RUN_TEST(test_mask_payload_all_offsets);
+    RUN_TEST(test_mask_payload_matches_bytewise_any_alignment);
     RUN_TEST(test_mask_payload_large);
     RUN_TEST(test_mask_payload_misaligned_ptr);
     RUN_TEST(test_mask_payload_offset_boundary);
