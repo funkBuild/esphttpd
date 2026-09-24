@@ -168,6 +168,8 @@ static void ram_vfs_register_once(void) {
 static httpd_handle_t s_handle;
 static TaskHandle_t s_loop_task;
 static volatile bool s_loop_exited;
+static volatile int64_t s_loop_exit_us;   // when event_loop_run returned
+static int64_t s_last_stop_us;            // stop request -> loop exit, us
 static uint16_t s_port = 18080;
 
 static esphttpd_server_t* srv(void) { return (esphttpd_server_t*)g_server; }
@@ -175,6 +177,7 @@ static esphttpd_server_t* srv(void) { return (esphttpd_server_t*)g_server; }
 static void live_loop_task(void* arg) {
     (void)arg;
     event_loop_run(&srv()->event_loop, &srv()->handlers);
+    s_loop_exit_us = esp_timer_get_time();
     s_loop_exited = true;
     vTaskDelete(NULL);
 }
@@ -217,6 +220,7 @@ static int64_t live_stop_quiet(void) {
     }
     int64_t stop_ms = (esp_timer_get_time() - t0) / 1000;
     if (!s_loop_exited) return -2;
+    s_last_stop_us = s_loop_exit_us - t0;
     // Test mode httpd_stop does not close connection fds: remember them
     int fds[MAX_CONNECTIONS];
     int nfds = 0;
@@ -855,35 +859,62 @@ static void test_live_ws_cross_task_send_ordering(void) {
 // the event loop's 1 s select() timeout to be noticed
 // ============================================================================
 
-#define WAKE_LATENCY_MAX_MS 500  // pre-fix: ~850-1000 ms (select timeout); headroom for loaded CI hosts
+// Pre-fix every one of these waited for the loop's 1 s select() timeout
+// (measured 850-1010 ms). The bounds sit well below that but leave headroom
+// for a loaded host: the per-sample bound is half the select timeout, and
+// the repeated tests also bound the MEDIAN tightly (load-tolerant: one
+// descheduled sample cannot fail the run, a missing wake always would).
+#define WAKE_LATENCY_MAX_MS 500
+
+static int cmp_i64(const void* a, const void* b) {
+    int64_t x = *(const int64_t*)a, y = *(const int64_t*)b;
+    return (x > y) - (x < y);
+}
+
+// Sorts samples in place, prints min/median/p90/max (us), returns the median
+static int64_t report_us(const char* what, int64_t* us, int n) {
+    qsort(us, (size_t)n, sizeof(us[0]), cmp_i64);
+    int64_t med = us[n / 2];
+    printf("LATENCY %s over %d samples (us): min %" PRId64 " median %" PRId64
+           " p90 %" PRId64 " max %" PRId64 "\n",
+           what, n, us[0], med, us[(n * 9) / 10], us[n - 1]);
+    return med;
+}
 
 // Slow reader: an app-task WebSocket send overflows the socket and queues.
 // The loop, idle in select() with no write interest, must pick the queued
-// bytes up promptly once the client starts reading.
+// bytes up promptly once the client starts reading. The figure includes
+// moving 24 KB through lwIP loopback TCP under QEMU (the dominant part).
+#define WS_DRAIN_SAMPLES 8
 static void test_live_wake_ws_queued_send_latency(void) {
     live_start(register_all);
     int fd = ws_open();
-    vTaskDelay(pdMS_TO_TICKS(50));  // loop is now parked in select()
 
     const size_t len = 24000;
     uint8_t* payload = malloc(len);
-    TEST_ASSERT_NOT_NULL(payload);
-    for (size_t i = 0; i < len; i++) payload[i] = (uint8_t)(i * 13);
-    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_ws_send(s_ws, payload, len, WS_TYPE_BINARY));
-    int64_t t0 = esp_timer_get_time();
-
     uint8_t* got = malloc(len);
+    TEST_ASSERT_NOT_NULL(payload);
     TEST_ASSERT_NOT_NULL(got);
-    uint8_t op;
-    int n = ws_read_server_frame(fd, &op, got, len);
-    int64_t ms = (esp_timer_get_time() - t0) / 1000;
-    TEST_ASSERT_EQUAL_INT((int)len, n);
-    TEST_ASSERT_EQUAL_UINT8(0x2, op);
-    TEST_ASSERT_EQUAL_MEMORY(payload, got, len);
+    for (size_t i = 0; i < len; i++) payload[i] = (uint8_t)(i * 13);
+    int64_t us[WS_DRAIN_SAMPLES];
+    for (int k = 0; k < WS_DRAIN_SAMPLES; k++) {
+        vTaskDelay(pdMS_TO_TICKS(50));  // loop is now parked in select()
+        payload[0] = (uint8_t)k;
+        TEST_ASSERT_EQUAL(HTTPD_OK, httpd_ws_send(s_ws, payload, len, WS_TYPE_BINARY));
+        int64_t t0 = esp_timer_get_time();
+        uint8_t op;
+        int n = ws_read_server_frame(fd, &op, got, len);
+        us[k] = esp_timer_get_time() - t0;
+        TEST_ASSERT_EQUAL_INT((int)len, n);
+        TEST_ASSERT_EQUAL_UINT8(0x2, op);
+        TEST_ASSERT_EQUAL_MEMORY(payload, got, len);
+    }
     free(payload);
     free(got);
-    printf("LATENCY queued ws send drained in %" PRId64 " ms\n", ms);
-    TEST_ASSERT_TRUE_MESSAGE(ms < WAKE_LATENCY_MAX_MS, "queued WS bytes waited for the select timeout");
+    int64_t med = report_us("queued 24 KB ws send drained", us, WS_DRAIN_SAMPLES);
+    TEST_ASSERT_TRUE_MESSAGE(us[WS_DRAIN_SAMPLES - 1] < WAKE_LATENCY_MAX_MS * 1000,
+                             "queued WS bytes waited for the select timeout");
+    TEST_ASSERT_TRUE_MESSAGE(med < 150 * 1000, "queued WS drain median too slow");
 
     close(fd);
     live_stop();
@@ -950,13 +981,22 @@ static void test_live_wake_defer_resume_latency(void) {
     vSemaphoreDelete(s_defer_paused);
 }
 
-// httpd_stop's event_loop_stop from another task: the loop notices promptly
+// httpd_stop's event_loop_stop from another task: the loop notices promptly.
+// This is the pure wake-pair round trip (wake datagram -> select returns ->
+// loop exits), timed from the stop request to event_loop_run returning.
+#define STOP_SAMPLES 15
 static void test_live_wake_stop_latency(void) {
-    live_start(register_all);
-    vTaskDelay(pdMS_TO_TICKS(50));  // loop parked in select()
-    int64_t ms = live_stop();
-    printf("LATENCY loop stop noticed in %" PRId64 " ms\n", ms);
-    TEST_ASSERT_TRUE_MESSAGE(ms < WAKE_LATENCY_MAX_MS, "stop waited for the select timeout");
+    int64_t us[STOP_SAMPLES];
+    for (int k = 0; k < STOP_SAMPLES; k++) {
+        live_start(register_all);
+        vTaskDelay(pdMS_TO_TICKS(30));  // loop parked in select()
+        live_stop();
+        us[k] = s_last_stop_us;
+    }
+    int64_t med = report_us("loop stop (wake round trip)", us, STOP_SAMPLES);
+    TEST_ASSERT_TRUE_MESSAGE(us[STOP_SAMPLES - 1] < WAKE_LATENCY_MAX_MS * 1000,
+                             "stop waited for the select timeout");
+    TEST_ASSERT_TRUE_MESSAGE(med < 20 * 1000, "wake round-trip median too slow");
 }
 
 // ============================================================================
