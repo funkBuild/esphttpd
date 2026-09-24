@@ -672,6 +672,74 @@ static bool drain_send_buffer(connection_t* conn) {
     return !send_buffer_has_data(sb);
 }
 
+// Queue [p0][p1] (either part may be empty) behind whatever is already
+// pending on the connection, preserving order - the shared tail of the
+// single- and two-buffer send paths:
+//  - a pending memory stream means BOTH parts append behind it via ONE
+//    send_buffer_start_mem2 call, which checks the backlog cap once for the
+//    combined length BEFORE copying anything (a cap rejection can never
+//    leave p0 queued without p1 - a torn response);
+//  - otherwise the parts fill the ring in chunks, draining to the socket
+//    between fills; when ring and socket are both full, the ordered
+//    remainder (tail of p0 + all of p1, or tail of p1) moves to a memory
+//    stream in one atomic call (a fresh stream is uncapped: see
+//    send_buffer_start_mem2). on_write_ready drains it as the window opens.
+// Marks the connection write-pending. Returns false on failure.
+static bool queue_send_residue(connection_t* conn, send_buffer_t* sb,
+                               const uint8_t* p0, size_t r0,
+                               const uint8_t* p1, size_t r1) {
+    if (!sb->allocated && !send_buffer_alloc(sb)) {
+        ESP_LOGE(TAG, "Failed to allocate send buffer");
+        return false;
+    }
+
+    if (send_buffer_is_mem_streaming(sb)) {
+        if (!send_buffer_start_mem2(sb, p0, r0, p1, r1)) {
+            ESP_LOGE(TAG, "Failed to append %zu+%zu bytes to memory stream", r0, r1);
+            return false;
+        }
+        connection_mark_write_pending(&g_server->connection_pool, conn->pool_index, true);
+        return true;
+    }
+
+    const uint8_t* part[2] = { p0, p1 };
+    size_t part_len[2] = { r0, r1 };
+    for (int i = 0; i < 2; i++) {
+        while (part_len[i] > 0) {
+            size_t space = send_buffer_space(sb);
+            if (space == 0) {
+                // Buffer full - drain to socket to make room
+                drain_send_buffer(conn);
+                space = send_buffer_space(sb);
+                if (space == 0) {
+                    // Socket also full - defer the ordered remainder to the
+                    // memory stream atomically
+                    const uint8_t* rest = (i == 0) ? part[1] : NULL;
+                    size_t rest_len = (i == 0) ? part_len[1] : 0;
+                    if (!send_buffer_start_mem2(sb, part[i], part_len[i], rest, rest_len)) {
+                        ESP_LOGE(TAG, "Send buffer full and mem stream alloc failed (%zu bytes)",
+                                 part_len[i] + rest_len);
+                        return false;
+                    }
+                    ESP_LOGD(TAG, "Deferred %zu bytes to memory stream for conn [%d]",
+                             part_len[i] + rest_len, conn->pool_index);
+                    goto queued;
+                }
+            }
+            size_t to_queue = (part_len[i] <= space) ? part_len[i] : space;
+            if (send_buffer_queue(sb, part[i], to_queue) < 0) {
+                return false;
+            }
+            part[i] += to_queue;
+            part_len[i] -= to_queue;
+        }
+    }
+
+queued:
+    connection_mark_write_pending(&g_server->connection_pool, conn->pool_index, true);
+    return true;
+}
+
 // Non-blocking send - tries to send data, queues remainder if socket/tcp buffer would block
 // Returns number of bytes sent/queued, or -1 on error
 static ssize_t send_nonblocking_impl(connection_t* __restrict conn, const void* __restrict data, size_t len, int flags) {
@@ -731,58 +799,9 @@ static ssize_t send_nonblocking_impl(connection_t* __restrict conn, const void* 
     return (ssize_t)len;
 
 queue_data:
-    // Ensure we have a buffer allocated
-    if (!sb->allocated) {
-        if (!send_buffer_alloc(sb)) {
-            ESP_LOGE(TAG, "Failed to allocate send buffer");
-            return -1;
-        }
+    if (!queue_send_residue(conn, sb, ptr, remaining, NULL, 0)) {
+        return -1;
     }
-
-    // If a memory stream is already pending, new bytes must queue behind it.
-    // The ring drains to the socket before on_write_ready refills it from the
-    // stream, so queueing into the ring here would reorder the response.
-    if (send_buffer_is_mem_streaming(sb)) {
-        if (!send_buffer_start_mem(sb, ptr, remaining)) {
-            ESP_LOGE(TAG, "Failed to append %zu bytes to memory stream", remaining);
-            return -1;
-        }
-        connection_mark_write_pending(&g_server->connection_pool, conn->pool_index, true);
-        return (ssize_t)len;
-    }
-
-    // Queue data in chunks when remaining exceeds buffer capacity.
-    // Between chunks, drain the buffer to the socket to free space.
-    while (remaining > 0) {
-        size_t space = send_buffer_space(sb);
-        if (space == 0) {
-            // Buffer full - drain to socket to make room
-            drain_send_buffer(conn);
-            space = send_buffer_space(sb);
-            if (space == 0) {
-                // Socket also full - fall back to async memory streaming.
-                // Copies remaining data to heap so on_write_ready can drain
-                // it incrementally as the TCP window opens.
-                if (!send_buffer_start_mem(sb, ptr, remaining)) {
-                    ESP_LOGE(TAG, "Send buffer full and mem stream alloc failed (%zu bytes)", remaining);
-                    return -1;
-                }
-                ESP_LOGD(TAG, "Deferred %zu bytes to memory stream for conn [%d]",
-                         remaining, conn->pool_index);
-                break;
-            }
-        }
-        size_t to_queue = (remaining <= space) ? remaining : space;
-        if (send_buffer_queue(sb, ptr, to_queue) < 0) {
-            return -1;
-        }
-        ptr += to_queue;
-        remaining -= to_queue;
-    }
-
-    // Mark connection as having pending writes
-    connection_mark_write_pending(&g_server->connection_pool, conn->pool_index, true);
-
     return (ssize_t)len;
 }
 
@@ -905,73 +924,9 @@ static ssize_t send_nonblocking2_impl(connection_t* conn,
     return (ssize_t)(len0 + len1);
 
 queue_data:
-    // Ensure we have a buffer allocated
-    if (!sb->allocated) {
-        if (!send_buffer_alloc(sb)) {
-            ESP_LOGE(TAG, "Failed to allocate send buffer");
-            return -1;
-        }
+    if (!queue_send_residue(conn, sb, p0, r0, p1, r1)) {
+        return -1;
     }
-
-    // A pending memory stream means BOTH residues must append behind it, in
-    // order, via ONE atomic call: send_buffer_start_mem2 checks the pending
-    // cap once for len0+len1 BEFORE copying anything, so a cap rejection can
-    // never leave buf0 queued without buf1 (a torn response).
-    if (send_buffer_is_mem_streaming(sb)) {
-        if (!send_buffer_start_mem2(sb, p0, r0, p1, r1)) {
-            ESP_LOGE(TAG, "Failed to append %zu+%zu bytes to memory stream", r0, r1);
-            return -1;
-        }
-        connection_mark_write_pending(&g_server->connection_pool, conn->pool_index, true);
-        return (ssize_t)(len0 + len1);
-    }
-
-    // Queue buf0 then buf1 through the ring in chunks, draining between
-    // fills. When socket and ring are both full, the ordered remainder of
-    // both buffers moves to the memory stream in ONE atomic call. In this
-    // branch no stream exists yet, so send_buffer_start_mem2's fresh-stream
-    // allocation is uncapped — identical semantics to the single-buffer path.
-    {
-        const uint8_t* part[2] = { p0, p1 };
-        size_t part_len[2] = { r0, r1 };
-        for (int i = 0; i < 2; i++) {
-            while (part_len[i] > 0) {
-                size_t space = send_buffer_space(sb);
-                if (space == 0) {
-                    // Buffer full - drain to socket to make room
-                    drain_send_buffer(conn);
-                    space = send_buffer_space(sb);
-                    if (space == 0) {
-                        // Socket also full - defer the ordered remainder
-                        // (tail of buf0 + all of buf1, or tail of buf1)
-                        // to the memory stream atomically.
-                        if (!send_buffer_start_mem2(sb, part[i], part_len[i],
-                                                    (i == 0) ? part[1] : NULL,
-                                                    (i == 0) ? part_len[1] : 0)) {
-                            ESP_LOGE(TAG, "Send buffer full and mem stream alloc failed (%zu bytes)",
-                                     part_len[i] + ((i == 0) ? part_len[1] : 0));
-                            return -1;
-                        }
-                        ESP_LOGD(TAG, "Deferred %zu bytes to memory stream for conn [%d]",
-                                 part_len[i] + ((i == 0) ? part_len[1] : 0), conn->pool_index);
-                        goto queued;
-                    }
-                }
-                size_t to_queue = (part_len[i] <= space) ? part_len[i] : space;
-                if (send_buffer_queue(sb, part[i], to_queue) < 0) {
-                    return -1;
-                }
-                part[i] += to_queue;
-                part_len[i] -= to_queue;
-            }
-        }
-    }
-
-queued:
-    // Mark connection as having pending writes (same bookkeeping as the
-    // single-buffer path — there are no other counters on this path)
-    connection_mark_write_pending(&g_server->connection_pool, conn->pool_index, true);
-
     return (ssize_t)(len0 + len1);
 #endif // CONFIG_HTTPD_USE_RAW_API
 }
