@@ -1111,7 +1111,7 @@ static httpd_err_t hdr_mig_handler(httpd_req_t* req) {
     return HTTPD_OK;
 }
 
-// Multi-packet headers force the inline(512B)->heap migration of recv_buf.
+// Multi-packet headers force the inline->heap migration of recv_buf.
 // Offsets indexed BEFORE the migration must resolve correctly against the
 // final heap base (contents move as a block), a value split across the two
 // packets must reassemble, and the oversized heap buffer must be shrunk to
@@ -1136,12 +1136,13 @@ static void test_req_get_header_survives_recv_buf_migration(void) {
         "X-Early: before-move\r\n"
         "X-Split: part1";
 
-    // Chunk 2: completes X-Split, then a 400-byte value to push the total
-    // past the 512-byte inline buffer (forces malloc + memcpy + rebase)
-    char chunk2[600];
+    // Chunk 2: completes X-Split, then a value long enough to push the total
+    // past the inline buffer (forces malloc + memcpy + rebase)
+    enum { FILL = sizeof(((test_request_context_t*)0)->inline_recv_buf) - 112 };
+    char chunk2[FILL + 200];
     int n = snprintf(chunk2, sizeof(chunk2), "part2\r\nX-Fill: ");
-    memset(chunk2 + n, 'b', 400);
-    n += 400;
+    memset(chunk2 + n, 'b', FILL);
+    n += FILL;
     n += snprintf(chunk2 + n, sizeof(chunk2) - n,
                   "\r\nX-Late: after-move\r\nConnection: keep-alive\r\n\r\n");
     TEST_ASSERT_TRUE(n > 0 && n < (int)sizeof(chunk2));
@@ -1157,7 +1158,7 @@ static void test_req_get_header_survives_recv_buf_migration(void) {
     // Value split across the two packets reassembles
     TEST_ASSERT_EQUAL_STRING("part1part2", hdr_mig_split);
     TEST_ASSERT_EQUAL_STRING("after-move", hdr_mig_late);
-    TEST_ASSERT_EQUAL(400, hdr_mig_fill_len);
+    TEST_ASSERT_EQUAL(FILL, hdr_mig_fill_len);
     TEST_ASSERT_EQUAL('b', hdr_mig_fill_first);
     TEST_ASSERT_EQUAL('b', hdr_mig_fill_last);
 

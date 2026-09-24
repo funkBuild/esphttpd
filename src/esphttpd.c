@@ -352,7 +352,7 @@ typedef struct {
                                           // pinned_header_names once headers[] is full
     uint8_t resp_hdr_buf[512];            // Staged response headers (accessed up to resp_hdr_len);
                                           // transmitted with the status line when the response starts
-    uint8_t inline_recv_buf[512];         // Embedded buffer for single-packet requests
+    uint8_t inline_recv_buf[1024];        // Embedded buffer for single-packet requests
     char inline_uri_buf[64];              // Embedded buffer for typical URI lengths (heap fallback for longer)
     query_param_entry_t query_params[MAX_QUERY_PARAMS];  // Lazy parsed (accessed up to query_param_count)
     httpd_middleware_t mw_chain[CONFIG_HTTPD_MAX_TOTAL_MIDDLEWARE];  // Accessed up to middleware count

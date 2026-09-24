@@ -190,7 +190,7 @@ typedef struct {
     test_req_header_entry_t headers[MAX_REQ_HEADERS];  // Header index
     test_req_header_entry_t pinned_headers[8];  // Overflow index (MAX_PINNED_HEADERS)
     uint8_t resp_hdr_buf[512];            // Staged response headers (must match esphttpd.c)
-    uint8_t inline_recv_buf[512];         // Embedded buffer for single-packet requests
+    uint8_t inline_recv_buf[1024];        // Embedded buffer for single-packet requests
     char inline_uri_buf[64];             // Embedded buffer for typical URI lengths
     test_query_param_entry_t query_params[MAX_QUERY_PARAMS];
     // Middleware chain (persists for request lifetime, safe across deferred handlers)
