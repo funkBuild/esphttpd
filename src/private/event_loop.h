@@ -30,6 +30,8 @@ typedef struct {
 #endif
     uint16_t ws_close_timeout_ms;       // WebSocket close handshake timeout (0 = default 5s)
     uint16_t header_timeout_ms;         // Deadline to complete request headers (0 = default 10s)
+    uint16_t body_timeout_ms;           // Request-body progress window (0 = default 10s)
+    uint16_t body_min_bytes;            // Body bytes required per window (0 = default 4096)
     bool nodelay;                   // TCP_NODELAY option
     bool reuseaddr;                 // SO_REUSEADDR option
 } event_loop_config_t;
@@ -47,6 +49,8 @@ typedef struct {
     uint32_t timeout_ticks;         // Precomputed timeout in ticks
     uint32_t ws_close_timeout_ticks; // Precomputed WS close handshake timeout in ticks
     uint32_t header_timeout_ticks;  // Precomputed request-header deadline in ticks
+    uint32_t body_timeout_ticks;    // Precomputed body-progress window in ticks
+    uint32_t last_check_tick;       // tick_count at the previous timeout scan
     int64_t last_tick_us;           // Wall-clock time of the last tick advance (µs)
 #ifndef CONFIG_HTTPD_USE_RAW_API
     struct timeval select_timeout;  // Precomputed select timeout struct

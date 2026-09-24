@@ -600,6 +600,210 @@ static void test_header_deadline_closes_trickling_request(void) {
     TEST_ASSERT_EQUAL(CONN_STATE_HTTP_HEADERS, slow->state);
 }
 
+// M-3 slow-body slot exhaustion: the idle timeout is refreshed by every
+// received byte and the header deadline stops at the blank line, so a client
+// that sends "Content-Length: 1000000000" and then one body byte every 25 s
+// (inside the 30 s idle timeout) held its slot forever. Sixteen such clients
+// occupy every slot, and none of them is evictable (they are mid-request).
+// The body must make minimum progress per window or the connection is closed.
+static void test_body_trickle_is_reaped(void) {
+    event_loop_t loop = {0};
+    connection_pool_t pool = {0};
+    event_loop_config_t config = {
+        .timeout_ms = 30000,
+        .select_timeout_ms = 1000,
+        .io_buffer_size = 1024,
+    };
+    event_loop_init(&loop, &pool, &config);
+
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        connection_t* c = &pool.connections[i];
+        c->fd = -1;
+        c->pool_index = i;
+        c->state = CONN_STATE_HTTP_BODY;  // headers done, body outstanding
+        c->content_length = 1000000000U;
+        c->bytes_received = 0;
+        c->last_activity = 0;
+        connection_mark_active(&pool, i);
+    }
+    // Pool full of mid-body connections: a newcomer has nothing to evict
+    TEST_ASSERT_EQUAL(-1, event_loop_evict_idle(&loop, NULL));
+
+    // Five minutes, one tick at a time; one byte per client every 25 ticks
+    for (uint32_t t = 1; t <= 300; t++) {
+        loop.tick_count = t;
+        if (t % 25 == 0) {
+            for (int i = 0; i < MAX_CONNECTIONS; i++) {
+                connection_t* c = &pool.connections[i];
+                if (c->state != CONN_STATE_HTTP_BODY) continue;
+                c->bytes_received += 1;
+                c->last_activity = t;  // what handle_connection_data does
+            }
+        }
+        event_loop_check_timeouts(&loop);
+    }
+
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        TEST_ASSERT_EQUAL_MESSAGE(CONN_STATE_CLOSED, pool.connections[i].state,
+                                  "trickling body held its slot");
+    }
+}
+
+// The slow-body deadline is a minimum rate, not a total deadline: a large
+// upload that keeps delivering at least body_min_bytes per window survives
+// far past every other timeout, and the last window only needs the remainder.
+static void test_body_progressing_upload_survives(void) {
+    event_loop_t loop = {0};
+    connection_pool_t pool = {0};
+    event_loop_config_t config = {
+        .timeout_ms = 30000,
+        .select_timeout_ms = 1000,
+        .io_buffer_size = 1024,
+    };
+    event_loop_init(&loop, &pool, &config);
+    TEST_ASSERT_EQUAL(10, loop.body_timeout_ticks);
+    TEST_ASSERT_EQUAL(4096, loop.config.body_min_bytes);
+
+    connection_t* up = &pool.connections[0];
+    up->fd = -1;
+    up->state = CONN_STATE_HTTP_BODY;
+    up->content_length = 1000000;
+    connection_arm_body_window(up, 0);
+    connection_mark_active(&pool, 0);
+
+    // ~500 B/s for 5 minutes: slow, but above the ~410 B/s floor
+    for (uint32_t t = 1; t <= 300; t++) {
+        loop.tick_count = t;
+        connection_note_body_bytes(up, 500);
+        up->last_activity = t;
+        event_loop_check_timeouts(&loop);
+        TEST_ASSERT_EQUAL(CONN_STATE_HTTP_BODY, up->state);
+    }
+
+    // Final window: only 100 bytes left, delivered then nothing more is owed
+    up->content_length = up->bytes_received + 100;
+    connection_arm_body_window(up, loop.tick_count);
+    connection_note_body_bytes(up, 60);
+    for (int k = 0; k < 9; k++) {
+        loop.tick_count++;
+        event_loop_check_timeouts(&loop);
+    }
+    connection_note_body_bytes(up, 40);  // remainder arrives in the window
+    loop.tick_count++;
+    event_loop_check_timeouts(&loop);
+    TEST_ASSERT_EQUAL(CONN_STATE_HTTP_BODY, up->state);
+}
+
+// Body fully received but the connection still in HTTP_BODY (its response is
+// streaming out): nothing is owed, so the body deadline must not fire.
+static void test_body_deadline_ignores_complete_body(void) {
+    event_loop_t loop = {0};
+    connection_pool_t pool = {0};
+    event_loop_config_t config = {
+        .timeout_ms = 30000,
+        .select_timeout_ms = 1000,
+        .io_buffer_size = 1024,
+    };
+    event_loop_init(&loop, &pool, &config);
+
+    connection_t* c = &pool.connections[0];
+    c->fd = -1;
+    c->state = CONN_STATE_HTTP_BODY;
+    c->content_length = 10;
+    connection_arm_body_window(c, 0);
+    connection_note_body_bytes(c, 10);
+    connection_mark_active(&pool, 0);
+
+    for (uint32_t t = 1; t <= 25; t++) {
+        loop.tick_count = t;
+        c->last_activity = t;  // e.g. write progress
+        event_loop_check_timeouts(&loop);
+    }
+    TEST_ASSERT_EQUAL(CONN_STATE_HTTP_BODY, c->state);
+}
+
+// A partial body that stops mid-way is closed after one window (sooner than
+// the 30 s idle timeout), and a remainder smaller than body_min_bytes that
+// never arrives is still enforced.
+static void test_body_stall_mid_body_closes(void) {
+    event_loop_t loop = {0};
+    connection_pool_t pool = {0};
+    event_loop_config_t config = {
+        .timeout_ms = 30000,
+        .select_timeout_ms = 1000,
+        .io_buffer_size = 1024,
+    };
+    event_loop_init(&loop, &pool, &config);
+
+    connection_t* c = &pool.connections[0];
+    c->fd = -1;
+    c->state = CONN_STATE_HTTP_BODY;
+    c->content_length = 100;
+    connection_arm_body_window(c, 0);
+    connection_note_body_bytes(c, 40);  // arrived with the headers
+    connection_mark_active(&pool, 0);
+
+    // 40 of 100 within the first window: short of the 100 owed
+    for (uint32_t t = 1; t <= 9; t++) {
+        loop.tick_count = t;
+        event_loop_check_timeouts(&loop);
+        TEST_ASSERT_EQUAL(CONN_STATE_HTTP_BODY, c->state);
+    }
+    loop.tick_count = 10;
+    event_loop_check_timeouts(&loop);
+    TEST_ASSERT_EQUAL(CONN_STATE_CLOSED, c->state);
+}
+
+// Ticks during which the loop itself was blocked (a handler stalling the
+// server task) are not charged to the client; a paused deferred upload
+// re-arms its window so resuming does not trip the deadline at once.
+static void test_body_deadline_excuses_server_stall_and_pause(void) {
+    event_loop_t loop = {0};
+    connection_pool_t pool = {0};
+    event_loop_config_t config = {
+        .timeout_ms = 30000,
+        .select_timeout_ms = 1000,
+        .io_buffer_size = 1024,
+    };
+    event_loop_init(&loop, &pool, &config);
+
+    connection_t* c = &pool.connections[0];
+    c->fd = -1;
+    c->state = CONN_STATE_HTTP_BODY;
+    c->content_length = 1000000;
+    connection_arm_body_window(c, 0);
+    connection_mark_active(&pool, 0);
+
+    loop.tick_count = 1;
+    event_loop_check_timeouts(&loop);
+    // Server blocked for 20 ticks: the window is extended, not expired
+    loop.tick_count = 21;
+    c->last_activity = 21;
+    event_loop_check_timeouts(&loop);
+    TEST_ASSERT_EQUAL(CONN_STATE_HTTP_BODY, c->state);
+
+    // Paused deferred upload: window refreshed every scan while paused
+    c->deferred = 1;
+    c->defer_paused = 1;
+    for (uint32_t t = 22; t <= 60; t++) {
+        loop.tick_count = t;
+        event_loop_check_timeouts(&loop);
+    }
+    TEST_ASSERT_EQUAL(CONN_STATE_HTTP_BODY, c->state);
+    c->defer_paused = 0;
+    loop.tick_count = 61;
+    connection_note_body_bytes(c, 4096);
+    event_loop_check_timeouts(&loop);
+    TEST_ASSERT_EQUAL(CONN_STATE_HTTP_BODY, c->state);
+
+    // ...and with no progress after resume it is reaped one window later
+    for (uint32_t t = 62; t <= 80; t++) {
+        loop.tick_count = t;
+        event_loop_check_timeouts(&loop);
+    }
+    TEST_ASSERT_EQUAL(CONN_STATE_CLOSED, c->state);
+}
+
 // Pool full: the longest-idle keep-alive connection is reclaimed for the new
 // client; connections with work in progress are never evicted.
 static void test_evict_oldest_idle_keepalive(void) {
@@ -681,6 +885,11 @@ void test_event_loop_run(void) {
     RUN_TEST(test_paused_defer_not_reaped_by_timeout);
     RUN_TEST(test_header_deadline_closes_trickling_request);
     RUN_TEST(test_evict_oldest_idle_keepalive);
+    RUN_TEST(test_body_trickle_is_reaped);
+    RUN_TEST(test_body_progressing_upload_survives);
+    RUN_TEST(test_body_deadline_ignores_complete_body);
+    RUN_TEST(test_body_stall_mid_body_closes);
+    RUN_TEST(test_body_deadline_excuses_server_stall_and_pause);
 
     ESP_LOGI(TAG, "Event Loop tests completed");
 }

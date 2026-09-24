@@ -192,6 +192,49 @@ static void test_parse_keep_alive(void)
     TEST_ASSERT_TRUE(http_parse_keep_alive((const uint8_t*)"", 0)); // Default true
 }
 
+// HTTP/1.0 has no persistent connections unless the client asks for one, and
+// the version token used to be skipped unchecked ("GET / JUNK" parsed).
+static parse_result_t parse_str(connection_t* conn, http_parser_context_t* ctx, const char* s)
+{
+    return http_parse_request(conn, (const uint8_t*)s, strlen(s), ctx);
+}
+static void test_parse_http10_defaults_to_close(void)
+{
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+    TEST_ASSERT_EQUAL(PARSE_COMPLETE, parse_str(&conn, &ctx, "GET / HTTP/1.0\r\nHost: a\r\n\r\n"));
+    TEST_ASSERT_EQUAL(0, conn.keep_alive);
+
+    connection_t conn2 = {0};
+    http_parser_context_t ctx2 = {0};
+    TEST_ASSERT_EQUAL(PARSE_COMPLETE,
+                      parse_str(&conn2, &ctx2, "GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n"));
+    TEST_ASSERT_EQUAL(1, conn2.keep_alive);
+
+    connection_t conn3 = {0};
+    http_parser_context_t ctx3 = {0};
+    TEST_ASSERT_EQUAL(PARSE_COMPLETE, parse_str(&conn3, &ctx3, "GET / HTTP/1.1\r\nHost: a\r\n\r\n"));
+    TEST_ASSERT_EQUAL(1, conn3.keep_alive);
+}
+static void test_parse_rejects_bad_http_version(void)
+{
+    const char* bad[] = {"GET / JUNK\r\n\r\n", "GET / HTTP/2.0\r\n\r\n", "GET / HTTP/1.1x\r\n\r\n",
+                         "GET / \r\n\r\n"};
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        connection_t conn = {0};
+        http_parser_context_t ctx = {0};
+        TEST_ASSERT_EQUAL_MESSAGE(PARSE_ERROR, parse_str(&conn, &ctx, bad[i]), bad[i]);
+    }
+}
+static void test_parse_version_split_across_reads(void)
+{
+    connection_t conn = {0};
+    http_parser_context_t ctx = {0};
+    TEST_ASSERT_EQUAL(PARSE_NEED_MORE, parse_str(&conn, &ctx, "GET /x HTTP/1"));
+    TEST_ASSERT_EQUAL(PARSE_COMPLETE, parse_str(&conn, &ctx, ".0\r\nHost: a\r\n\r\n"));
+    TEST_ASSERT_EQUAL(0, conn.keep_alive);
+}
+
 // Test OPTIONS request for CORS
 static void test_parse_options_request(void)
 {
@@ -1667,6 +1710,9 @@ void test_http_parser_run(void)
     RUN_TEST(test_parse_content_length);
     RUN_TEST(test_parse_keep_alive);
     RUN_TEST(test_parse_options_request);
+    RUN_TEST(test_parse_http10_defaults_to_close);
+    RUN_TEST(test_parse_rejects_bad_http_version);
+    RUN_TEST(test_parse_version_split_across_reads);
 
     // Security and edge case tests
     RUN_TEST(test_parse_null_buffer);

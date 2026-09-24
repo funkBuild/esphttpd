@@ -52,6 +52,8 @@ typedef struct {
     uint8_t value_pending_cr;   // Held-back trailing CR at a buffer-slice end:
                                 // becomes the CRLF terminator if the next byte
                                 // is LF, else counts as header value data
+    uint8_t version_len;        // Bytes of the request-line version token so far
+    char version[10];           // "HTTP/1.x" (+ CR), accumulated across slices
     // Arrays at end
     char ws_client_key[32]; // Per-parse WebSocket client key
 } http_parser_context_t;

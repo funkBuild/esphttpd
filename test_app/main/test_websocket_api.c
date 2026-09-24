@@ -455,6 +455,41 @@ static void test_ws_invalid_frame_closes_connection(void) {
     TEST_ASSERT_EQUAL(1, ws_lifecycle_disconnect_count);
 }
 
+// A client-initiated close was echoed but the connection stayed a live
+// WEBSOCKET with its frame parser parked on the CLOSE: every later read
+// re-ran the close (another echo each time), frames were never parsed again,
+// the app could keep sending data frames after the close (RFC 6455 forbids
+// it), and the slot and DISCONNECT waited for the client to drop TCP.
+static void test_ws_client_close_completes_the_close(void) {
+    start_test_server();
+    ws_install_mock_send_buffer();
+    ws_lifecycle_connect_count = 0;
+    ws_lifecycle_disconnect_count = 0;
+
+    connection_t* conn = ws_upgrade_slot0("/ws-cclose");
+    TEST_ASSERT_EQUAL(CONN_STATE_WEBSOCKET, conn->state);
+
+    /* Masked close, code 1000 (mask 0x01020304: 0x03e8 ^ 0x0102 = 0x02ea). */
+    uint8_t close_frame[] = { 0x88, 0x82, 0x01, 0x02, 0x03, 0x04, 0x02, 0xea };
+    g_server->handlers.on_ws_frame(conn, close_frame, sizeof(close_frame));
+
+    TEST_ASSERT_EQUAL(1, ws_lifecycle_disconnect_count);
+    TEST_ASSERT_TRUE_MESSAGE(conn->state == CONN_STATE_CLOSED || conn->state == CONN_STATE_WS_CLOSING,
+                             "still a live WebSocket after the client's close");
+    TEST_ASSERT_EQUAL(0u, g_server->connection_pool.ws_active_mask & 1u);
+    TEST_ASSERT_EQUAL(HTTPD_ERR_CONN_CLOSED, httpd_ws_send(ws_lifecycle_socket, "x", 1, WS_TYPE_TEXT));
+
+    /* Anything the client still sends is not delivered, and the close is not
+     * processed (or echoed) a second time. */
+    uint8_t text_frame[] = { 0x81, 0x81, 0x01, 0x02, 0x03, 0x04, 'h' ^ 0x01 };
+    g_server->handlers.on_ws_frame(conn, text_frame, sizeof(text_frame));
+    TEST_ASSERT_EQUAL(1, ws_lifecycle_disconnect_count);
+
+    ws_remove_mock_send_buffer();
+    stop_test_server();
+    TEST_ASSERT_EQUAL(1, ws_lifecycle_disconnect_count);
+}
+
 // Fix 3a: httpd_stop with a live WebSocket connection must fire
 // WS_EVENT_DISCONNECT to the route handler before teardown - app per-socket
 // state (allocated on WS_EVENT_CONNECT) leaked on every stop otherwise.
@@ -605,6 +640,7 @@ void test_websocket_api_run(void) {
 
     // Lifecycle tests (frame error handling / stop-time disconnect events)
     RUN_TEST(test_ws_invalid_frame_closes_connection);
+    RUN_TEST(test_ws_client_close_completes_the_close);
     RUN_TEST(test_ws_stop_fires_disconnect_event);
     RUN_TEST(test_ws_headers_readable_after_upgrade);
 

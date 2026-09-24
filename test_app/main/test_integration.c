@@ -246,6 +246,40 @@ static void test_header_pending_tracks_partial_headers(void) {
     stop_test_server();
 }
 
+// Slow-body deadline accounting: the window is armed when the headers
+// complete, and body bytes count whether they arrived with the headers or
+// later through on_http_body (and even when the handler never reads them).
+static void test_body_progress_accounting(void) {
+    start_test_server();
+    ka_handler_calls = 0;
+    httpd_route_t route = { .method = HTTP_POST, .pattern = "/ka", .handler = ka_handler };
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_route(test_handle, &route));
+
+    connection_t conn = {0};
+    conn.fd = -1;
+    conn.pool_index = 0;
+    conn.state = CONN_STATE_NEW;
+
+    g_server->event_loop.tick_count = 7;
+    char req[] = "POST /ka HTTP/1.1\r\nContent-Length: 100\r\n"
+                 "Connection: keep-alive\r\n\r\n0123456789";
+    g_server->handlers.on_http_request(&conn, (uint8_t*)req, sizeof(req) - 1);
+    TEST_ASSERT_EQUAL(1, ka_handler_calls);
+    TEST_ASSERT_EQUAL(CONN_STATE_HTTP_BODY, conn.state);  // 90 bytes owed
+    TEST_ASSERT_EQUAL(100, conn.content_length);
+    TEST_ASSERT_EQUAL(10, conn.bytes_received);
+    TEST_ASSERT_EQUAL(7, conn.body_window_start);
+    TEST_ASSERT_EQUAL(10, conn.body_window_bytes);
+
+    uint8_t chunk[30];
+    memset(chunk, 'x', sizeof(chunk));
+    g_server->handlers.on_http_body(&conn, chunk, sizeof(chunk));
+    TEST_ASSERT_EQUAL(40, conn.bytes_received);
+    TEST_ASSERT_EQUAL(40, conn.body_window_bytes);
+
+    stop_test_server();
+}
+
 // A full receive buffer can contain hundreds of minimal pipelined requests.
 // Dispatch must be iterative: recursive dispatch makes remote input consume
 // one server-task stack frame per request.
@@ -1139,6 +1173,7 @@ void test_integration_run(void) {
     RUN_TEST(test_get_body_in_later_segment_is_drained);
     RUN_TEST(test_pipelined_request_waits_for_file_stream);
     RUN_TEST(test_header_pending_tracks_partial_headers);
+    RUN_TEST(test_body_progress_accounting);
     RUN_TEST(test_user_ctx_without_middleware);
     RUN_TEST(test_user_ctx_without_middleware_router);
     RUN_TEST(test_pipelined_requests_dispatch_iteratively);

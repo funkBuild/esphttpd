@@ -282,15 +282,11 @@ static void test_url_tracking(void)
 {
     connection_t conn = {0};
 
-    // Test URL offset and length
-    conn.url_offset = 0;
+    // Test URL length
     conn.url_len = 10;
-    TEST_ASSERT_EQUAL(0, conn.url_offset);
     TEST_ASSERT_EQUAL(10, conn.url_len);
 
-    conn.url_offset = 1024;
     conn.url_len = 255; // Max uint8_t
-    TEST_ASSERT_EQUAL(1024, conn.url_offset);
     TEST_ASSERT_EQUAL(255, conn.url_len);
 }
 

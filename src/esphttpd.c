@@ -108,6 +108,9 @@ typedef struct {
 // small overflow index instead, so httpd_req_get_header() always finds them.
 static const char* const pinned_header_names[] = {
     "Host", "Origin", "Referer", "Content-Type", "X-Forwarded-Host",
+    // Credentials: dropping them past the index cap turned a request from a
+    // browser that sends many headers into a 401.
+    "Authorization", "Cookie",
 };
 #define PINNED_HEADER_NAME_COUNT (sizeof(pinned_header_names) / sizeof(pinned_header_names[0]))
 #define MAX_PINNED_HEADERS 8
@@ -299,6 +302,7 @@ typedef struct {
     bool uri_buf_is_heap;                 // true if uri_buf was malloc'd (needs free)
     uint8_t query_param_count;
     bool query_parsed;
+    bool query_cache_full;           // more parameters than MAX_QUERY_PARAMS
     // Deferred (async) body handling
     struct {
         httpd_body_cb_t on_body;          // Body data callback
@@ -1261,6 +1265,27 @@ static inline __attribute__((always_inline)) request_context_t* get_req_context(
     return request_contexts[conn->pool_index];
 }
 
+// Next '&'-separated parameter of [*p, end). A segment without '=' is a key
+// with an empty value ("?debug&x=1"); empty segments ("a=1&&b=2") are skipped.
+// Returns false when the string is exhausted.
+static bool query_next_param(const char** p, const char* end, const char** key, size_t* key_len,
+                             const char** value, size_t* value_len) {
+    while (*p < end) {
+        const char* seg = *p;
+        const char* amp = memchr(seg, '&', end - seg);
+        const char* seg_end = amp ? amp : end;
+        *p = amp ? amp + 1 : end;
+        if (seg_end == seg) continue;
+        const char* eq = memchr(seg, '=', seg_end - seg);
+        *key = seg;
+        *key_len = (eq ? eq : seg_end) - seg;
+        *value = eq ? eq + 1 : seg_end;
+        *value_len = eq ? (size_t)(seg_end - (eq + 1)) : 0;
+        return true;
+    }
+    return false;
+}
+
 // Parse query string once and cache results
 static void parse_query_params(request_context_t* ctx) {
     if (ctx->query_parsed) return;
@@ -1272,27 +1297,21 @@ static void parse_query_params(request_context_t* ctx) {
 
     const char* p = query;
     const char* end = query + ctx->req.query_len;
+    const char *key, *value;
+    size_t key_len, value_len;
 
-    while (p < end && ctx->query_param_count < MAX_QUERY_PARAMS) {
-        // Find '=' for key-value split
-        const char* eq = memchr(p, '=', end - p);
-        if (!eq) break;
-
-        // Find end of this parameter
-        const char* amp = memchr(eq + 1, '&', end - (eq + 1));
-        const char* v_end = amp ? amp : end;
-
+    while (ctx->query_param_count < MAX_QUERY_PARAMS &&
+           query_next_param(&p, end, &key, &key_len, &value, &value_len)) {
         // Store in cache (pointers into query string, no copying)
         query_param_entry_t* entry = &ctx->query_params[ctx->query_param_count];
-        entry->key = p;
-        entry->key_len = eq - p;
-        entry->value = eq + 1;
-        entry->value_len = v_end - (eq + 1);
+        entry->key = key;
+        entry->key_len = key_len;
+        entry->value = value;
+        entry->value_len = value_len;
         ctx->query_param_count++;
-
-        if (!amp) break;
-        p = amp + 1;
     }
+    // Parameters past the cache are still found by the scan in the lookup.
+    ctx->query_cache_full = query_next_param(&p, end, &key, &key_len, &value, &value_len);
 }
 
 int httpd_req_get_query(httpd_req_t* req, const char* key, char* value, size_t value_size) {
@@ -1314,26 +1333,19 @@ int httpd_req_get_query(httpd_req_t* req, const char* key, char* value, size_t v
                 return httpd_url_decode_n(entry->value, entry->value_len, value, value_size);
             }
         }
-        return -1;  // Not found in cache
+        if (!ctx->query_cache_full) return -1;  // Not in the query at all
     }
 
-    // Fallback to original linear scan if context unavailable
+    // Linear scan: no context, or the parameter lies beyond the cache
     const char* p = req->query;
     const char* end = req->query + req->query_len;
+    const char *k, *v;
+    size_t k_len, v_len;
 
-    while (p < end) {
-        const char* eq = memchr(p, '=', end - p);
-        if (!eq) break;
-
-        size_t k_len = eq - p;
-        const char* amp = memchr(eq + 1, '&', end - (eq + 1));
-        if (k_len == key_len && memcmp(p, key, key_len) == 0) {
-            const char* v_start = eq + 1;
-            size_t v_len = amp ? (size_t)(amp - v_start) : (size_t)(end - v_start);
-            return httpd_url_decode_n(v_start, v_len, value, value_size);
+    while (query_next_param(&p, end, &k, &k_len, &v, &v_len)) {
+        if (k_len == key_len && memcmp(k, key, key_len) == 0) {
+            return httpd_url_decode_n(v, v_len, value, value_size);
         }
-        if (!amp) break;
-        p = amp + 1;
     }
 
     return -1;
@@ -2269,6 +2281,7 @@ int httpd_req_recv(httpd_req_t* req, void* buf, size_t len) {
         if (received > 0) {
             req->body_received += received;
             total_received += received;
+            connection_note_body_bytes(conn, (size_t)received);  // slow-body deadline
         } else if (received == 0) {
             // Connection closed
             if (total_received == 0) return -1;
@@ -4402,6 +4415,19 @@ static void on_http_request_impl(connection_t* conn, uint8_t* buffer, size_t len
     // Store content length
     ctx->req.content_length = conn->content_length;
 
+    // Open the first body-progress window (slow-body deadline in
+    // event_loop_check_timeouts). Body bytes that arrived with the headers
+    // count as received - they are off the wire even if body_buf below
+    // cannot be allocated.
+    if (conn->content_length > 0 && g_server) {
+        connection_arm_body_window(conn, g_server->event_loop.tick_count);
+        if (ctx->recv_buf_len > conn->header_bytes) {
+            size_t pre = ctx->recv_buf_len - conn->header_bytes;
+            connection_note_body_bytes(conn, pre < conn->content_length
+                                             ? pre : conn->content_length);
+        }
+    }
+
     size_t request_end = conn->header_bytes;
     if (conn->content_length <= SIZE_MAX - request_end) {
         request_end += conn->content_length;
@@ -4804,6 +4830,7 @@ static void on_http_body(connection_t* conn, uint8_t* buffer, size_t len) {
                      ? ctx->req.content_length - wire : 0;
     size_t body_len = (len < remaining) ? len : remaining;
     size_t surplus = len - body_len;
+    connection_note_body_bytes(conn, body_len);  // slow-body deadline
 
     if (!conn->deferred && !conn->continuation) {
         // Sync handler already returned (it reads via httpd_req_recv during
@@ -4944,6 +4971,9 @@ static void on_http_body(connection_t* conn, uint8_t* buffer, size_t len) {
 static void on_ws_frame(connection_t* conn, uint8_t* buffer, size_t len) {
     ws_context_t* ws_ctx = get_ws_context(conn);
     if (!ws_ctx || !ws_ctx->route) return;
+    // Closed (close handshake done, or a protocol error): nothing after the
+    // close is delivered, and the event loop reaps the connection.
+    if (conn->state == CONN_STATE_CLOSED) return;
 
     // Process all WebSocket frames in the buffer
     size_t offset = 0;
@@ -5060,10 +5090,30 @@ static void on_ws_frame(connection_t* conn, uint8_t* buffer, size_t len) {
                 }
                 conn->state = CONN_STATE_CLOSED;
             }
-            // Client-initiated close (CONN_STATE_WEBSOCKET):
-            // ws_handle_control_frame already echoed the close frame.
-            // Wait for the client to close TCP (recv returns 0), which
-            // triggers on_ws_disconnect via handle_connection_data.
+            else if (ws_ctx->ws.connected) {
+                // Client-initiated close: ws_handle_control_frame already
+                // echoed the close frame, which completes the handshake.
+                // RFC 6455 7.1.1: the server closes TCP first. Waiting for the
+                // client left the connection a live WEBSOCKET with its parser
+                // parked on the CLOSE (re-echoed on every read, nothing else
+                // parsed) and let the app keep sending after the close.
+                if (ws_ctx->route->handler) {
+                    httpd_ws_event_t disconnect_event = {
+                        .type = WS_EVENT_DISCONNECT,
+                        .data = NULL,
+                        .len = 0
+                    };
+                    ws_ctx->route->handler(&ws_ctx->ws, &disconnect_event);
+                }
+                ws_ctx->ws.connected = false;
+                httpd_ws_leave_all(&ws_ctx->ws);
+                if (g_server) {
+                    connection_mark_ws_inactive(&g_server->connection_pool, conn->pool_index);
+                }
+                conn->state = CONN_STATE_CLOSED;
+            }
+            ws_ctx->frame_ctx.state = WS_STATE_OPCODE;
+            ws_ctx->frame_ctx.payload_received = 0;
             break;
         } else if (result == WS_FRAME_NEED_MORE) {
             // Need more data - wait for next read

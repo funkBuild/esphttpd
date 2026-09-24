@@ -85,9 +85,8 @@ find_qemu() {
 QEMU_BIN=$(find_qemu)
 
 # The efuse device needs a backing image or the ESP32-S3 machine won't boot.
-if [ ! -f build/qemu_efuse.bin ]; then
-    dd if=/dev/zero of=build/qemu_efuse.bin bs=1K count=4 2>/dev/null
-fi
+# IDF's default S3 eFuses (chip rev 0.3); a zero image reads as rev 0.0.
+python3 "$SCRIPT_DIR/../../../tools/qemu/make_efuse.py" build/qemu_efuse.bin
 
 # Run QEMU with timeout
 echo -e "${GREEN}Starting QEMU ESP32S3...${NC}"
@@ -103,8 +102,10 @@ echo -e "${YELLOW}Running tests (timeout: ${TIMEOUT}s)...${NC}"
 
 "$QEMU_BIN" \
     -M esp32s3 \
+    -m 8M \
     -drive file=build/qemu_flash.bin,if=mtd,format=raw \
     -drive file=build/qemu_efuse.bin,if=none,format=raw,id=efuse \
+    -global driver=nvram.esp32s3.efuse,property=drive,value=efuse \
     -serial mon:stdio \
     -nographic \
     -no-reboot \

@@ -153,6 +153,7 @@ typedef struct {
     bool uri_buf_is_heap;                 // true if uri_buf was malloc'd (needs free)
     uint8_t query_param_count;
     bool query_parsed;
+    bool query_cache_full;
     // Deferred (async) body handling
     struct {
         httpd_body_cb_t on_body;          // Body data callback

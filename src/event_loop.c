@@ -10,6 +10,7 @@
 #include <errno.h>
 #endif
 #include <string.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -55,6 +56,8 @@ void event_loop_init(event_loop_t* loop, connection_pool_t* pool, const event_lo
     if (loop->config.backlog == 0) loop->config.backlog = 5;
     if (loop->config.ws_close_timeout_ms == 0) loop->config.ws_close_timeout_ms = 5000;
     if (loop->config.header_timeout_ms == 0) loop->config.header_timeout_ms = 10000;
+    if (loop->config.body_timeout_ms == 0) loop->config.body_timeout_ms = 10000;
+    if (loop->config.body_min_bytes == 0) loop->config.body_min_bytes = 4096;
 #ifdef CONFIG_HTTPD_USE_RAW_API
     loop->listen_pcb = NULL;
     // Compute timeout in poll intervals (each poll = CONFIG_HTTPD_RAW_POLL_INTERVAL * 500ms)
@@ -64,6 +67,8 @@ void event_loop_init(event_loop_t* loop, connection_pool_t* pool, const event_lo
     loop->ws_close_timeout_ticks = loop->config.ws_close_timeout_ms / divisor;
     loop->header_timeout_ticks = loop->config.header_timeout_ms / divisor;
     if (loop->header_timeout_ticks == 0) loop->header_timeout_ticks = 1;
+    loop->body_timeout_ticks = loop->config.body_timeout_ms / divisor;
+    if (loop->body_timeout_ticks == 0) loop->body_timeout_ticks = 1;
 #else
     loop->listen_fd = -1;
     if (loop->config.select_timeout_ms == 0) loop->config.select_timeout_ms = 1000;
@@ -76,6 +81,8 @@ void event_loop_init(event_loop_t* loop, connection_pool_t* pool, const event_lo
     if (loop->ws_close_timeout_ticks == 0) loop->ws_close_timeout_ticks = 1;
     loop->header_timeout_ticks = loop->config.header_timeout_ms / loop->config.select_timeout_ms;
     if (loop->header_timeout_ticks == 0) loop->header_timeout_ticks = 1;
+    loop->body_timeout_ticks = loop->config.body_timeout_ms / loop->config.select_timeout_ms;
+    if (loop->body_timeout_ticks == 0) loop->body_timeout_ticks = 1;
     // Precompute select timeout struct (avoid repeated struct construction)
     loop->select_timeout.tv_sec = loop->config.select_timeout_ms / 1000;
     loop->select_timeout.tv_usec = (loop->config.select_timeout_ms % 1000) * 1000;
@@ -331,9 +338,48 @@ int event_loop_evict_idle(event_loop_t* loop, const event_handlers_t* handlers) 
     return victim;
 }
 
+// Slow-body deadline. The idle timeout is refreshed by every received byte and
+// the header deadline ends at the blank line, so a client that declared a huge
+// Content-Length and then sent one body byte per idle period held its slot
+// forever (and a mid-request connection is never evicted): sixteen of them
+// locked every client out. While body bytes are outstanding, each
+// body_timeout_ticks window must deliver body_min_bytes (or the whole
+// remainder, if smaller); a window that falls short closes the connection.
+// This is a minimum rate, not a total deadline: a large upload that keeps
+// progressing is never cut off. Ticks during which the server itself was not
+// polling (a handler blocking the loop, e.g. a flash erase in an upload
+// handler) are excused so a server-side stall is not blamed on the client.
+// No 408 is sent: the handler may already have answered this request.
+static bool body_progress_stalled(event_loop_t* loop, connection_t* conn,
+                                  uint32_t excused_ticks) {
+    if (conn->state != CONN_STATE_HTTP_BODY ||
+        conn->bytes_received >= conn->content_length) {
+        return false;  // no body outstanding (e.g. response still streaming)
+    }
+    conn->body_window_start += (uint16_t)excused_ticks;
+    uint16_t elapsed = (uint16_t)((uint16_t)loop->tick_count - conn->body_window_start);
+    if (elapsed < loop->body_timeout_ticks) {
+        return false;
+    }
+    // Bytes still outstanding when this window opened
+    uint32_t owed = conn->content_length - conn->bytes_received + conn->body_window_bytes;
+    uint32_t need = loop->config.body_min_bytes;
+    if (owed < need) need = owed;
+    if (conn->body_window_bytes < need) {
+        return true;
+    }
+    connection_arm_body_window(conn, loop->tick_count);
+    return false;
+}
+
 void event_loop_check_timeouts(event_loop_t* loop) {
     // Use precomputed timeout_ticks (avoid division in hot path)
     uint32_t timeout_ticks = loop->timeout_ticks;
+    // Ticks beyond one since the previous scan elapsed while the loop was not
+    // running (blocked in a handler): see body_progress_stalled()
+    uint32_t scan_gap = loop->tick_count - loop->last_check_tick;
+    uint32_t excused_ticks = (scan_gap > 1) ? scan_gap - 1 : 0;
+    loop->last_check_tick = loop->tick_count;
 
     uint32_t mask = loop->pool->active_mask;
     while (mask) {
@@ -360,6 +406,14 @@ void event_loop_check_timeouts(event_loop_t* loop) {
         // dies while paused is only reaped after resume + a full idle timeout.
         if (conn->defer_paused) {
             conn->last_activity = loop->tick_count;
+            connection_arm_body_window(conn, loop->tick_count);
+            continue;
+        }
+
+        if (body_progress_stalled(loop, conn, excused_ticks)) {
+            ESP_LOGD(TAG, "Connection [%d] request body stalled at %" PRIu32 "/%" PRIu32
+                     " bytes", i, conn->bytes_received, conn->content_length);
+            conn->state = CONN_STATE_CLOSED;
             continue;
         }
 

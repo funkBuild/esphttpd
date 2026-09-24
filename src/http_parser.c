@@ -429,18 +429,29 @@ parse_result_t http_parse_request(connection_t* __restrict conn,
             }
 
             case PARSE_STATE_VERSION: {
-                // Bulk scan: find \n to skip version string
-                const uint8_t* nl = (const uint8_t*)memchr(&buffer[i], '\n', buffer_len - i);
-                if (nl) {
-                    ctx->state = PARSE_STATE_HEADER_KEY;
-                    ctx->current_header_key = NULL;
-                    ctx->header_key_len = 0;
-                    conn->header_bytes = 0;
-                    i = nl - buffer; // i will be incremented past \n below
-                } else {
-                    i = buffer_len;
-                    continue;
+                // "HTTP/1.0" or "HTTP/1.1", then CRLF (or bare LF). The token
+                // may span recv slices, so it accumulates in the context. It
+                // used to be skipped unchecked: "GET / JUNK" parsed, and an
+                // HTTP/1.0 client was held open as if it were keep-alive.
+                if (c != '\n') {
+                    if (ctx->version_len >= sizeof(ctx->version)) return PARSE_ERROR;
+                    ctx->version[ctx->version_len++] = (char)c;
+                    break;
                 }
+                size_t vlen = ctx->version_len;
+                if (vlen > 0 && ctx->version[vlen - 1] == '\r') vlen--;
+                if (vlen != 8 || memcmp(ctx->version, "HTTP/1.", 7) != 0 ||
+                    (ctx->version[7] != '0' && ctx->version[7] != '1')) {
+                    return PARSE_ERROR;
+                }
+                // HTTP/1.0 is non-persistent unless the client asks
+                // (Connection: keep-alive is processed with the headers).
+                if (ctx->version[7] == '0') conn->keep_alive = 0;
+                ctx->version_len = 0;
+                ctx->state = PARSE_STATE_HEADER_KEY;
+                ctx->current_header_key = NULL;
+                ctx->header_key_len = 0;
+                conn->header_bytes = 0;
                 break;
             }
 

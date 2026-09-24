@@ -4,6 +4,7 @@
 #include "sdkconfig.h"
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
 #ifndef CONFIG_HTTPD_USE_RAW_API
 #include <sys/socket.h>
@@ -83,7 +84,8 @@ typedef struct {
     int fd;                      // Socket file descriptor
 #endif
     uint32_t content_length;     // Expected content length (supports up to 4GB)
-    uint32_t bytes_received;     // Bytes received for current message
+    uint32_t bytes_received;     // Request body bytes received off the wire so
+                                 // far (drives the body-progress deadline)
     uint32_t ws_mask_key;        // WebSocket masking key (when masked)
     uint32_t last_activity;      // Last activity timestamp (tick count)
     uint32_t ws_ping_interval_ticks;
@@ -94,10 +96,16 @@ typedef struct {
     uint16_t header_bytes;       // Bytes of headers received
     uint16_t ws_payload_len;     // Current frame payload length
     uint16_t ws_payload_read;    // Payload bytes already processed
-    uint16_t request_start;      // Low 16 bits of the tick at which the pending
-                                 // request's first byte arrived (header deadline;
-                                 // compared modulo 2^16)
-    uint16_t url_offset;         // Offset in shared URL buffer
+    // Low 16 bits of a tick, compared modulo 2^16. The two uses never overlap:
+    // request_start is live only while headers are incomplete (header
+    // deadline), body_window_start only in CONN_STATE_HTTP_BODY after they
+    // complete (slow-body deadline).
+    union {
+        uint16_t request_start;      // Tick of the pending request's first byte
+        uint16_t body_window_start;  // Tick the current body-progress window opened
+    };
+    uint16_t body_window_bytes;  // Body bytes received in the current body-progress
+                                 // window (saturating)
     uint16_t url_len;            // URL length
 
     // 8-bit fields (1 byte)
@@ -192,6 +200,21 @@ static inline void connection_mark_write_pending(connection_pool_t* pool, int in
     } else {
         connection_mask_clear(&pool->write_pending_mask, index);
     }
+}
+
+// Request-body progress accounting for the slow-body deadline (see
+// event_loop_check_timeouts). Arm when the headers complete with a body
+// outstanding; note every body byte taken off the wire.
+static inline void connection_arm_body_window(connection_t* conn, uint32_t tick) {
+    conn->body_window_start = (uint16_t)tick;
+    conn->body_window_bytes = 0;
+}
+
+static inline void connection_note_body_bytes(connection_t* conn, size_t n) {
+    uint32_t room = UINT32_MAX - conn->bytes_received;
+    conn->bytes_received += (n < room) ? (uint32_t)n : room;
+    uint32_t w = (uint32_t)conn->body_window_bytes + (n < UINT16_MAX ? (uint32_t)n : UINT16_MAX);
+    conn->body_window_bytes = (w < UINT16_MAX) ? (uint16_t)w : UINT16_MAX;
 }
 
 // WebSocket active tracking for O(k) broadcast iteration

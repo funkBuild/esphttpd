@@ -1177,6 +1177,86 @@ static void test_req_get_header_survives_recv_buf_migration(void) {
     stop_test_server();
 }
 
+// ==================== Query edge cases (server-backed) ====================
+// A parameter without '=' used to swallow the next '&'-separated parameter into
+// its key ("debug&x=1" -> key "debug&x"), and only the first
+// MAX_QUERY_PARAMS parameters were ever found.
+static char q_x[32], q_b[32], q_last[32], q_flag[32];
+static int q_x_len, q_b_len, q_last_len, q_flag_len;
+static httpd_err_t query_edge_handler(httpd_req_t* req) {
+    hdr_handler_calls++;
+    q_x_len = httpd_req_get_query(req, "x", q_x, sizeof(q_x));
+    q_b_len = httpd_req_get_query(req, "b", q_b, sizeof(q_b));
+    q_last_len = httpd_req_get_query(req, "p12", q_last, sizeof(q_last));
+    q_flag_len = httpd_req_get_query(req, "debug", q_flag, sizeof(q_flag));
+    return HTTPD_OK;
+}
+static void run_query_request(const char* target) {
+    connection_t* conn = connection_get(&g_server->connection_pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    memset(conn, 0, sizeof(*conn));
+    conn->fd = -1;
+    conn->pool_index = 0;
+    conn->state = CONN_STATE_NEW;
+    char req_bytes[512];
+    int n = snprintf(req_bytes, sizeof(req_bytes), "GET %s HTTP/1.1\r\nHost: device.local\r\n\r\n", target);
+    hdr_handler_calls = 0;
+    q_x_len = q_b_len = q_last_len = q_flag_len = -2;
+    g_server->handlers.on_http_request(conn, (uint8_t*)req_bytes, (size_t)n);
+    TEST_ASSERT_EQUAL(1, hdr_handler_calls);
+}
+static void test_req_get_query_flag_and_empty_segments(void) {
+    start_test_server();
+    httpd_route_t route = { .method = HTTP_GET, .pattern = "/q", .handler = query_edge_handler };
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_route(test_server, &route));
+
+    run_query_request("/q?debug&x=1&a=1&&b=2");
+    TEST_ASSERT_EQUAL(1, q_x_len);
+    TEST_ASSERT_EQUAL_STRING("1", q_x);
+    TEST_ASSERT_EQUAL(1, q_b_len);
+    TEST_ASSERT_EQUAL_STRING("2", q_b);
+    TEST_ASSERT_EQUAL(0, q_flag_len);  // present, no value
+
+    run_query_request("/q?p1=1&p2=2&p3=3&p4=4&p5=5&p6=6&p7=7&p8=8&p9=9&p10=10&p11=11&p12=twelve");
+    TEST_ASSERT_EQUAL(6, q_last_len);
+    TEST_ASSERT_EQUAL_STRING("twelve", q_last);
+    stop_test_server();
+}
+
+// Authorization (and Cookie) are what httpd_check_basic_auth / session code
+// read; dropping them once a browser sends more than 16 headers turned every
+// such request into a 401.
+static bool auth_ok;
+static httpd_err_t auth_late_handler(httpd_req_t* req) {
+    hdr_handler_calls++;
+    auth_ok = httpd_check_basic_auth(req, "user", "pass");
+    hdr_snap(hdr_pin_ct, httpd_req_get_header(req, "Cookie"));
+    return HTTPD_OK;
+}
+static void test_req_auth_header_after_index_full(void) {
+    start_test_server();
+    httpd_route_t route = { .method = HTTP_GET, .pattern = "/auth", .handler = auth_late_handler };
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_route(test_server, &route));
+    connection_t* conn = connection_get(&g_server->connection_pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    memset(conn, 0, sizeof(*conn));
+    conn->fd = -1;
+    conn->pool_index = 0;
+    conn->state = CONN_STATE_NEW;
+    char req_bytes[1024];
+    int n = snprintf(req_bytes, sizeof(req_bytes), "GET /auth HTTP/1.1\r\nHost: device.local\r\n");
+    for (int i = 1; i <= 17; i++) n += snprintf(req_bytes + n, sizeof(req_bytes) - n, "Sec-Ch-%02d: v\r\n", i);
+    n += snprintf(req_bytes + n, sizeof(req_bytes) - n,
+                  "Authorization: Basic dXNlcjpwYXNz\r\nCookie: sid=abc\r\n\r\n");
+    hdr_handler_calls = 0;
+    auth_ok = false;
+    g_server->handlers.on_http_request(conn, (uint8_t*)req_bytes, (size_t)n);
+    TEST_ASSERT_EQUAL(1, hdr_handler_calls);
+    TEST_ASSERT_TRUE_MESSAGE(auth_ok, "Authorization dropped once the header index was full");
+    TEST_ASSERT_EQUAL_STRING("sid=abc", hdr_pin_ct);
+    stop_test_server();
+}
+
 void test_http_api_run(void) {
     ESP_LOGI(TAG, "Running HTTP API tests");
 
@@ -1189,6 +1269,8 @@ void test_http_api_run(void) {
     RUN_TEST(test_req_get_header_keep_alive_isolation);
     RUN_TEST(test_req_get_header_index_full);
     RUN_TEST(test_req_get_header_pinned_after_index_full);
+    RUN_TEST(test_req_get_query_flag_and_empty_segments);
+    RUN_TEST(test_req_auth_header_after_index_full);
     RUN_TEST(test_req_get_header_survives_recv_buf_migration);
 
     // Response status tests
