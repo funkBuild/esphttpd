@@ -169,6 +169,13 @@ static inline int format_hex(char* buf, size_t value) {
     return n + 2;
 }
 
+// Number of hex digits format_hex writes for value (at least 1)
+static inline int hex_digits(size_t value) {
+    int n = 1;
+    while (value >>= 4) n++;
+    return n;
+}
+
 // Format size_t as decimal digits. Returns number of digits written.
 static inline int format_uint(char* buf, size_t value) {
     char tmp[16]; int n = 0;
@@ -5301,7 +5308,13 @@ static void on_write_ready_impl(connection_t* conn) {
             size_t reserved = ctx->data_provider.use_chunked ? 10 : 0;
             if (contiguous > reserved) {
                 size_t max_data = contiguous - reserved;
-                uint8_t* data_ptr = ctx->data_provider.use_chunked ? write_ptr + 8 : write_ptr;
+                // The provider writes where a FULL chunk's size line ends
+                // (hex digits of max_data + CRLF), so the common full chunk
+                // needs no move; only a shorter chunk whose size has fewer
+                // hex digits (the last one) is moved down below. Placing it
+                // after the 8-byte worst case moved every chunk's data.
+                uint8_t* data_ptr = ctx->data_provider.use_chunked
+                                  ? write_ptr + hex_digits(max_data) + 2 : write_ptr;
 
                 // Call user's data provider
                 if (unlock_for_blocking) SEND_UNLOCK();
@@ -5310,12 +5323,13 @@ static void on_write_ready_impl(connection_t* conn) {
 
                 if (bytes > 0) {
                     if (ctx->data_provider.use_chunked) {
-                        // Format chunk: size\r\n data \r\n
-                        int header_len = format_hex((char*)write_ptr, (size_t)bytes);
-                        // Move data if header is shorter than 8 bytes
-                        if (header_len < 8) {
+                        // Format chunk: size\r\n data \r\n (the size line
+                        // lies below both the old and the moved data)
+                        int header_len = hex_digits((size_t)bytes) + 2;
+                        if (write_ptr + header_len != data_ptr) {
                             memmove(write_ptr + header_len, data_ptr, bytes);
                         }
+                        format_hex((char*)write_ptr, (size_t)bytes);
                         // Add chunk trailer
                         write_ptr[header_len + bytes] = '\r';
                         write_ptr[header_len + bytes + 1] = '\n';
