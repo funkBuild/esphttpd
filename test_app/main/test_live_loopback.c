@@ -42,6 +42,13 @@
 
 static const char* TAG = "TEST_LIVE";
 
+// The live suite needs a real concurrent scheduler: the server's event loop
+// task sits in select() while the test task blocks in recv() on the client
+// side. The linux-target FreeRTOS port (tools/host_test/esphttpd_test_app)
+// does not preempt a task blocked in a host syscall, so there the server
+// never runs and every test times out. It runs under QEMU (lwIP loopback).
+#if !CONFIG_IDF_TARGET_LINUX
+
 // ============================================================================
 // RAM VFS (read-only) mounted at /ram
 // ============================================================================
@@ -1120,3 +1127,11 @@ void test_live_loopback_run(void) {
     RUN_TEST(test_live_lock_ws_send_not_blocked_by_provider);
     RUN_TEST(test_live_lock_ws_send_not_blocked_by_file_read);
 }
+
+#else  // CONFIG_IDF_TARGET_LINUX
+
+void test_live_loopback_run(void) {
+    ESP_LOGW(TAG, "Live loopback tests skipped on the linux target (see top of file)");
+}
+
+#endif  // !CONFIG_IDF_TARGET_LINUX
