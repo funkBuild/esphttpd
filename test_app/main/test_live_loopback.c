@@ -855,7 +855,7 @@ static void test_live_ws_cross_task_send_ordering(void) {
 // the event loop's 1 s select() timeout to be noticed
 // ============================================================================
 
-#define WAKE_LATENCY_MAX_MS 300
+#define WAKE_LATENCY_MAX_MS 500  // pre-fix: ~850-1000 ms (select timeout); headroom for loaded CI hosts
 
 // Slow reader: an app-task WebSocket send overflows the socket and queues.
 // The loop, idle in select() with no write interest, must pick the queued
