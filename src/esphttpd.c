@@ -5256,35 +5256,42 @@ static void on_write_ready_impl(connection_t* conn) {
             }
             // If we have data to send, send it first - worker will refill later
 #else
-            // Read directly into ring buffer - no intermediate copy
-            if (unlock_for_blocking) SEND_UNLOCK();
-            ssize_t bytes_read = read(sb->file_fd, write_ptr, to_read);
-            int read_errno = errno;
-            if (unlock_for_blocking) SEND_LOCK();
-            errno = read_errno;
-            if (bytes_read > 0) {
-                send_buffer_commit(sb, bytes_read);
-                sb->file_remaining -= bytes_read;
+            // Refill only once the ring has drained (as raw-API mode does):
+            // an empty ring is reset to offset 0, so each read fills the whole
+            // ring. Topping up whatever sliver a partial send freed - down to
+            // a few bytes at the wrap point - made 128 KB cost ~50 reads
+            // instead of ~32, and on flash every read has a fixed cost.
+            if (!send_buffer_has_data(sb)) {
+                // Read directly into ring buffer - no intermediate copy
+                if (unlock_for_blocking) SEND_UNLOCK();
+                ssize_t bytes_read = read(sb->file_fd, write_ptr, to_read);
+                int read_errno = errno;
+                if (unlock_for_blocking) SEND_LOCK();
+                errno = read_errno;
+                if (bytes_read > 0) {
+                    send_buffer_commit(sb, bytes_read);
+                    sb->file_remaining -= bytes_read;
 
-                // Check if file is complete
-                if (sb->file_remaining == 0) {
+                    // Check if file is complete
+                    if (sb->file_remaining == 0) {
+                        send_buffer_stop_file(sb);
+                        ESP_LOGD(TAG, "File streaming complete for conn [%d]", conn->pool_index);
+                    }
+                } else if (bytes_read == 0) {
+                    // EOF before file_remaining reached zero: the file shrank
+                    // while being served. Stop streaming (the promised
+                    // Content-Length cannot be honored) instead of re-reading
+                    // EOF in an infinite loop, and close the connection so the
+                    // peer is not left waiting for missing bytes.
+                    ESP_LOGW(TAG, "Unexpected EOF streaming file (%" PRIu32 " bytes short)",
+                             sb->file_remaining);
                     send_buffer_stop_file(sb);
-                    ESP_LOGD(TAG, "File streaming complete for conn [%d]", conn->pool_index);
+                    conn->state = CONN_STATE_CLOSED;
+                } else if (bytes_read < 0 && errno != EAGAIN) {
+                    ESP_LOGE(TAG, "File read error: %s", strerror(errno));
+                    send_buffer_stop_file(sb);
+                    conn->state = CONN_STATE_CLOSED;
                 }
-            } else if (bytes_read == 0) {
-                // EOF before file_remaining reached zero: the file shrank
-                // while being served. Stop streaming (the promised
-                // Content-Length cannot be honored) instead of re-reading
-                // EOF in an infinite loop, and close the connection so the
-                // peer is not left waiting for missing bytes.
-                ESP_LOGW(TAG, "Unexpected EOF streaming file (%" PRIu32 " bytes short)",
-                         sb->file_remaining);
-                send_buffer_stop_file(sb);
-                conn->state = CONN_STATE_CLOSED;
-            } else if (bytes_read < 0 && errno != EAGAIN) {
-                ESP_LOGE(TAG, "File read error: %s", strerror(errno));
-                send_buffer_stop_file(sb);
-                conn->state = CONN_STATE_CLOSED;
             }
 #endif
         }
