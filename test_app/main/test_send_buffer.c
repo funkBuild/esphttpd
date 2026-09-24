@@ -1090,6 +1090,31 @@ static void test_start_mem_append_capped(void)
     send_buffer_free(&sb);
 }
 
+// Regression: the FIRST overflow of a response larger than the cap is queued
+// whole. A 256 KB single-send reply used to be refused after its status line
+// was already on the wire, truncating the response; only appends to a pending
+// backlog are capped.
+static void test_start_mem_first_overflow_not_capped(void)
+{
+    send_buffer_t sb;
+    send_buffer_init(&sb);
+
+    size_t big = (size_t)SEND_BUFFER_MAX_PENDING * 4;
+    uint8_t* buf = (uint8_t*)malloc(big);
+    TEST_ASSERT_NOT_NULL(buf);
+    memset(buf, 'B', big);
+
+    TEST_ASSERT_TRUE(send_buffer_start_mem(&sb, buf, big));
+    TEST_ASSERT_EQUAL(big, send_buffer_mem_remaining(&sb));
+    TEST_ASSERT_EQUAL_MEMORY(buf, sb.mem_ptr, big);
+    // The backlog is now over the cap: further appends are refused, intact.
+    TEST_ASSERT_FALSE(send_buffer_start_mem(&sb, (const uint8_t*)"x", 1));
+    TEST_ASSERT_EQUAL(big, send_buffer_mem_remaining(&sb));
+
+    free(buf);
+    send_buffer_free(&sb);
+}
+
 // Ring-pending bytes are part of the same unsent backlog and must count
 // against the cap.
 static void test_start_mem_cap_counts_ring_pending(void)
@@ -1262,12 +1287,14 @@ static void test_start_mem2_single_part_normalization(void)
     send_buffer_free(&sb);
 }
 
+// Length arithmetic that would overflow size_t is refused before anything is
+// allocated or read. (A first overflow merely larger than the cap is accepted:
+// see test_start_mem_first_overflow_not_capped.)
 static void test_start_mem_rejects_initial_overflow(void) {
     send_buffer_t sb;
     send_buffer_init(&sb);
     const uint8_t data[] = "abc";
     TEST_ASSERT_FALSE(send_buffer_start_mem2(&sb, data, SIZE_MAX, data, 2));
-    TEST_ASSERT_FALSE(send_buffer_start_mem(&sb, data, (size_t)SEND_BUFFER_MAX_PENDING + 1));
     TEST_ASSERT_NULL(sb.mem_owned);
     TEST_ASSERT_TRUE(send_buffer_start_mem(&sb, data, 3));
     TEST_ASSERT_FALSE(send_buffer_start_mem2(&sb, data, SIZE_MAX - 1, data, 2));
@@ -1332,6 +1359,7 @@ void test_send_buffer_run(void)
     RUN_TEST(test_start_mem_append_preserves_pending);
     RUN_TEST(test_start_mem_append_after_partial_drain);
     RUN_TEST(test_start_mem_append_capped);
+    RUN_TEST(test_start_mem_first_overflow_not_capped);
     RUN_TEST(test_start_mem_cap_counts_ring_pending);
     RUN_TEST(test_stop_mem_clears_state);
     RUN_TEST(test_reset_clears_mem_state);

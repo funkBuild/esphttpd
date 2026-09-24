@@ -221,7 +221,12 @@ bool send_buffer_start_mem2(send_buffer_t* sb, const uint8_t* d0, size_t l0,
     size_t pending = send_buffer_pending(sb);
     size_t unsent = sb->mem_remaining;
     if (pending > SIZE_MAX - unsent || total > SIZE_MAX - pending - unsent) return false;
-    if (!sb->mem_owned && pending + unsent + total > SEND_BUFFER_MAX_PENDING) return false;
+    // The FIRST overflow of a response is not capped: it is one caller's
+    // already-materialised body (e.g. a large JSON API reply), bounded by its
+    // own size, and by now the status line and headers are on the wire, so a
+    // refusal could only truncate the response. The cap below bounds what the
+    // DoS case needs bounding: a backlog that keeps growing while the peer
+    // does not read (appends to a pending stream, e.g. WebSocket publishes).
 
     // If a stream is already pending, append behind its unsent bytes —
     // replacing the buffer here would silently drop response data.
