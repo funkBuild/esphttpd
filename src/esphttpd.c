@@ -1028,6 +1028,10 @@ static int stream_file_response(connection_t* conn, int file_fd, size_t file_siz
                                 const void* hdr, size_t hdr_len, int hdr_flags,
                                 uint8_t* counted_open) {
     int result = 0;
+    // An empty body means the header block IS the response: never cork it
+    // with MSG_MORE waiting for body bytes that will not come (the
+    // filesystem module passes MSG_MORE unconditionally).
+    if (file_size == 0) hdr_flags &= ~MSG_MORE;
     if (send_nonblocking(conn, hdr, hdr_len, hdr_flags) < 0) {
         result = -1;  // nothing on the wire
     } else if (file_size == 0) {
@@ -2892,6 +2896,18 @@ httpd_err_t httpd_resp_sendfile_async(httpd_req_t* req, const char* path,
     if (result < 0) {
         if (on_done) on_done(req, HTTPD_ERR_NOT_FOUND);
         return HTTPD_ERR_NOT_FOUND;
+    }
+
+    // Nothing left queued (a zero-length file, or a small header block that
+    // went straight into the socket): no write-ready event will ever fire to
+    // complete it, so complete now - as httpd_resp_send_async does. Arming
+    // async_send here left on_done unfired and, since finish_sync_request
+    // waits for it, the connection never re-armed.
+    send_buffer_t* sb = get_send_buffer(conn);
+    if (!sb || (!send_buffer_has_data(sb) && !send_buffer_is_streaming(sb) &&
+                !send_buffer_is_mem_streaming(sb))) {
+        if (on_done) on_done(req, HTTPD_OK);
+        return HTTPD_OK;
     }
 
     // Set up async completion tracking - on_done fires when send buffer is drained

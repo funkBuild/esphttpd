@@ -338,6 +338,18 @@ static void expect_bytes(int fd, const void* expected, size_t len) {
 
 static void expect_str(int fd, const char* expected) { expect_bytes(fd, expected, strlen(expected)); }
 
+// The server closed the connection (within the 3 s receive timeout). The FIN
+// may already have been consumed by expect_bytes' "no extra bytes" probe, in
+// which case lwIP reports ENOTCONN instead of a second 0; a timeout
+// (EAGAIN) means the connection is still open.
+static void expect_closed(int fd) {
+    uint8_t b[8];
+    errno = 0;
+    ssize_t n = recv(fd, b, sizeof(b), 0);
+    TEST_ASSERT_TRUE_MESSAGE(n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK),
+                             "connection still open");
+}
+
 // Masked client WebSocket frame (fixed mask key 01 02 03 04)
 static size_t ws_build_client_frame(uint8_t* out, uint8_t opcode, const uint8_t* payload, size_t len) {
     static const uint8_t mask[4] = { 1, 2, 3, 4 };
@@ -696,14 +708,28 @@ static void test_live_golden_filesystem_serving(void) {
                    "Content-Length: 10\r\n\r\nfs refused");
     TEST_ASSERT_EQUAL(HTTPD_ERR_NOT_FOUND, s_async_done_err);
 
-    // Zero-length file: the header block alone (Content-Length: 0). Known
-    // pre-existing wedge, pinned as-is: httpd_resp_sendfile_async arms its
-    // completion although nothing is queued, so on_done never fires and the
-    // connection never re-arms - hence this is the LAST request on it.
+    // Zero-length file: the header block alone (Content-Length: 0) is the
+    // whole response. Nothing is left queued, so on_done fires with success
+    // right away and the keep-alive connection serves the next request.
     s_async_done_err = -999;
     cli_send_str(fd, "GET /fs/empty.txt HTTP/1.1\r\nHost: x\r\n\r\n");
     expect_str(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n");
+    TEST_ASSERT_EQUAL(HTTPD_OK, s_async_done_err);
+    cli_send_str(fd, "GET /fs/hello.txt HTTP/1.1\r\nHost: x\r\n\r\n");
+    expect_str(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\n"
+                   "Hello, file!\n");
 
+    TEST_ASSERT_EQUAL(0, s_fs.open_files);
+    close(fd);
+
+    // Connection: close on a zero-length file: completes, then the server
+    // closes the connection (EOF after the header block).
+    fd = cli_connect();
+    s_async_done_err = -999;
+    cli_send_str(fd, "GET /fs/empty.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    expect_str(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n");
+    TEST_ASSERT_EQUAL(HTTPD_OK, s_async_done_err);
+    expect_closed(fd);
     TEST_ASSERT_EQUAL(0, s_fs.open_files);
     close(fd);
     live_stop();
