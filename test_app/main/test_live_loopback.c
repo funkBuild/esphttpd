@@ -506,17 +506,7 @@ static httpd_err_t ws_echo(httpd_ws_t* ws, httpd_ws_event_t* ev) {
     return HTTPD_OK;
 }
 
-// The server instance is static and httpd_stop does not clear a registered
-// error handler, so one installed by an earlier suite would still intercept
-// errors here. Install a pass-through so the DEFAULT error responses are what
-// these tests pin.
-static httpd_err_t passthrough_error_handler(httpd_err_t err, httpd_req_t* req) {
-    (void)req;
-    return err;
-}
-
 static void register_all(httpd_handle_t h) {
-    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_on_error(h, passthrough_error_handler));
     static const httpd_route_t routes[] = {
         { HTTP_GET, "/hello", h_hello, NULL },
         { HTTP_GET, "/json", h_json_staged, NULL },
@@ -1137,6 +1127,85 @@ static void test_live_lock_ws_send_not_blocked_by_file_read(void) {
     live_stop();
 }
 
+// ============================================================================
+// httpd_stop resets per-server registrations
+// ============================================================================
+
+static httpd_err_t custom_error_handler(httpd_err_t err, httpd_req_t* req) {
+    (void)err;
+    return httpd_resp_send_error(req, 404, "custom");
+}
+
+static httpd_err_t mw_tag(httpd_req_t* req, httpd_next_t next) {
+    httpd_resp_set_header(req, "X-MW", "1");
+    return next(req);
+}
+
+static httpd_err_t h_routed(httpd_req_t* req) {
+    return httpd_resp_send(req, "routed", 6);
+}
+
+// Everything registered on a server (error handler, middleware, routes,
+// mounted routers, WebSocket routes, the filesystem pointer) belongs to that
+// run: after httpd_stop + httpd_start the server behaves as freshly started.
+// The server instance is static, so anything stop leaves behind leaks into
+// the next start (the error handler did, and the filesystem pointer did -
+// httpd_resp_sendfile dereferences it even when serving is not enabled).
+static void test_live_stop_resets_server_state(void) {
+    live_start(NULL);
+    httpd_handle_t h = s_handle;
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_on_error(h, custom_error_handler));
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_use(h, mw_tag));
+    httpd_route_t hello = { HTTP_GET, "/hello", h_hello, NULL };
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_route(h, &hello));
+    httpd_router_t r = httpd_router_create();
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_router_get(r, "/x", h_routed));
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_mount(h, "/r", r));
+    httpd_ws_route_t ws = { .pattern = "/ws", .handler = ws_echo };
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_ws_route(h, &ws));
+    static filesystem_t stale_fs;  // attached but not enabled: stop must not unmount it
+    srv()->filesystem = &stale_fs;
+
+    int fd = cli_connect();
+    cli_send_str(fd, "GET /missing HTTP/1.1\r\nHost: x\r\n\r\n");
+    // (no route matched: server middleware only wraps route handlers)
+    expect_str(fd, "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n"
+                   "Content-Length: 6\r\n\r\ncustom");
+    cli_send_str(fd, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n");
+    expect_str(fd, "HTTP/1.1 200 OK\r\nX-MW: 1\r\nContent-Length: 5\r\n\r\nhello");
+    cli_send_str(fd, "GET /r/x HTTP/1.1\r\nHost: x\r\n\r\n");
+    expect_str(fd, "HTTP/1.1 200 OK\r\nX-MW: 1\r\nContent-Length: 6\r\n\r\nrouted");
+    close(fd);
+
+    // Stop directly (live_stop_quiet detaches the filesystem itself)
+    event_loop_stop(&srv()->event_loop);
+    for (int i = 0; i < 600 && !s_loop_exited; i++) vTaskDelay(pdMS_TO_TICKS(5));
+    TEST_ASSERT_TRUE(s_loop_exited);
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_stop(s_handle));
+    s_handle = NULL;
+
+    // Fresh start: only /hello
+    live_start(NULL);
+    TEST_ASSERT_NULL(srv()->filesystem);
+    TEST_ASSERT_EQUAL(HTTPD_OK, httpd_register_route(s_handle, &hello));
+    fd = cli_connect();
+    cli_send_str(fd, "GET /missing HTTP/1.1\r\nHost: x\r\n\r\n");
+    expect_str(fd, "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n"
+                   "Content-Length: 9\r\n\r\nNot Found");
+    cli_send_str(fd, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n");
+    expect_str(fd, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    cli_send_str(fd, "GET /r/x HTTP/1.1\r\nHost: x\r\n\r\n");
+    expect_str(fd, "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n"
+                   "Content-Length: 9\r\n\r\nNot Found");
+    cli_send_str(fd, "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                     "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    expect_str(fd, "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n"
+                   "Content-Length: 9\r\n\r\nNot Found");
+    close(fd);
+    live_stop();
+}
+
 void test_live_loopback_run(void) {
     ESP_LOGI(TAG, "Running live loopback golden tests");
     RUN_TEST(test_live_golden_basic_responses);
@@ -1152,6 +1221,7 @@ void test_live_loopback_run(void) {
     RUN_TEST(test_live_wake_stop_latency);
     RUN_TEST(test_live_lock_ws_send_not_blocked_by_provider);
     RUN_TEST(test_live_lock_ws_send_not_blocked_by_file_read);
+    RUN_TEST(test_live_stop_resets_server_state);
 }
 
 #else  // CONFIG_IDF_TARGET_LINUX

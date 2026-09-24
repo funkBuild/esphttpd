@@ -1849,6 +1849,11 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
     server->ws_route_count = 0;
     server->middleware_count = 0;
 
+    // The error handler is a registration of this run like the routes and
+    // middleware above: the instance is static, so leaving it set let it
+    // intercept errors after the next httpd_start.
+    server->error_handler = NULL;
+
     // Reset channel hash table
     init_channel_hash(server);
 
@@ -1861,6 +1866,11 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
         filesystem_unmount(server->filesystem);
         server->filesystem_enabled = false;
     }
+    // Forget it too: httpd_resp_sendfile counts streams against
+    // server->filesystem whenever it is non-NULL (enabled or not), so a
+    // pointer kept across a restart reached a filesystem_t the application
+    // may since have freed.
+    server->filesystem = NULL;
 
     // Clear the filesystem's file-response engine
     fs_set_file_stream_func(NULL);
