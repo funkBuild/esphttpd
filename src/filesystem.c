@@ -12,29 +12,13 @@
 
 static const char TAG[] = "FILESYSTEM";
 
-// Send function callback - set by server to route through send_nonblocking().
-// When NULL, falls back to blocking write() for backward compatibility (tests).
-static fs_send_func_t s_send_func = NULL;
-
-// File stream function callback - set by server to route through send_buffer.
-// When NULL, falls back to blocking read/send loop (tests).
+// File response function - set by the server to route file serving through
+// its non-blocking send buffer (see fs_start_file_stream_func_t). When NULL,
+// falls back to blocking write/read/send (tests without a server).
 static fs_start_file_stream_func_t s_file_stream_func = NULL;
-
-void fs_set_send_func(fs_send_func_t func) {
-    s_send_func = func;
-}
 
 void fs_set_file_stream_func(fs_start_file_stream_func_t func) {
     s_file_stream_func = func;
-}
-
-// Send helper: uses non-blocking callback when available, falls back to blocking write
-static ssize_t fs_send(connection_t* conn, const void* data, size_t len) {
-    if (s_send_func) {
-        return s_send_func(conn, data, len);
-    }
-    // Fallback for tests: blocking write
-    return write(conn->fd, data, len);
 }
 
 // Format uint32_t as decimal digits. Returns number of digits written.
@@ -361,7 +345,8 @@ int filesystem_send_file(filesystem_t* fs,
         ESP_LOGE(TAG, "Failed to open file: %s", full_path);
         return -1;
     }
-    if (fs->open_files < 255) fs->open_files++;
+    bool counted_open = fs->open_files < 255;
+    if (counted_open) fs->open_files++;
 
     // Send HTTP headers: memcpy static parts + dynamic mime_type and size
     char headers[512];
@@ -394,46 +379,32 @@ int filesystem_send_file(filesystem_t* fs,
     headers[header_len++] = '\r';
     headers[header_len++] = '\n';
 
-    // Send headers via non-blocking send
-    if (fs_send(conn, headers, header_len) < 0) {
-        close(file_fd);
-        if (fs->open_files > 0) fs->open_files--;
-        return -1;
-    }
-
-    // Zero-length file: the response is complete after the headers
-    // (Content-Length: 0). Starting a file stream with 0 bytes remaining
-    // would never terminate in on_write_ready.
-    if (metadata->size == 0) {
-        close(file_fd);
-        if (fs->open_files > 0) fs->open_files--;
-        return 0;
-    }
-
-    // Stream file content - use non-blocking file streaming when available
+    // Non-blocking: the server's file-response engine sends the header block
+    // (MSG_MORE: the body follows), completes an empty body, and hands the fd
+    // to the send buffer. It owns file_fd from here, and keeps open_files
+    // counted for the whole streaming lifetime: the fd is only closed
+    // asynchronously when the send buffer drains it, and the server's close
+    // hook releases the count then - so the limit above sees in-flight streams.
     if (s_file_stream_func) {
-        // Non-blocking: hand off file to send_buffer infrastructure.
-        // Ownership of file_fd transfers to the stream function (it will close it).
-        if (s_file_stream_func(conn, file_fd, metadata->size) < 0) {
-            close(file_fd);
-            if (fs->open_files > 0) fs->open_files--;
+        uint8_t* counted = counted_open ? &fs->open_files : NULL;
+        if (s_file_stream_func(conn, file_fd, metadata->size, headers, (size_t)header_len,
+                               MSG_MORE, counted) < 0) {
             return -1;
         }
-        // Keep open_files incremented for the whole streaming lifetime: the fd
-        // is still open and only closed asynchronously when the send buffer
-        // drains it. The server's send_buffer file-close hook decrements the
-        // count then. Decrementing here would let the limit never see in-flight
-        // streams.
         return (metadata->size <= (uint32_t)INT_MAX) ? (int)metadata->size : INT_MAX;
     }
 
-    // Fallback: blocking read/send loop (for tests without server infrastructure).
-    // The 1KB scratch buffer lives in a separate non-inlined frame so it does
-    // not inflate the stack of the production (non-blocking) serve path above.
-    int total_sent = filesystem_send_file_blocking(file_fd, conn->fd, metadata->size);
-
+    // Fallback: blocking header write + read/send loop (for tests without
+    // server infrastructure). The 1KB scratch buffer lives in a separate
+    // non-inlined frame so it does not inflate the stack of the production
+    // (non-blocking) serve path above.
+    int total_sent = -1;
+    if (write(conn->fd, headers, header_len) >= 0) {
+        total_sent = (metadata->size == 0) ? 0
+                   : filesystem_send_file_blocking(file_fd, conn->fd, metadata->size);
+    }
     close(file_fd);
-    if (fs->open_files > 0) fs->open_files--;
+    if (counted_open && fs->open_files > 0) fs->open_files--;
     return total_sent;
 }
 

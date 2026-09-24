@@ -976,11 +976,6 @@ static ssize_t ws_send2_callback(connection_t* conn,
     return send_nonblocking2(conn, buf0, len0, buf1, len1);
 }
 
-// Filesystem send callback - wraps send_nonblocking for use by filesystem.c
-static ssize_t fs_send_callback(connection_t* conn, const void* data, size_t len) {
-    return send_nonblocking(conn, data, len, MSG_MORE);
-}
-
 // Defined in send_buffer.c. Registered by the server so the filesystem's
 // in-flight open-file count is released when a streamed fd is ACTUALLY closed
 // (stream completion / reset / free), not at the handoff moment. Declared
@@ -1018,6 +1013,33 @@ static int fs_file_stream_callback(connection_t* conn, int file_fd, size_t file_
     // Mark connection as write-pending to trigger on_write_ready
     connection_mark_write_pending(&g_server->connection_pool, conn->pool_index, true);
     return 0;
+}
+
+// The single file-serving engine behind httpd_resp_sendfile and the
+// filesystem module (registered as its fs_start_file_stream_func_t; see
+// filesystem.h for the contract). Sends the complete header block, then
+// streams the body incrementally through the send buffer rather than pulling
+// the whole file into heap: buffering is capped at the ring size and drains
+// from on_write_ready as the TCP window reopens. Owns file_fd in every case.
+// counted_open (if non-NULL) is the in-flight open-file count the caller
+// already took for this fd: released here when no stream is started, and by
+// the send buffer's close hook (fs_stream_closed_cb) when a stream ends.
+static int stream_file_response(connection_t* conn, int file_fd, size_t file_size,
+                                const void* hdr, size_t hdr_len, int hdr_flags,
+                                uint8_t* counted_open) {
+    int result = 0;
+    if (send_nonblocking(conn, hdr, hdr_len, hdr_flags) < 0) {
+        result = -1;  // nothing on the wire
+    } else if (file_size == 0) {
+        result = 0;   // the header block (Content-Length: 0) is the response
+    } else if (fs_file_stream_callback(conn, file_fd, file_size) < 0) {
+        result = -2;  // headers sent, body stream could not start
+    } else {
+        return 0;     // the send buffer owns file_fd (and the count) now
+    }
+    close(file_fd);
+    if (counted_open && *counted_open > 0) (*counted_open)--;
+    return result;
 }
 
 const char* httpd_status_text(int status) {
@@ -1572,9 +1594,8 @@ httpd_err_t httpd_start(httpd_handle_t* handle, const httpd_config_t* config) {
     ws_set_send_func(ws_send_callback);
     ws_set_send2_func(ws_send2_callback);
 
-    // Register filesystem send callbacks so file serving routes through send_nonblocking
-    fs_set_send_func(fs_send_callback);
-    fs_set_file_stream_func(fs_file_stream_callback);
+    // Filesystem file serving goes through the same engine as httpd_resp_sendfile
+    fs_set_file_stream_func(stream_file_response);
 
     // Release the filesystem's in-flight open-file count when the send buffer
     // actually closes a streamed fd (streaming outlives the handoff call).
@@ -1837,8 +1858,7 @@ httpd_err_t httpd_stop(httpd_handle_t handle) {
         server->filesystem_enabled = false;
     }
 
-    // Clear filesystem send callbacks
-    fs_set_send_func(NULL);
+    // Clear the filesystem's file-response engine
     fs_set_file_stream_func(NULL);
     send_buffer_set_file_close_cb(NULL);
 
@@ -2678,52 +2698,33 @@ httpd_err_t httpd_resp_sendfile(httpd_req_t* req, const char* path) {
 
     // Entire header block — status line + staged headers (Content-Type and
     // Content-Length were staged above) + blank line — in one send
-    {
-        char block[RESP_HDR_BLOCK_BUF];
-        int pos = 0;
-        if (!req->headers_sent) {
-            pos = build_status_and_staged_headers(req, block, sizeof(block));
-            if (pos < 0) {
-                close(file_fd);
-                return HTTPD_ERR_NO_MEM;
-            }
-        }
-        block[pos++] = '\r';
-        block[pos++] = '\n';
-        if (send_nonblocking(conn, block, pos, st.st_size > 0 ? MSG_MORE : 0) < 0) {
+    char block[RESP_HDR_BLOCK_BUF];
+    int pos = 0;
+    if (!req->headers_sent) {
+        pos = build_status_and_staged_headers(req, block, sizeof(block));
+        if (pos < 0) {
             close(file_fd);
-            return HTTPD_ERR_IO;
+            return HTTPD_ERR_NO_MEM;
         }
     }
-    req->body_started = true;
+    block[pos++] = '\r';
+    block[pos++] = '\n';
 
-    // Zero-length file: the headers (Content-Length: 0) complete the response.
-    if (st.st_size == 0) {
-        close(file_fd);
-        return HTTPD_OK;
-    }
-
-    // Stream the body incrementally through the send buffer rather than pulling
-    // the whole file into heap. The previous fread()+send loop, under a stalled
-    // client, grew an unbounded memory-stream copy of the unsent remainder (a
-    // 1MB file ≈ 1MB transient heap, starving other connections). File
-    // streaming caps buffering at the ring size and drains from on_write_ready
-    // as the TCP window reopens. Count the in-flight fd against the filesystem's
-    // open-file budget (matching filesystem_send_file) so the send-buffer
-    // close hook releases it symmetrically when streaming ends.
+    // Count the in-flight fd against the filesystem's open-file budget (as
+    // filesystem_send_file does) so the send-buffer close hook releases it
+    // symmetrically when streaming ends; the engine releases it itself when
+    // no stream starts.
+    uint8_t* counted = NULL;
     if (g_server && g_server->filesystem && g_server->filesystem->open_files < 255) {
-        g_server->filesystem->open_files++;
+        counted = &g_server->filesystem->open_files;
+        (*counted)++;
     }
-    if (fs_file_stream_callback(conn, file_fd, (size_t)st.st_size) < 0) {
-        // Handoff failed: the send buffer did not take the fd, so release our
-        // own reference and count immediately.
-        if (g_server && g_server->filesystem && g_server->filesystem->open_files > 0) {
-            g_server->filesystem->open_files--;
-        }
-        close(file_fd);
-        return HTTPD_ERR_IO;
+    int r = stream_file_response(conn, file_fd, (size_t)st.st_size, block, (size_t)pos,
+                                 st.st_size > 0 ? MSG_MORE : 0, counted);
+    if (r != -1) {
+        req->body_started = true;  // the header block is on the wire
     }
-    return HTTPD_OK;
+    return (r < 0) ? HTTPD_ERR_IO : HTTPD_OK;
 }
 
 httpd_err_t httpd_resp_send_json(httpd_req_t* req, const char* json) {

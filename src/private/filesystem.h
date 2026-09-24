@@ -12,24 +12,23 @@
 extern "C" {
 #endif
 
-// Send callback type: routes filesystem sends through the server's non-blocking
-// send infrastructure. Signature: (connection, data, len) -> bytes sent/queued, or -1 on error
-typedef ssize_t (*fs_send_func_t)(connection_t* conn, const void* data, size_t len);
+// File response callback: the server's single file-serving engine (shared
+// with httpd_resp_sendfile). Transmits the complete header block hdr, then
+// streams file_size bytes from file_fd through the connection's send buffer
+// (an empty body completes with the headers). Takes ownership of file_fd in
+// every case. counted_open is the in-flight open-file count the caller
+// already incremented for this fd (NULL if it did not count it): released
+// on failure / empty body, otherwise when the stream closes the fd.
+// Returns 0 on success, -1 if the headers could not be sent (nothing on the
+// wire), -2 if the body stream could not be started after the headers went
+// out.
+typedef int (*fs_start_file_stream_func_t)(connection_t* conn, int file_fd, size_t file_size,
+                                           const void* hdr, size_t hdr_len, int hdr_flags,
+                                           uint8_t* counted_open);
 
-// File stream callback type: initiates non-blocking file streaming via send buffer.
-// Opens the file descriptor for streaming and marks the connection as write-pending.
-// Signature: (connection, file_fd, file_size) -> 0 on success, -1 on error
-// Note: ownership of file_fd transfers to the callback (it will be closed by send_buffer)
-typedef int (*fs_start_file_stream_func_t)(connection_t* conn, int file_fd, size_t file_size);
-
-// Set the send function used by filesystem operations.
-// Called by the server during init to route sends through send_nonblocking().
-// When NULL (default), falls back to blocking send() for backward compatibility.
-void fs_set_send_func(fs_send_func_t func);
-
-// Set the file stream function used by filesystem operations.
-// Called by the server during init to route file streaming through send_buffer.
-// When NULL (default), falls back to blocking read/send loop.
+// Set the file response function used by filesystem operations (registered
+// by the server at start). When NULL (default, tests without a server), the
+// filesystem falls back to a blocking write/read/send loop.
 void fs_set_file_stream_func(fs_start_file_stream_func_t func);
 
 // File system configuration for LittleFS
