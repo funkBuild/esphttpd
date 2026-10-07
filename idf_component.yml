@@ -6,5 +6,8 @@ dependencies:
   # filesystem-backed tests fail visibly rather than silently passing against a fake FS.
   esp_littlefs:
     git: https://github.com/joltwallet/esp_littlefs.git
+    # Pinned: an unpinned git dependency resolves to whatever master is when
+    # each project's lock is created (v1.22.3 supports ESP-IDF 6)
+    version: v1.22.3
     rules:
       - if: "target != linux"

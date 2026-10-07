@@ -19,6 +19,7 @@ static const char* TAG = "TEST_PERF";
 // Benchmark Macros
 // ============================================================================
 
+#undef PERF_START  // lwIP def.h defines an empty PERF_START
 #define PERF_START() int64_t _perf_start = esp_timer_get_time()
 
 #define PERF_END(name, iters) do { \

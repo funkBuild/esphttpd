@@ -2954,8 +2954,17 @@ httpd_err_t httpd_resp_send_provider(httpd_req_t* req, ssize_t content_length,
     request_context_t* ctx = get_request_context(conn);
     if (!ctx) return HTTPD_ERR_INVALID_ARG;
 
-    // Determine if using chunked encoding
-    bool use_chunked = (content_length < 0);
+    // Framing: content_length >= 0 sends Content-Length, HTTPD_PROVIDER_CHUNKED
+    // chunked encoding, HTTPD_PROVIDER_RAW_STREAM no framing header at all -
+    // the body runs until the connection closes (NTRIP / ICY casters)
+    bool raw_stream = (content_length == HTTPD_PROVIDER_RAW_STREAM);
+    bool use_chunked = (content_length < 0) && !raw_stream;
+    if (raw_stream) {
+        conn->keep_alive = 0;
+        if (!req->headers_sent) {
+            httpd_resp_set_header(req, "Connection", "close");
+        }
+    }
 
     // Entire header block — status line + staged headers + framing header +
     // blank line — in one send
@@ -2975,7 +2984,7 @@ httpd_err_t httpd_resp_send_provider(httpd_req_t* req, ssize_t content_length,
             static const char te_chunked[] = "Transfer-Encoding: chunked\r\n";
             memcpy(block + pos, te_chunked, sizeof(te_chunked) - 1);
             pos += sizeof(te_chunked) - 1;
-        } else if (!req->content_length_set) {
+        } else if (!raw_stream && !req->content_length_set) {
             static const char cl_pfx[] = "Content-Length: ";
             memcpy(block + pos, cl_pfx, sizeof(cl_pfx) - 1);
             pos += sizeof(cl_pfx) - 1;

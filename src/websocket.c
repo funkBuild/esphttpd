@@ -6,8 +6,15 @@
 #include <arpa/inet.h>
 #include "lwip/sockets.h"
 #include "esp_log.h"
-#include "mbedtls/sha1.h"
+#include "mbedtls/build_info.h"
 #include "mbedtls/base64.h"
+#if MBEDTLS_VERSION_MAJOR >= 4
+// mbedTLS 4 (ESP-IDF 6) makes the legacy hash API private: hash through PSA
+// (ESP-IDF runs psa_crypto_init() at startup)
+#include "psa/crypto.h"
+#else
+#include "mbedtls/sha1.h"
+#endif
 
 static const char TAG[] = "WS_FRAME";
 static const char WS_GUID[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -716,14 +723,27 @@ int ws_compute_accept_key(const char* client_key, char* accept_key, size_t accep
     // Streaming SHA1: feed client key and GUID separately to avoid concat buffer
     size_t key_len = strlen(client_key);
 
+    unsigned char hash[20];
+#if MBEDTLS_VERSION_MAJOR >= 4
+    psa_hash_operation_t op = PSA_HASH_OPERATION_INIT;
+    size_t hash_len = 0;
+    if (psa_hash_setup(&op, PSA_ALG_SHA_1) != PSA_SUCCESS ||
+        psa_hash_update(&op, (const uint8_t*)client_key, key_len) != PSA_SUCCESS ||
+        psa_hash_update(&op, (const uint8_t*)WS_GUID, sizeof(WS_GUID) - 1) != PSA_SUCCESS ||
+        psa_hash_finish(&op, hash, sizeof(hash), &hash_len) != PSA_SUCCESS ||
+        hash_len != sizeof(hash)) {
+        psa_hash_abort(&op);
+        return -1;
+    }
+#else
     mbedtls_sha1_context sha_ctx;
     mbedtls_sha1_init(&sha_ctx);
     mbedtls_sha1_starts(&sha_ctx);
     mbedtls_sha1_update(&sha_ctx, (const unsigned char*)client_key, key_len);
     mbedtls_sha1_update(&sha_ctx, (const unsigned char*)WS_GUID, sizeof(WS_GUID) - 1);
-    unsigned char hash[20];
     mbedtls_sha1_finish(&sha_ctx, hash);
     mbedtls_sha1_free(&sha_ctx);
+#endif
 
     // Base64 encode the hash
     size_t olen;

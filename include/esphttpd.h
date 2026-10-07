@@ -783,6 +783,11 @@ httpd_err_t httpd_resp_sendfile_async(httpd_req_t* req, const char* path,
  */
 typedef ssize_t (*httpd_data_provider_t)(httpd_req_t* req, uint8_t* buf, size_t max_len);
 
+/** httpd_resp_send_provider() content_length: chunked transfer encoding */
+#define HTTPD_PROVIDER_CHUNKED     (-1)
+/** httpd_resp_send_provider() content_length: unframed body ended by closing the connection */
+#define HTTPD_PROVIDER_RAW_STREAM  (-2)
+
 /**
  * @brief Send response using a data provider callback
  *
@@ -801,7 +806,11 @@ typedef ssize_t (*httpd_data_provider_t)(httpd_req_t* req, uint8_t* buf, size_t 
  * 7. on_complete callback invoked when all data sent
  *
  * @param req Request context
- * @param content_length Total response size, or -1 for chunked encoding
+ * @param content_length Total response size (Content-Length), HTTPD_PROVIDER_CHUNKED
+ *                       for chunked encoding, or HTTPD_PROVIDER_RAW_STREAM for
+ *                       a body with no framing header that ends when the
+ *                       connection closes (NTRIP/ICY streams; the connection
+ *                       is not kept alive)
  * @param provider Callback to provide data (required)
  * @param on_complete Callback when send completes (can be NULL)
  * @return HTTPD_OK if set up successfully

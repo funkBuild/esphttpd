@@ -460,6 +460,10 @@ static httpd_err_t h_prov_chunked(httpd_req_t* req) {
     return httpd_resp_send_provider(req, -1, prov_digits, prov_done);
 }
 
+static httpd_err_t h_prov_raw(httpd_req_t* req) {
+    return httpd_resp_send_provider(req, HTTPD_PROVIDER_RAW_STREAM, prov_digits, prov_done);
+}
+
 static httpd_err_t h_sendfile(httpd_req_t* req) {
     // /file/<name> -> /ram/<name>
     char path[64];
@@ -516,6 +520,7 @@ static void register_all(httpd_handle_t h) {
         { HTTP_GET, "/fail", h_fail, NULL },
         { HTTP_GET, "/prov", h_prov_len, NULL },
         { HTTP_GET, "/provc", h_prov_chunked, NULL },
+        { HTTP_GET, "/provr", h_prov_raw, NULL },
         { HTTP_GET, "/file/:name", h_sendfile, NULL },
         { HTTP_GET, "/typed", h_sendfile_typed, NULL },
         { HTTP_GET, "/trav", h_sendfile_traversal, NULL },
@@ -584,6 +589,23 @@ static void test_live_golden_provider(void) {
     cli_send_str(fd, "GET /provc HTTP/1.1\r\nHost: x\r\n\r\n");
     expect_str(fd, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
                    "a\r\n0123456789\r\na\r\n0123456789\r\na\r\n0123456789\r\n0\r\n\r\n");
+    TEST_ASSERT_EQUAL(HTTPD_OK, s_prov_done_err);
+
+    close(fd);
+    live_stop();
+}
+
+// A raw stream (NTRIP/ICY) has no framing header: the body ends when the
+// server closes the connection
+static void test_live_golden_provider_raw(void) {
+    live_start(register_all);
+    int fd = cli_connect();
+
+    s_prov_done_err = -999;
+    cli_send_str(fd, "GET /provr HTTP/1.1\r\nHost: x\r\n\r\n");
+    expect_str(fd, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n"
+                   "012345678901234567890123456789");
+    expect_closed(fd);
     TEST_ASSERT_EQUAL(HTTPD_OK, s_prov_done_err);
 
     close(fd);
@@ -1210,6 +1232,7 @@ void test_live_loopback_run(void) {
     ESP_LOGI(TAG, "Running live loopback golden tests");
     RUN_TEST(test_live_golden_basic_responses);
     RUN_TEST(test_live_golden_provider);
+    RUN_TEST(test_live_golden_provider_raw);
     RUN_TEST(test_live_golden_pipelined_order);
     RUN_TEST(test_live_golden_sendfile);
     RUN_TEST(test_live_golden_filesystem_serving);
